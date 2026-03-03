@@ -1,7 +1,7 @@
 """
 Message tool — mirrors OpenClaw's telegram-actions.ts contract.
 
-Action name parity (OpenClaw camelCase ↔ PyGate snake_case):
+Action name parity (OpenClaw camelCase ↔ LobsterClaw snake_case):
   sendMessage / send           editMessage / edit
   deleteMessage / delete       reactMessage / react
   sendSticker / send_sticker   sendSticker / sticker (OpenClaw telegram.ts)
@@ -206,7 +206,7 @@ def _normalise_buttons(raw: list | None) -> list[list[dict]] | None:
     """
     Accept both:
       - 2D (OpenClaw): [[{text, callback_data}], ...]
-      - Flat (PyGate legacy): [{text, data/callback_data}]
+      - Flat (LobsterClaw legacy): [{text, data/callback_data}]
     Returns 2D list of {text, callback_data, ?style}, or None.
     """
     if not raw:
@@ -230,7 +230,7 @@ def _normalise_buttons(raw: list | None) -> list[list[dict]] | None:
             if not isinstance(btn, dict):
                 continue
             text = str(btn.get("text", "")).strip()
-            # callback_data field: OpenClaw uses callback_data, PyGate uses data
+            # callback_data field: OpenClaw uses callback_data, LobsterClaw uses data
             cb = btn.get("callback_data") or btn.get("data") or text
             cb = str(cb).strip()
             if not text or not cb:
@@ -337,12 +337,12 @@ TOOL_DEFINITION = ToolDefinition(
             # Reaction
             "emoji": {"type": "string", "description": "Emoji for react (e.g. '👍')"},
             "remove": {"type": "boolean", "description": "Remove the reaction (react action)"},
-            # Buttons — 2D rows (OpenClaw) or flat list (PyGate compat)
+            # Buttons — 2D rows (OpenClaw) or flat list (LobsterClaw compat)
             "buttons": {
                 "type": "array",
                 "description": (
                     "Inline keyboard. 2D rows (OpenClaw): [[{text, callback_data, style?}]].\n"
-                    "Flat (PyGate compat): [{text, data}] — auto-promoted to [[...]]."
+                    "Flat (LobsterClaw compat): [{text, data}] — auto-promoted to [[...]]."
                 ),
                 "items": {},
             },

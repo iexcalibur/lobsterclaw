@@ -1,6 +1,6 @@
-# PyGate Canvas Frontend
+# LobsterClaw Canvas Frontend
 
-Next.js 14 interactive canvas UI for PyGate agent.
+Next.js 14 interactive canvas UI for LobsterClaw agent.
 
 ## Setup
 
@@ -12,10 +12,10 @@ npm install
 
 ## Development
 
-Run the Next.js dev server alongside the PyGate canvas host:
+Run the Next.js dev server alongside the LobsterClaw canvas host:
 
 ```bash
-# Terminal 1 — PyGate with canvas host enabled
+# Terminal 1 — LobsterClaw with canvas host enabled
 CANVAS_HOST_ENABLED=true python main.py
 
 # Terminal 2 — Next.js dev server
@@ -31,13 +31,13 @@ The canvas host runs at `http://localhost:7681`.
 npm run build
 ```
 
-This exports a static site to `out/`. PyGate's canvas host automatically serves it
+This exports a static site to `out/`. LobsterClaw's canvas host automatically serves it
 when `out/` exists, so the full UI is available at `http://localhost:7681`.
 
 ## Architecture
 
 ```
-PyGate Agent
+LobsterClaw Agent
     │
     │  canvas(action="present", kind="markdown", markdown="# Hello")
     ▼

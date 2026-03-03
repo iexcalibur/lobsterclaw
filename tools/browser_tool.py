@@ -112,7 +112,7 @@ TOOL_DEFINITION = ToolDefinition(
             "url": {"type": "string", "description": "URL for navigate/open"},
             "targetUrl": {"type": "string", "description": "Alias for url (OpenClaw field name)"},
             # Tab identification
-            "tab_id": {"type": "integer", "description": "Tab ID (PyGate)"},
+            "tab_id": {"type": "integer", "description": "Tab ID (LobsterClaw)"},
             "targetId": {"type": "string", "description": "Tab/target ID (OpenClaw field name; accepts int or string)"},
             # Snapshot options (OpenClaw parity)
             "snapshotFormat": {
@@ -220,7 +220,7 @@ TOOL_DEFINITION = ToolDefinition(
             },
             # act: legacy flattened params (top-level, OpenClaw parity)
             "kind": {"type": "string", "description": "act kind when using flattened params: click|type|press|hover|drag|select|fill|resize|wait|evaluate|close"},
-            "sub_action": {"type": "string", "description": "PyGate alias for kind (act sub-action)"},
+            "sub_action": {"type": "string", "description": "LobsterClaw alias for kind (act sub-action)"},
             "doubleClick": {"type": "boolean", "description": "act click: double-click"},
             "button": {"type": "string", "description": "act click: mouse button (left|right|middle)"},
             "modifiers": {"type": "array", "description": "act click: modifier keys", "items": {"type": "string"}},
@@ -239,7 +239,7 @@ TOOL_DEFINITION = ToolDefinition(
             "timeMs": {"type": "number", "description": "act wait: milliseconds"},
             "loadState": {"type": "string", "description": "act wait: wait for load state"},
             "textGone": {"type": "string", "description": "act wait: wait until text disappears"},
-            # Scroll (PyGate extension)
+            # Scroll (LobsterClaw extension)
             "direction": {"type": "string", "description": "scroll direction: up|down|left|right"},
             "amount": {"type": "integer", "description": "scroll pixels (default 500)"},
             "wait_ms": {"type": "integer", "description": "Alias for timeMs (wait action)"},
@@ -273,7 +273,7 @@ async def _browser(
     text: str | None = None,
     value: str | None = None,              # alias for text
     # act sub-action
-    sub_action: str | None = None,         # PyGate field
+    sub_action: str | None = None,         # LobsterClaw field
     kind: str | None = None,              # OpenClaw field (alias)
     # act structured request object (OpenClaw preferred)
     request: dict | None = None,
@@ -356,7 +356,7 @@ async def _browser(
 
     # node target: delegate exec to nodes_tool (stub — remote browser not implemented)
     if target == "node" and node:
-        return f"Remote browser on node '{node}' is not yet implemented in PyGate."
+        return f"Remote browser on node '{node}' is not yet implemented in LobsterClaw."
 
     # ------------------------------------------------------------------
     # Actions that don't require the browser to be open

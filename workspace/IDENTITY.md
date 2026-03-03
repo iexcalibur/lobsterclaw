@@ -4,7 +4,7 @@ _Optional: override the agent's name and identity here._
 
 ## Agent Name
 
-PyGate
+LobsterClaw
 
 ## Role
 

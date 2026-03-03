@@ -41,7 +41,7 @@ TOOL_DEFINITION = ToolDefinition(
                 "description": "Number of results (1-10, default 5)",
                 "default": 5,
             },
-            # Freshness: OpenClaw uses string 'freshness'; PyGate also accepts bool 'fresh'
+            # Freshness: OpenClaw uses string 'freshness'; LobsterClaw also accepts bool 'fresh'
             "freshness": {
                 "type": "string",
                 "description": "Time filter: pd (past day) | pw (past week) | pm (past month) | py (past year)",

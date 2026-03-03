@@ -73,7 +73,7 @@ CORE_TOOL_SUMMARIES: dict[str, str] = {
         "include recent context in reminder text if appropriate)"
     ),
     "message": "Send messages and channel actions",
-    "gateway": "Restart, apply config, or run updates on the running PyGate process",
+    "gateway": "Restart, apply config, or run updates on the running LobsterClaw process",
     "agents_list": "List agent ids allowed for sessions_spawn",
     "sessions_list": "List other sessions with filters",
     "sessions_history": "Fetch history for another session",
@@ -132,7 +132,7 @@ def build_system_prompt(
     is_minimal = mode in ("minimal", "none")
 
     if mode == "none":
-        return "You are a personal assistant running inside PyGate."
+        return "You are a personal assistant running inside LobsterClaw."
 
     silent_token = getattr(cfg, "silent_reply_token", "NO_REPLY")
     heartbeat_ok = getattr(cfg, "heartbeat_ok_token", "HEARTBEAT_OK")
@@ -184,7 +184,7 @@ def build_system_prompt(
     owner_line = _build_owner_line(cfg)
 
     lines: list[str] = [
-        "You are a personal assistant running inside PyGate.",
+        "You are a personal assistant running inside LobsterClaw.",
         "",
         f"Current time: {now_str}{(' (' + tz + ')') if tz else ''}",
         "",
@@ -244,34 +244,39 @@ def build_system_prompt(
     ]
 
     # ----------------------------------------------------------------
-    # ## Skills
+    # ## Skills (mandatory)
     # ----------------------------------------------------------------
     if skills_text and not is_minimal:
         lines += [
-            "## Skills",
-            "Available skills are listed below. "
-            "Scan their descriptions to decide when to apply one before answering.",
+            "## Skills (mandatory)",
+            "Before replying: scan <available_skills> <description> entries.",
+            f"- If exactly one skill clearly applies: read its SKILL.md at <location> with `read`, then follow it.",
+            "- If multiple could apply: choose the most specific one, then read/follow it.",
+            "- If none clearly apply: do not read any SKILL.md.",
+            "Constraints: never read more than one skill up front; only read after selecting.",
             skills_text,
             "",
         ]
 
     # ----------------------------------------------------------------
-    # ## Memory
+    # ## Memory Recall
     # ----------------------------------------------------------------
     if has_memory_tools:
         memory_lines = [
-            "## Memory",
-            "Before answering questions about the user's preferences, past decisions, "
-            "ongoing projects, or personal details: run memory_search first.",
-            "Use memory_get to read specific entries. Use memory_list to see all keys.",
-            "To store durable facts: use memory_write with file memory/YYYY-MM-DD.md "
-            "(APPEND, do not overwrite).",
-            "If unsure after searching, say so — don't guess.",
+            "## Memory Recall",
+            "Before answering anything about prior work, decisions, dates, people, "
+            "preferences, or todos: run memory_search on MEMORY.md + memory/*.md; "
+            "then use memory_get to pull only the needed lines. "
+            "If low confidence after search, say you checked.",
         ]
-        if memory_citations != "off":
+        if memory_citations == "off":
             memory_lines.append(
-                "When recalling a fact from memory, cite the source inline: "
-                "(from memory/filename.md) or [MEMORY: filename]."
+                "Citations are disabled: do not mention file paths or line numbers in replies "
+                "unless the user explicitly asks."
+            )
+        else:
+            memory_lines.append(
+                "Citations: include Source: <path#line> when it helps the user verify memory snippets."
             )
         lines += memory_lines + [""]
 
@@ -280,18 +285,19 @@ def build_system_prompt(
     # ----------------------------------------------------------------
     if has_gateway and not is_minimal:
         lines += [
-            "## PyGate Self-Update",
+            "## LobsterClaw Self-Update",
             "Self-update is ONLY allowed when the user explicitly asks for it.",
             "Do not run config.apply or update.run unless the user explicitly requests it.",
             "Use config.schema to fetch the current JSON Schema before making config changes.",
             "Actions: config.get, config.schema, config.apply (validate + write + restart), update.run.",
+            "After restart, LobsterClaw pings the last active session automatically.",
             "",
         ]
 
     # ----------------------------------------------------------------
     # ## Workspace
     # ----------------------------------------------------------------
-    workspace_dir_display = str(workspace_dir or Path.home() / ".pygate" / "workspace")
+    workspace_dir_display = str(workspace_dir or Path.home() / ".lobsterclaw" / "workspace")
     if repo_root:
         workspace_dir_display = repo_root
     lines += [
@@ -299,6 +305,7 @@ def build_system_prompt(
         f"Your working directory is: {workspace_dir_display}",
         "Treat this directory as the single global workspace for file operations "
         "unless explicitly instructed otherwise.",
+        "These user-editable files are loaded by LobsterClaw and included below in Project Context.",
         "",
     ]
 
@@ -345,7 +352,7 @@ def build_system_prompt(
             f"Heartbeat schedule: {heartbeat_schedule}",
             "If you receive a heartbeat poll and there is nothing that needs attention, reply exactly:",
             heartbeat_ok,
-            f'PyGate treats a leading/trailing "{heartbeat_ok}" as a heartbeat ack (and discards it).',
+            f'LobsterClaw treats a leading/trailing "{heartbeat_ok}" as a heartbeat ack (and may discard it).',
             f"If something needs attention, do NOT include \"{heartbeat_ok}\"; "
             "reply with the alert text instead.",
             "",
@@ -561,30 +568,33 @@ def _build_telegram_messaging_section(
 ) -> list[str]:
     lines = [
         "## Messaging",
-        "Channel: Telegram.",
-        "For normal replies, just return text — it is auto-delivered to the conversation.",
-        f"To stay silent (no reply), respond with exactly: {silent_token}",
-        "Use `message` action=send to send a separate, unprompted message "
-        "(e.g., completing a background task, sending to another chat).",
-        "Target routing: send without 'to' → owner's DM. "
-        "Set 'to' to target a different chat_id.",
-        "For @username or t.me/ links, pass them as 'to' — they are resolved automatically.",
-        "Media: action=send_photo (path/URL), send_document (file), send_audio (MP3/OGG).",
-        "Stickers: action=sticker (file_id) or sticker_search (query).",
-        "Edit/delete: action=edit (message_id + text) or delete (message_id).",
-        "Reactions: action=react (message_id + emoji). Supported emojis only.",
-        "Pin/unpin: action=pin (message_id) or unpin (message_id).",
+        f"- Reply in current session → automatically routes to the source channel (Telegram)",
+        f"- Cross-session messaging → use sessions_send(sessionKey, message)",
+        f"- Sub-agent orchestration → use subagents(action=list|steer|kill)",
+        f"- Runtime-generated completion events may ask for a user update. Rewrite those in your "
+        f"normal assistant voice and send the update (do not forward raw internal metadata or "
+        f"default to {silent_token}).",
+        f"- Never use exec/curl for provider messaging; LobsterClaw handles all routing internally.",
+        "",
+        "### message tool",
+        "- Use `message` for proactive sends + channel actions (polls, reactions, etc.).",
+        "- For `action=send`, include `to` and `message`.",
+        f"- If you use `message` (`action=send`) to deliver your user-visible reply, "
+        f"respond with ONLY: {silent_token} (avoid duplicate replies).",
+        "- Target routing: send without 'to' → owner's DM. Set 'to' for a different chat_id.",
+        "- For @username or t.me/ links, pass them as 'to' — resolved automatically.",
+        "- Media: action=send_photo (path/URL), send_document (file), send_audio (MP3/OGG).",
+        "- Stickers: action=sticker (file_id) or sticker_search (query).",
+        "- Edit/delete: action=edit (message_id + text) or delete (message_id).",
+        "- Reactions: action=react (message_id + emoji). Supported emojis only.",
+        "- Pin/unpin: action=pin (message_id) or unpin (message_id).",
+        "- Forum threads: pass message_thread_id to scope a message to a topic.",
     ]
     if inline_buttons:
         lines += [
-            "Inline buttons: pass buttons=[[{text, data}]] to message action=send "
-            "(2D array of rows).",
-            "Each row is an array of button objects {text: string, data: string}.",
+            "- Inline buttons supported. Use `action=send` with `buttons=[[{text,callback_data}]]`.",
         ]
-    lines += [
-        "Forum threads: pass message_thread_id to scope a message to a topic.",
-        "",
-    ]
+    lines += [""]
     return lines
 
 

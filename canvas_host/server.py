@@ -84,7 +84,7 @@ def create_app(frontend_build_dir: Path | None = None) -> FastAPI:
         yield
         logger.info("Canvas host stopped")
 
-    app = FastAPI(title="PyGate Canvas Host", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="LobsterClaw Canvas Host", version="1.0.0", lifespan=lifespan)
 
     app.add_middleware(
         CORSMiddleware,

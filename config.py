@@ -107,7 +107,7 @@ class Config:
     )
     # Sticker cache persistence path (SQLite)
     telegram_sticker_cache_db: str = field(
-        default_factory=lambda: _env("TELEGRAM_STICKER_CACHE_DB", "~/.pygate/sticker_cache.db")
+        default_factory=lambda: _env("TELEGRAM_STICKER_CACHE_DB", "~/.lobsterclaw/sticker_cache.db")
     )
     # Webhook mode: set TELEGRAM_WEBHOOK_URL to use webhooks instead of polling
     telegram_webhook_url: str = field(default_factory=lambda: _env("TELEGRAM_WEBHOOK_URL", ""))
@@ -115,7 +115,7 @@ class Config:
     telegram_webhook_secret: str = field(default_factory=lambda: _env("TELEGRAM_WEBHOOK_SECRET", ""))
     # Polling offset persistence: survives restarts without re-processing old messages
     telegram_polling_offset_path: str = field(
-        default_factory=lambda: _env("TELEGRAM_POLLING_OFFSET_PATH", "~/.pygate/telegram_offset.json")
+        default_factory=lambda: _env("TELEGRAM_POLLING_OFFSET_PATH", "~/.lobsterclaw/telegram_offset.json")
     )
     # Multi-account: JSON array of {label, token, owner_id, dm_policy?, group_policy?}
     telegram_accounts_json: str = field(
@@ -176,14 +176,14 @@ class Config:
 
     # Memory
     memory_enabled: bool = field(default_factory=lambda: _env_bool("MEMORY_ENABLED", True))
-    memory_dir: str = field(default_factory=lambda: _env("MEMORY_DIR", "~/.pygate/memory"))
+    memory_dir: str = field(default_factory=lambda: _env("MEMORY_DIR", "~/.lobsterclaw/memory"))
     memory_semantic: bool = field(
         default_factory=lambda: _env_bool("MEMORY_SEMANTIC", False)
     )  # Enable OpenAI embedding-based semantic search (requires OPENAI_API_KEY)
 
     # Cron
     cron_enabled: bool = field(default_factory=lambda: _env_bool("CRON_ENABLED", True))
-    cron_db_path: str = field(default_factory=lambda: _env("CRON_DB_PATH", "~/.pygate/cron.db"))
+    cron_db_path: str = field(default_factory=lambda: _env("CRON_DB_PATH", "~/.lobsterclaw/cron.db"))
 
     # Heartbeat (periodic agent wake)
     heartbeat_enabled: bool = field(default_factory=lambda: _env_bool("HEARTBEAT_ENABLED", False))
@@ -324,7 +324,7 @@ class Config:
     )
 
     # General
-    data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "~/.pygate"))
+    data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "~/.lobsterclaw"))
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
     max_history_messages: int = field(default_factory=lambda: _env_int("MAX_HISTORY_MESSAGES", 100))
     max_tool_iterations: int = field(default_factory=lambda: _env_int("MAX_TOOL_ITERATIONS", 10))

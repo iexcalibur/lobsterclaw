@@ -2,7 +2,7 @@
 Gateway tool — mirrors OpenClaw's gateway tool.
 
 Actions:
-  restart      — restart the PyGate process (sends SIGTERM to self)
+  restart      — restart the LobsterClaw process (sends SIGTERM to self)
   config.get   — read current .env config (redacted)
   config.set   — update a config value in .env
   update.run   — pull latest code from git and restart
@@ -27,7 +27,7 @@ _start_time = datetime.now()
 TOOL_DEFINITION = ToolDefinition(
     name="gateway",
     description=(
-        "Control the PyGate process and remote gateways.\n\n"
+        "Control the LobsterClaw process and remote gateways.\n\n"
         "Field parity with OpenClaw gateway-tool.ts:\n"
         "  action       — required: see actions below\n"
         "  gatewayUrl   — remote gateway base URL (for remote ops)\n"
@@ -123,7 +123,7 @@ async def _gateway(
         hours, rem = divmod(int(uptime.total_seconds()), 3600)
         mins, secs = divmod(rem, 60)
         return (
-            f"PyGate status:\n"
+            f"LobsterClaw status:\n"
             f"PID: {os.getpid()}\n"
             f"Python: {sys.version.split()[0]}\n"
             f"Uptime: {hours}h {mins}m {secs}s\n"
@@ -139,12 +139,12 @@ async def _gateway(
         delay_s = restartDelayMs / 1000.0
         loop = asyncio.get_running_loop()
         loop.call_later(delay_s, lambda: os.kill(os.getpid(), signal.SIGTERM))
-        return f"PyGate restart scheduled in {restartDelayMs}ms... ✅"
+        return f"LobsterClaw restart scheduled in {restartDelayMs}ms... ✅"
 
     if action == "config.schema":
         import dataclasses
         from config import Config
-        lines = ["PyGate configuration schema (.env keys):"]
+        lines = ["LobsterClaw configuration schema (.env keys):"]
         for f in dataclasses.fields(Config):
             env_key = f.name.upper()
             type_name = str(f.type) if isinstance(f.type, str) else type(f.default).__name__
@@ -281,7 +281,7 @@ async def _remote_gateway_call(
     params: dict | None = None,
     timeoutMs: int = 10000,
 ) -> str:
-    """Delegate an action to a remote PyGate instance via HTTP (OpenClaw remote gateway parity)."""
+    """Delegate an action to a remote LobsterClaw instance via HTTP (OpenClaw remote gateway parity)."""
     try:
         import httpx
         headers = {}

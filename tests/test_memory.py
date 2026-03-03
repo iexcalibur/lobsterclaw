@@ -24,7 +24,7 @@ def _setup_memory_env(tmp_dir: Path):
 def tmp_workspace(tmp_path):
     (tmp_path / "memory").mkdir()
     (tmp_path / "MEMORY.md").write_text("# Main Memory\n\nUser likes Python and coffee.")
-    (tmp_path / "memory" / "projects.md").write_text("# Projects\n\nWorking on PyGate chatbot.")
+    (tmp_path / "memory" / "projects.md").write_text("# Projects\n\nWorking on LobsterClaw chatbot.")
     return tmp_path
 
 
@@ -65,7 +65,7 @@ async def test_memory_index_loads_subdir(tmp_workspace):
         memory_dir=tmp_workspace / "memory",
         memory_md=tmp_workspace / "MEMORY.md",
     )
-    results = idx.search("PyGate chatbot", limit=3)
+    results = idx.search("LobsterClaw chatbot", limit=3)
     keys = [r.key for r in results]
     assert "projects" in keys
 
@@ -120,7 +120,7 @@ async def test_memory_get_existing(tmp_workspace):
         with patch("tools.memory_tool._get_memory_dir", return_value=tmp_workspace / "memory"):
             from tools.memory_tool import _memory_get
             result = await _memory_get("projects")
-            assert "PyGate" in result
+            assert "LobsterClaw" in result
 
 
 @pytest.mark.asyncio

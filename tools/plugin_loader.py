@@ -3,7 +3,7 @@ Plugin/extension system — mirrors OpenClaw's plugin architecture.
 
 Plugins live in:
   1. workspace/plugins/<name>/  (project-local plugins)
-  2. ~/.pygate/plugins/<name>/  (user-global plugins)
+  2. ~/.lobsterclaw/plugins/<name>/  (user-global plugins)
 
 Each plugin directory must contain a __init__.py (or plugin.py) that exports:
   TOOLS: list[ToolDefinition]   — tool definitions provided by this plugin
@@ -65,7 +65,7 @@ def _discover_plugin_dirs() -> list[Path]:
     if project_dir.exists():
         dirs.append(project_dir)
     # User-global plugins
-    user_dir = Path.home() / ".pygate" / "plugins"
+    user_dir = Path.home() / ".lobsterclaw" / "plugins"
     if user_dir.exists():
         dirs.append(user_dir)
     return dirs
@@ -158,7 +158,7 @@ def list_plugins() -> str:
     """Return a human-readable list of available plugins."""
     plugins = load_all_plugins()
     if not plugins:
-        return "No plugins found. Add plugins to workspace/plugins/ or ~/.pygate/plugins/"
+        return "No plugins found. Add plugins to workspace/plugins/ or ~/.lobsterclaw/plugins/"
     lines = [f"Installed plugins ({len(plugins)}):"]
     for p in plugins:
         tools_str = ", ".join(t.name for t in p.tools)

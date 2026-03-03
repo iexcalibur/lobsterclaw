@@ -154,7 +154,7 @@ def _get_memory_dir() -> Path:
     """Returns the memory directory, creating it if needed."""
     cfg = get_config()
     # Use the configured path; fall back to workspace/memory/ next to this project
-    if cfg.memory_dir and cfg.memory_dir != "~/.pygate/memory":
+    if cfg.memory_dir and cfg.memory_dir != "~/.lobsterclaw/memory":
         directory = Path(cfg.memory_dir).expanduser()
     else:
         # Default: workspace/memory/ relative to project root
@@ -167,7 +167,7 @@ def _get_memory_md_path() -> Path:
     """Top-level MEMORY.md — checked in config memory_dir first, then workspace root."""
     cfg = get_config()
     # Check config directory first (non-default path)
-    if cfg.memory_dir and cfg.memory_dir != "~/.pygate/memory":
+    if cfg.memory_dir and cfg.memory_dir != "~/.lobsterclaw/memory":
         candidate = Path(cfg.memory_dir).expanduser().parent / "MEMORY.md"
         if candidate.exists():
             return candidate

@@ -1,5 +1,5 @@
 """
-Canvas tool — full action surface backed by the PyGate Canvas Host.
+Canvas tool — full action surface backed by the LobsterClaw Canvas Host.
 
 The canvas host is a FastAPI + WebSocket server (canvas_host/) that streams
 content to a Next.js frontend. This tool makes HTTP calls to the host and

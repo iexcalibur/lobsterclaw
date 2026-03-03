@@ -99,7 +99,7 @@ TOOL_DEFINITION = ToolDefinition(
             # Job identifier
             "jobId": {"type": "string", "description": "Job ID (OpenClaw field name; also 'id', 'job_id')"},
             "id": {"type": "string", "description": "Alias for jobId"},
-            "job_id": {"type": "string", "description": "Alias for jobId (PyGate legacy)"},
+            "job_id": {"type": "string", "description": "Alias for jobId (LobsterClaw legacy)"},
             # Job creation / update
             "job": {
                 "type": "object",

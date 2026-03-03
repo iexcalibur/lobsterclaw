@@ -5,7 +5,7 @@ In OpenClaw, nodes are remote machines (Raspberry Pi, VMs, cloud instances)
 that the agent can reach through the gateway relay. Actions bridge
 SSH, file transfers, WoL packets, tunnel management, and exec routing.
 
-PyGate implementation:
+LobsterClaw implementation:
   - Full schema parity with nodes-tool.ts
   - SSH-based execution (requires host to be configured in NODE_<n>_HOST etc.)
   - Nodes configured via .env (NODE_0_NAME, NODE_0_HOST, NODE_0_USER, NODE_0_KEY)
@@ -349,7 +349,7 @@ async def _scp(cfg: NodeConfig, source: str, destination: str, timeout: int) -> 
 
 
 def _tunnel_create(cfg: NodeConfig, local_port: int, remote_port: int, remote_host: str) -> str:
-    """Return the SSH tunnel command (PyGate is stateless; user must run it)."""
+    """Return the SSH tunnel command (LobsterClaw is stateless; user must run it)."""
     key_flag = f"-i {cfg.key_path}" if cfg.key_path else ""
     cmd = (
         f"ssh -N -L {local_port}:{remote_host}:{remote_port} "

@@ -42,8 +42,8 @@ TOOLS = [
 
 ## Global Plugins
 
-You can also install plugins globally in `~/.pygate/plugins/` — they will be
-loaded for all PyGate instances on this machine.
+You can also install plugins globally in `~/.lobsterclaw/plugins/` — they will be
+loaded for all LobsterClaw instances on this machine.
 
 ## Policy
 

@@ -433,7 +433,7 @@ class TelegramChannel:
 
         if not self._is_allowed(update):
             return
-        await update.message.reply_text("PyGate is running. Send me a message.")
+        await update.message.reply_text("LobsterClaw is running. Send me a message.")
 
     async def _send_pairing_request(self, user, store) -> None:
         import uuid
@@ -456,7 +456,7 @@ class TelegramChannel:
             (
                 f"<b>Pairing request</b>\n\n"
                 f"User: <b>{name}</b> (@{user.username or 'no_username'}, ID: <code>{user.id}</code>)\n"
-                f"wants access to PyGate."
+                f"wants access to LobsterClaw."
             ),
             reply_markup=keyboard,
         )
@@ -480,7 +480,7 @@ class TelegramChannel:
         if not self._is_allowed(update):
             return
         help_text = (
-            "<b>PyGate — Commands</b>\n\n"
+            "<b>LobsterClaw — Commands</b>\n\n"
             "/reset — Clear conversation history\n"
             "/status — Show bot and agent status\n"
             "/model [name] — Show or switch LLM model\n"
@@ -498,7 +498,7 @@ class TelegramChannel:
         thinking_budget = getattr(cfg, "llm_thinking_budget", 0)
         thinking_str = f"budget={thinking_budget}" if thinking_budget else "disabled"
         status = (
-            f"<b>PyGate Status</b> [{self._label}]\n\n"
+            f"<b>LobsterClaw Status</b> [{self._label}]\n\n"
             f"Model: <code>{cfg.llm_model}</code> ({cfg.llm_provider})\n"
             f"Thinking: {thinking_str}\n"
             f"Streaming: {'✅' if cfg.llm_streaming else '❌'}\n"

@@ -634,7 +634,7 @@ AGENTS_LIST_TOOL = ToolDefinition(
     name="agents_list",
     description=(
         "List all available agents that can be targeted with sessions_spawn. "
-        "In PyGate there is one default agent (the current one)."
+        "In LobsterClaw there is one default agent (the current one)."
     ),
     parameters={
         "type": "object",

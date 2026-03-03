@@ -1,5 +1,5 @@
 """
-PyGate — Personal AI Assistant
+LobsterClaw — Personal AI Assistant
 Entry point: wires all components together and starts the Telegram bot(s).
 
 Usage:
@@ -163,7 +163,7 @@ def _wire_channel(telegram, registry, approval, cron_mgr, build_system_prompt):
 
 
 def main() -> None:
-    logger.info("Starting PyGate...")
+    logger.info("Starting LobsterClaw...")
 
     cfg = get_config()
     logger.info("LLM provider: %s / model: %s", cfg.llm_provider, cfg.llm_model)

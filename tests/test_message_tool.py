@@ -74,7 +74,7 @@ def test_buttons_2d_passthrough():
 
 
 def test_buttons_flat_promoted():
-    # Flat list (PyGate legacy) → 2D rows
+    # Flat list (LobsterClaw legacy) → 2D rows
     raw = [{"text": "A", "data": "a"}, {"text": "B", "callback_data": "b"}]
     out = _normalise_buttons(raw)
     assert out is not None
