@@ -226,6 +226,18 @@ class Config:
     # Show extended thinking blocks in Telegram (shown as spoiler/code if true)
     llm_show_thinking: bool = field(default_factory=lambda: _env_bool("LLM_SHOW_THINKING", False))
 
+    # Canvas host (FastAPI + WebSocket server)
+    canvas_host_enabled: bool = field(default_factory=lambda: _env_bool("CANVAS_HOST_ENABLED", False))
+    canvas_host_port: int = field(default_factory=lambda: _env_int("CANVAS_HOST_PORT", 7681))
+    canvas_host_bind: str = field(default_factory=lambda: _env("CANVAS_HOST_BIND", "127.0.0.1"))
+    # Dev mode: Next.js dev server proxied; production: serve built static files
+    canvas_frontend_dev: bool = field(default_factory=lambda: _env_bool("CANVAS_FRONTEND_DEV", False))
+    canvas_frontend_dev_port: int = field(
+        default_factory=lambda: _env_int("CANVAS_FRONTEND_DEV_PORT", 3000)
+    )
+    # How long wait_event polls for a user interaction (seconds)
+    canvas_event_timeout: int = field(default_factory=lambda: _env_int("CANVAS_EVENT_TIMEOUT", 60))
+
     # General
     data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "~/.pygate"))
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
@@ -283,6 +295,18 @@ class Config:
     @property
     def sessions_db(self) -> Path:
         return self.data_path / "sessions.db"
+
+    @property
+    def canvas_db(self) -> Path:
+        return self.data_path / "canvas.db"
+
+    @property
+    def canvas_host_url(self) -> str:
+        return f"http://{self.canvas_host_bind}:{self.canvas_host_port}"
+
+    @property
+    def canvas_host_ws_url(self) -> str:
+        return f"ws://{self.canvas_host_bind}:{self.canvas_host_port}"
 
 
 _config: Config | None = None

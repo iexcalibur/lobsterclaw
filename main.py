@@ -5,8 +5,13 @@ Entry point: wires all components together and starts the Telegram bot(s).
 Usage:
     cp .env.example .env        # fill in your keys
     pip install -r requirements.txt
-    playwright install chromium  # only needed if BROWSER_ENABLED=true
+    playwright install chromium  # only needed if BROWSER_ENABLED=true or CANVAS_HOST_ENABLED=true
     python main.py
+
+Canvas host:
+    Set CANVAS_HOST_ENABLED=true to start the FastAPI canvas host at CANVAS_HOST_PORT (default 7681).
+    Then run `cd canvas_frontend && npm install && npm run dev` to launch the Next.js UI.
+    Or build once with `npm run build` — the host serves the static output automatically.
 
 Multi-account:
     Set TELEGRAM_ACCOUNTS to a JSON array of account objects, e.g.:
@@ -148,6 +153,10 @@ def _wire_channel(telegram, registry, approval, cron_mgr, build_system_prompt):
     # Browser screenshot → Telegram photo; PDF → Telegram document
     browser_tool.set_send_photo_fn(telegram.send_photo)
     browser_tool.set_send_document_fn(telegram.send_document)
+
+    # Canvas snapshot → Telegram photo
+    from tools import canvas_tool
+    canvas_tool.set_send_photo_fn(telegram.send_photo)
 
     # Cron manager (shared)
     cron_tool.set_manager(cron_mgr)
@@ -305,18 +314,36 @@ def main() -> None:
     all_tools = registry.get_names()
     logger.info("Bot ready. %d tools: %s", len(all_tools), ", ".join(all_tools))
 
-    if len(channels) == 1:
-        # Simple single-account blocking path
+    use_canvas_host = cfg.canvas_host_enabled
+
+    if use_canvas_host:
+        logger.info(
+            "Canvas host enabled — starting on %s:%d",
+            cfg.canvas_host_bind,
+            cfg.canvas_host_port,
+        )
+
+    if len(channels) == 1 and not use_canvas_host:
+        # Simple single-account blocking path (no canvas host)
         logger.info("Starting single-account bot...")
         channels[0].run()
     else:
-        # Multi-account: run all concurrently via asyncio
-        logger.info("Starting %d accounts concurrently...", len(channels))
-        asyncio.run(_run_all_accounts(channels))
+        # Async path: multi-account OR canvas host (or both)
+        logger.info(
+            "Starting %d account(s) in async mode (canvas_host=%s)...",
+            len(channels),
+            use_canvas_host,
+        )
+        asyncio.run(_run_async_main(channels, start_canvas_host=use_canvas_host))
 
 
-async def _run_all_accounts(channels: list) -> None:
-    """Run multiple TelegramChannel instances concurrently."""
+async def _run_async_main(channels: list, *, start_canvas_host: bool = False) -> None:
+    """
+    Async entry point for:
+    - Multi-account Telegram bots
+    - Single account + canvas host
+    - Both
+    """
     stop_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()
@@ -327,21 +354,41 @@ async def _run_all_accounts(channels: list) -> None:
             # Windows doesn't support add_signal_handler
             pass
 
-    # Start all channels
-    start_tasks = [asyncio.create_task(ch.run_async()) for ch in channels]
-    try:
-        await asyncio.gather(*start_tasks, return_exceptions=True)
-    except Exception as e:
-        logger.warning("Error starting accounts: %s", e)
+    tasks: list[asyncio.Task] = []
 
-    logger.info("All accounts running. Waiting for shutdown signal...")
+    # Start canvas host (runs alongside the Telegram bot(s))
+    if start_canvas_host:
+        from canvas_host.server import run_server
+        cfg = get_config()
+        canvas_task = asyncio.create_task(
+            run_server(host=cfg.canvas_host_bind, port=cfg.canvas_host_port),
+            name="canvas-host",
+        )
+        tasks.append(canvas_task)
+        logger.info("Canvas host task started on %s:%d", cfg.canvas_host_bind, cfg.canvas_host_port)
+
+    # Start all Telegram channels
+    for ch in channels:
+        t = asyncio.create_task(ch.run_async(), name=f"telegram-{getattr(ch, 'label', 'main')}")
+        tasks.append(t)
+
+    logger.info("All tasks started (%d). Waiting for shutdown signal...", len(tasks))
     await stop_event.wait()
 
     # Graceful shutdown
-    logger.info("Shutting down all accounts...")
+    logger.info("Shutting down...")
+
+    # Stop Telegram bots first
     stop_tasks = [asyncio.create_task(ch.stop_async()) for ch in channels]
     await asyncio.gather(*stop_tasks, return_exceptions=True)
-    logger.info("All accounts stopped.")
+
+    # Cancel remaining tasks (canvas host, etc.)
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":

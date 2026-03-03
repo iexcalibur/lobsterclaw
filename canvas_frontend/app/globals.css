@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --canvas-bg: #0f0f11;
+  --canvas-surface: #1a1a1f;
+  --canvas-border: #2d2d3e;
+  --canvas-accent: #a78bfa;
+  --canvas-text: #e2e8f0;
+  --canvas-muted: #94a3b8;
+}
+
+html, body {
+  background-color: var(--canvas-bg);
+  color: var(--canvas-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #3d3d52; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #5a5a7a; }
+
+/* Prose overrides for markdown */
+.prose pre { background: var(--canvas-surface) !important; }
+.prose code::before, .prose code::after { content: '' !important; }
