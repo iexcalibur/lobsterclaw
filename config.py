@@ -46,7 +46,12 @@ class Config:
     tools_allow: list[str] = field(
         default_factory=lambda: _env_list(
             "TOOLS_ALLOW",
-            "web_fetch,web_search,cron,memory_search,memory_get,memory_write,message,tts,pdf,image",
+            (
+                "web_fetch,web_search,cron,memory_search,memory_get,memory_write,"
+                "message,tts,pdf,image,"
+                "sessions_spawn,sessions_list,sessions_history,sessions_send,"
+                "session_status,subagents,agents_list"
+            ),
         )
     )
     tools_deny: list[str] = field(
@@ -96,6 +101,16 @@ class Config:
     tts_enabled: bool = field(default_factory=lambda: _env_bool("TTS_ENABLED", True))
     tts_voice: str = field(default_factory=lambda: _env("TTS_VOICE", "en-US-GuyNeural"))
 
+    # Sub-agents
+    subagents_enabled: bool = field(default_factory=lambda: _env_bool("SUBAGENTS_ENABLED", True))
+    subagents_max_depth: int = field(default_factory=lambda: _env_int("SUBAGENTS_MAX_DEPTH", 3))
+    subagents_max_children: int = field(default_factory=lambda: _env_int("SUBAGENTS_MAX_CHILDREN", 5))
+
+    # Tool result truncation
+    tool_result_max_chars: int = field(
+        default_factory=lambda: _env_int("TOOL_RESULT_MAX_CHARS", 50_000)
+    )
+
     # General
     data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "~/.pygate"))
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
@@ -127,6 +142,10 @@ class Config:
     @property
     def cron_db(self) -> Path:
         return Path(self.cron_db_path).expanduser()
+
+    @property
+    def sessions_db(self) -> Path:
+        return self.data_path / "sessions.db"
 
 
 _config: Config | None = None

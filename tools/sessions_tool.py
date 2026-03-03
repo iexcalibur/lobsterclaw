@@ -1,0 +1,343 @@
+"""
+Sessions & agent orchestration tools — mirrors OpenClaw's sessions tools.
+
+Tools implemented:
+  sessions_spawn    — spawn a sub-agent with an isolated task
+  sessions_list     — list all sessions (main + sub-agents)
+  sessions_history  — read message history for a session
+  sessions_send     — inject a message into a running session
+  session_status    — current session usage and model info
+  subagents         — list/cancel running sub-agents
+  agents_list       — list configured agents
+"""
+
+from __future__ import annotations
+
+import logging
+
+from tools.registry import ToolDefinition
+
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------
+# sessions_spawn
+# ------------------------------------------------------------------
+
+SESSIONS_SPAWN_TOOL = ToolDefinition(
+    name="sessions_spawn",
+    description=(
+        "Spawn a sub-agent to handle a task in isolation. "
+        "The sub-agent runs autonomously, has access to all tools, "
+        "and auto-announces its result when done. "
+        "Use this to delegate long, independent tasks. "
+        "Do NOT poll for completion — the result will be sent back automatically."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "The full task description for the sub-agent",
+            },
+            "label": {
+                "type": "string",
+                "description": "Short human-readable name for this sub-agent run (optional)",
+            },
+            "model": {
+                "type": "string",
+                "description": "Override the LLM model for this sub-agent (optional, defaults to current model)",
+            },
+        },
+        "required": ["task"],
+    },
+    fn=lambda **kw: _sessions_spawn(**kw),
+)
+
+
+async def _sessions_spawn(
+    task: str,
+    label: str = "",
+    model: str | None = None,
+    _session_id: str = "main",  # injected by AgentLoop if available
+) -> str:
+    from agent.subagent import get_subagent_manager
+    try:
+        mgr = get_subagent_manager()
+        result = await mgr.spawn(
+            task=task,
+            label=label,
+            parent_session_id=_session_id,
+            model=model or None,
+        )
+        if result["status"] == "accepted":
+            return (
+                f"Sub-agent spawned successfully.\n"
+                f"run_id: {result['run_id']}\n"
+                f"session_id: {result['session_id']}\n"
+                f"label: {result['label']}\n"
+                f"depth: {result['depth']}\n\n"
+                f"Note: {result['note']}"
+            )
+        return f"sessions_spawn {result['status']}: {result.get('error', '')}"
+    except Exception as e:
+        return f"Error spawning sub-agent: {e}"
+
+
+# ------------------------------------------------------------------
+# sessions_list
+# ------------------------------------------------------------------
+
+SESSIONS_LIST_TOOL = ToolDefinition(
+    name="sessions_list",
+    description="List all sessions (main conversation + sub-agent sessions) with their status.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": "Filter by status: active | completed | error | cancelled (optional)",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max sessions to return (default 20)",
+                "default": 20,
+            },
+        },
+        "required": [],
+    },
+    fn=lambda **kw: _sessions_list(**kw),
+)
+
+
+async def _sessions_list(status: str | None = None, limit: int = 20) -> str:
+    from agent.sessions import get_session_store
+    try:
+        store = get_session_store()
+        sessions = await store.list_sessions(status=status, limit=limit)
+        if not sessions:
+            return "No sessions found."
+        lines = []
+        for s in sessions:
+            depth_str = f" depth={s.depth}" if s.depth > 0 else " (main)"
+            parent_str = f" parent={s.parent_id}" if s.parent_id else ""
+            lines.append(
+                f"• `{s.id}` [{s.status}]{depth_str}{parent_str} label={s.label} updated={s.updated_at}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing sessions: {e}"
+
+
+# ------------------------------------------------------------------
+# sessions_history
+# ------------------------------------------------------------------
+
+SESSIONS_HISTORY_TOOL = ToolDefinition(
+    name="sessions_history",
+    description=(
+        "Read the message history for a specific session. "
+        "Use sessions_list first to find the session ID."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "The session ID to read history from",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max messages to return (default 50)",
+                "default": 50,
+            },
+        },
+        "required": ["session_id"],
+    },
+    fn=lambda **kw: _sessions_history(**kw),
+)
+
+
+async def _sessions_history(session_id: str, limit: int = 50) -> str:
+    from agent.sessions import get_session_store
+    try:
+        store = get_session_store()
+        session = await store.get_session(session_id)
+        if not session:
+            return f"Session '{session_id}' not found."
+        history = await store.get_messages_formatted(session_id, limit=limit)
+        return f"Session `{session_id}` ({session.label}) — last {limit} messages:\n\n{history}"
+    except Exception as e:
+        return f"Error reading session history: {e}"
+
+
+# ------------------------------------------------------------------
+# sessions_send
+# ------------------------------------------------------------------
+
+SESSIONS_SEND_TOOL = ToolDefinition(
+    name="sessions_send",
+    description=(
+        "Send a message into a running sub-agent session to steer or provide additional context. "
+        "The sub-agent will process the message on its next iteration."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Target session ID",
+            },
+            "message": {
+                "type": "string",
+                "description": "Message to inject into the session",
+            },
+        },
+        "required": ["session_id", "message"],
+    },
+    fn=lambda **kw: _sessions_send(**kw),
+)
+
+
+async def _sessions_send(session_id: str, message: str) -> str:
+    from agent.sessions import get_session_store
+    try:
+        store = get_session_store()
+        session = await store.get_session(session_id)
+        if not session:
+            return f"Session '{session_id}' not found."
+        if session.status != "active":
+            return f"Session '{session_id}' is {session.status} — cannot send to it."
+        # Append to session history as an injected user message
+        await store.append_message(session_id, "user", f"[Injected message]: {message}")
+        return f"Message injected into session '{session_id}' ({session.label})."
+    except Exception as e:
+        return f"Error sending to session: {e}"
+
+
+# ------------------------------------------------------------------
+# session_status
+# ------------------------------------------------------------------
+
+SESSION_STATUS_TOOL = ToolDefinition(
+    name="session_status",
+    description=(
+        "Return the current session's model, token usage estimate, depth, and active sub-agents."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+    fn=lambda **kw: _session_status(**kw),
+)
+
+
+async def _session_status(_session_id: str = "main") -> str:
+    from agent.sessions import get_session_store
+    from agent.subagent import get_subagent_manager
+    from config import get_config
+    try:
+        store = get_session_store()
+        cfg = get_config()
+        session = await store.get_session(_session_id)
+
+        active_subagents = []
+        try:
+            mgr = get_subagent_manager()
+            active_subagents = mgr.list_runs(status="running")
+        except Exception:
+            pass
+
+        lines = [
+            f"**Session ID:** {_session_id}",
+            f"**Model:** {cfg.llm_model}",
+            f"**Provider:** {cfg.llm_provider}",
+            f"**Max tokens:** {cfg.llm_max_tokens}",
+            f"**Tool iterations limit:** {cfg.max_tool_iterations}",
+        ]
+        if session:
+            lines += [
+                f"**Depth:** {session.depth}",
+                f"**Status:** {session.status}",
+                f"**Last updated:** {session.updated_at}",
+            ]
+        lines.append(f"**Active sub-agents:** {len(active_subagents)}")
+        if active_subagents:
+            for r in active_subagents:
+                lines.append(f"  • `{r.run_id}` {r.label} (depth {r.depth})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reading session status: {e}"
+
+
+# ------------------------------------------------------------------
+# subagents (list / cancel)
+# ------------------------------------------------------------------
+
+SUBAGENTS_TOOL = ToolDefinition(
+    name="subagents",
+    description=(
+        "List or cancel running sub-agents. "
+        "Actions: 'list' — show all sub-agents and their status. "
+        "'cancel' — cancel a specific sub-agent by run_id."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "description": "Action: 'list' or 'cancel'",
+            },
+            "run_id": {
+                "type": "string",
+                "description": "Sub-agent run_id to cancel (required for cancel action)",
+            },
+        },
+        "required": ["action"],
+    },
+    fn=lambda **kw: _subagents(**kw),
+)
+
+
+async def _subagents(action: str, run_id: str | None = None) -> str:
+    from agent.subagent import get_subagent_manager
+    try:
+        mgr = get_subagent_manager()
+        if action == "list":
+            return mgr.format_list()
+        if action == "cancel":
+            if not run_id:
+                return "run_id is required to cancel a sub-agent"
+            return await mgr.cancel(run_id)
+        return f"Unknown action '{action}'. Use 'list' or 'cancel'."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ------------------------------------------------------------------
+# agents_list
+# ------------------------------------------------------------------
+
+AGENTS_LIST_TOOL = ToolDefinition(
+    name="agents_list",
+    description=(
+        "List all available agents that can be targeted with sessions_spawn. "
+        "In PyGate there is one default agent (the current one)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+    fn=lambda **kw: _agents_list(**kw),
+)
+
+
+async def _agents_list() -> str:
+    from config import get_config
+    cfg = get_config()
+    return (
+        f"Available agents:\n\n"
+        f"• **default** — {cfg.llm_provider}/{cfg.llm_model} (this agent)\n\n"
+        f"Sub-agents spawned via sessions_spawn use the same agent with optional model override."
+    )

@@ -26,8 +26,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def build_registry():
-    from tools.registry import ToolRegistry, ToolDefinition
+def build_registry(send_fn=None):
+    """Build and return a ToolRegistry with all registered tools."""
+    from tools.registry import ToolRegistry
     from tools import (
         web_fetch,
         web_search,
@@ -38,6 +39,7 @@ def build_registry():
         media_tool,
         message_tool,
         cron_tool,
+        sessions_tool,
     )
 
     registry = ToolRegistry()
@@ -46,7 +48,7 @@ def build_registry():
     registry.register(web_fetch.TOOL_DEFINITION)
     registry.register(web_search.TOOL_DEFINITION)
 
-    # Shell (only registered if exec_enabled; policy also blocks via tools_deny)
+    # Shell
     registry.register(exec_tool.TOOL_DEFINITION)
     registry.register(exec_tool.PROCESS_TOOL_DEFINITION)
 
@@ -73,22 +75,29 @@ def build_registry():
     registry.register(message_tool.TOOL_DEFINITION)
     registry.register(cron_tool.TOOL_DEFINITION)
 
+    # Sessions / sub-agents / orchestration
+    registry.register(sessions_tool.SESSIONS_SPAWN_TOOL)
+    registry.register(sessions_tool.SESSIONS_LIST_TOOL)
+    registry.register(sessions_tool.SESSIONS_HISTORY_TOOL)
+    registry.register(sessions_tool.SESSIONS_SEND_TOOL)
+    registry.register(sessions_tool.SESSION_STATUS_TOOL)
+    registry.register(sessions_tool.SUBAGENTS_TOOL)
+    registry.register(sessions_tool.AGENTS_LIST_TOOL)
+
     return registry
 
 
 def main() -> None:
     logger.info("Starting PyGate...")
 
-    # Validate config early
     cfg = get_config()
     logger.info("LLM provider: %s / model: %s", cfg.llm_provider, cfg.llm_model)
     logger.info("Owner Telegram ID: %s", cfg.telegram_owner_id)
 
-    # Ensure data directories exist
     cfg.data_path.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------------------------------------------
-    # Build components
+    # Build core components
     # ----------------------------------------------------------------
 
     from tools.approval import ApprovalGate
@@ -96,8 +105,19 @@ def main() -> None:
     from agent.loop import AgentLoop
     from agent.prompt import build_system_prompt
     from agent.heartbeat import HeartbeatRunner
+    from agent.sessions import SessionStore, set_session_store
+    from agent.subagent import SubagentManager, set_subagent_manager
     from scheduler.manager import CronManager
     from channels.telegram import TelegramChannel
+
+    # Session store — SQLite-backed registry of all sessions
+    session_store = SessionStore(cfg.sessions_db)
+    set_session_store(session_store)
+    logger.info("Session store initialized at %s", cfg.sessions_db)
+
+    # Sub-agent manager
+    subagent_mgr = SubagentManager()
+    set_subagent_manager(subagent_mgr)
 
     approval = ApprovalGate()
     registry = build_registry()
@@ -117,7 +137,7 @@ def main() -> None:
     )
 
     # ----------------------------------------------------------------
-    # Wire lazy send functions (tools that need to push to Telegram)
+    # Wire lazy send functions
     # ----------------------------------------------------------------
 
     from tools import message_tool, media_tool, cron_tool
@@ -126,24 +146,44 @@ def main() -> None:
     media_tool.set_send_audio(telegram.send_audio)
     cron_tool.set_manager(cron_mgr)
 
-    # Shared agent runner for background tasks (cron + heartbeat)
+    # ----------------------------------------------------------------
+    # Sub-agent factory — creates a fresh registry for each sub-agent
+    # (each sub-agent gets its own isolated tool registry + message_tool wired)
+    # ----------------------------------------------------------------
+
+    def subagent_registry_factory():
+        sub_registry = build_registry()
+        sub_registry.set_approval_gate(approval)
+        message_tool.set_send_fn(telegram.send_message)
+        return sub_registry
+
+    subagent_mgr.configure(
+        send_fn=telegram.send_message,
+        agent_loop_factory=subagent_registry_factory,
+    )
+
+    # ----------------------------------------------------------------
+    # Background agent runner (used by cron + heartbeat)
+    # ----------------------------------------------------------------
+
     async def agent_for_bg(message: str, system_prompt: str | None = None) -> str:
         system = system_prompt or build_system_prompt(cfg, registry.get_names())
         return await agent.run([{"role": "user", "content": message}], system)
 
-    # Cron fires agent loop so reminders have full tool access
     cron_mgr.configure(
         send_fn=telegram.send_message,
         agent_fn=lambda msg: agent_for_bg(msg),
     )
 
-    # Heartbeat fires agent loop with HEARTBEAT.md context
     heartbeat.configure(
         agent_fn=agent_for_bg,
         send_fn=telegram.send_message,
     )
 
-    # Start cron + heartbeat on a shared scheduler
+    # ----------------------------------------------------------------
+    # Start schedulers
+    # ----------------------------------------------------------------
+
     if cfg.cron_enabled:
         cron_mgr.start()
         logger.info("Cron scheduler started")
@@ -155,7 +195,10 @@ def main() -> None:
     # Start Telegram bot (blocking)
     # ----------------------------------------------------------------
 
-    logger.info("Bot is running. Send a message to start.")
+    logger.info(
+        "Bot ready. Tools: %s",
+        ", ".join(registry.get_names()),
+    )
     telegram.run()
 
 
@@ -166,6 +209,5 @@ if __name__ == "__main__":
         logger.info("Shutting down.")
         sys.exit(0)
     except ValueError as e:
-        # Config validation errors
         logger.error("%s", e)
         sys.exit(1)
