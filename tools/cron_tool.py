@@ -24,6 +24,12 @@ def set_manager(mgr: Any) -> None:
 TOOL_DEFINITION = ToolDefinition(
     name="cron",
     description=(
+        "Cron job semantics:\n"
+        "  session_target: 'main' (default) — fire in the main chat session\n"
+        "                  'isolated' — spawn an isolated sub-agent for each run\n"
+        "  delivery:       'agent' (default) — pass reminder to the AI agent\n"
+        "                  'direct' — send message directly without AI processing\n\n"
+    ) + (
         "Schedule and manage reminders and recurring tasks.\n"
         "Actions:\n"
         "  status   — show scheduler status\n"
@@ -68,6 +74,14 @@ TOOL_DEFINITION = ToolDefinition(
                 "type": "string",
                 "description": "Text to pass to the agent on wake (for 'wake' action)",
             },
+            "session_target": {
+                "type": "string",
+                "description": "Delivery target: 'main' (default, run in main session) | 'isolated' (spawn sub-agent for each run)",
+            },
+            "delivery": {
+                "type": "string",
+                "description": "Delivery mode: 'agent' (default, pass to AI) | 'direct' (send message without AI)",
+            },
         },
         "required": ["action"],
     },
@@ -82,6 +96,8 @@ async def _cron(
     message: str | None = None,
     description: str | None = None,
     wake_text: str | None = None,
+    session_target: str = "main",
+    delivery: str = "agent",
 ) -> str:
     if not _manager:
         return "Cron scheduler not initialized"
@@ -103,6 +119,8 @@ async def _cron(
             schedule=schedule,
             message=message,
             description=description or message[:60],
+            session_target=session_target,
+            delivery=delivery,
         )
 
     if action == "update":

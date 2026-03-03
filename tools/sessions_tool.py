@@ -314,20 +314,27 @@ async def _session_status(_session_id: str = "main") -> str:
 SUBAGENTS_TOOL = ToolDefinition(
     name="subagents",
     description=(
-        "List or cancel running sub-agents. "
-        "Actions: 'list' — show all sub-agents and their status. "
-        "'cancel' — cancel a specific sub-agent by run_id."
+        "List, steer, or cancel running sub-agents.\n"
+        "Actions:\n"
+        "  list   — show all sub-agents and their status\n"
+        "  steer  — inject guidance text into a running sub-agent's context\n"
+        "           (sub-agent sees it on its next tool-call iteration)\n"
+        "  cancel — cancel a sub-agent by run_id"
     ),
     parameters={
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "description": "Action: 'list' or 'cancel'",
+                "description": "Action: list | steer | cancel",
             },
             "run_id": {
                 "type": "string",
-                "description": "Sub-agent run_id to cancel (required for cancel action)",
+                "description": "Sub-agent run_id (required for steer and cancel)",
+            },
+            "message": {
+                "type": "string",
+                "description": "Guidance message to inject (required for steer)",
             },
         },
         "required": ["action"],
@@ -336,7 +343,7 @@ SUBAGENTS_TOOL = ToolDefinition(
 )
 
 
-async def _subagents(action: str, run_id: str | None = None) -> str:
+async def _subagents(action: str, run_id: str | None = None, message: str | None = None) -> str:
     from agent.subagent import get_subagent_manager
     try:
         mgr = get_subagent_manager()
@@ -346,7 +353,13 @@ async def _subagents(action: str, run_id: str | None = None) -> str:
             if not run_id:
                 return "run_id is required to cancel a sub-agent"
             return await mgr.cancel(run_id)
-        return f"Unknown action '{action}'. Use 'list' or 'cancel'."
+        if action == "steer":
+            if not run_id:
+                return "run_id is required for steer"
+            if not message:
+                return "message is required for steer"
+            return await mgr.steer(run_id, message)
+        return f"Unknown action '{action}'. Use 'list', 'steer', or 'cancel'."
     except Exception as e:
         return f"Error: {e}"
 

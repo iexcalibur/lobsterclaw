@@ -67,6 +67,7 @@ TOOL_DEFINITION = ToolDefinition(
         "required": ["command"],
     },
     fn=lambda **kw: _exec(**kw),
+    owner_only=True,  # Shell execution is owner-only (blocked in sub-agents by default)
 )
 
 # ------------------------------------------------------------------
@@ -104,6 +105,7 @@ PROCESS_TOOL_DEFINITION = ToolDefinition(
         "required": ["action"],
     },
     fn=lambda **kw: _process(**kw),
+    owner_only=True,  # Process management is owner-only (blocked in sub-agents by default)
 )
 
 

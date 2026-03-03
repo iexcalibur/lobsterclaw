@@ -104,7 +104,9 @@ TOOL_DEFINITION = ToolDefinition(
             "file_path": {"type": "string", "description": "Local file path (for upload)"},
             "direction": {"type": "string", "description": "Scroll direction: up|down|left|right (default: down)"},
             "amount": {"type": "integer", "description": "Scroll pixels (default 500)"},
-            "sub_action": {"type": "string", "description": "act sub-action: click|type|press|hover|select|fill|scroll|wait|evaluate|drag"},
+            "width": {"type": "integer", "description": "Viewport width in pixels (for resize action)"},
+            "height": {"type": "integer", "description": "Viewport height in pixels (for resize action)"},
+            "sub_action": {"type": "string", "description": "act sub-action: click|type|press|hover|select|fill|scroll|wait|evaluate|drag|resize|close"},
             "dialog_action": {"type": "string", "description": "Dialog action: accept|dismiss (default: accept)"},
             "prompt_text": {"type": "string", "description": "Text to enter in a prompt dialog"},
             "wait_ms": {"type": "integer", "description": "Milliseconds to wait (for sub_action=wait)"},
@@ -136,6 +138,8 @@ async def _browser(
     prompt_text: str | None = None,
     wait_ms: int = 1000,
     timeout: int = 10_000,
+    width: int | None = None,
+    height: int | None = None,
 ) -> str:
     global _playwright_instance, _browser_instance, _tabs, _active_tab_id
 
@@ -387,11 +391,11 @@ async def _browser(
     if action == "act":
         if not sub_action:
             return "Error: 'sub_action' is required for act action"
-        return await _act(page, sub_action, selector, value, key, script, direction, amount, wait_ms, timeout)
+        return await _act(page, sub_action, selector, value, key, script, direction, amount, wait_ms, timeout, width, height)
 
     # Convenience aliases (direct action names map to act sub-actions)
-    if action in ("click", "fill", "type", "press", "hover", "select", "scroll", "wait", "evaluate", "drag"):
-        return await _act(page, action, selector, value, key, script, direction, amount, wait_ms, timeout)
+    if action in ("click", "fill", "type", "press", "hover", "select", "scroll", "wait", "evaluate", "drag", "resize", "close"):
+        return await _act(page, action, selector, value, key, script, direction, amount, wait_ms, timeout, width, height)
 
     return (
         f"Unknown browser action '{action}'. "
@@ -407,6 +411,7 @@ async def _act(
     page, sub_action: str,
     selector: str | None, value: str | None, key: str | None,
     script: str | None, direction: str, amount: int, wait_ms: int, timeout: int,
+    width: int | None = None, height: int | None = None,
 ) -> str:
     sub_action = sub_action.lower().strip()
 
@@ -511,7 +516,31 @@ async def _act(
         except Exception as e:
             return f"Drag error: {e}"
 
-    return f"Unknown act sub_action '{sub_action}'. Use: click, fill, type, press, hover, select, scroll, wait, evaluate, drag"
+    if sub_action == "resize":
+        w = width or 1280
+        h = height or 800
+        try:
+            await page.set_viewport_size({"width": w, "height": h})
+            return f"Viewport resized to {w}x{h}"
+        except Exception as e:
+            return f"Resize error: {e}"
+
+    if sub_action == "close":
+        # Close the current tab
+        global _active_tab_id
+        for tid, t in list(_tabs.items()):
+            if t.page is page:
+                try:
+                    await t.page.close()
+                except Exception:
+                    pass
+                _tabs.pop(tid, None)
+                if _active_tab_id == tid:
+                    _active_tab_id = next(iter(_tabs), None)
+                return f"Tab {tid} closed ✅"
+        return "No matching tab found to close."
+
+    return f"Unknown act sub_action '{sub_action}'. Use: click, fill, type, press, hover, select, scroll, wait, evaluate, drag, resize, close"
 
 
 # ------------------------------------------------------------------

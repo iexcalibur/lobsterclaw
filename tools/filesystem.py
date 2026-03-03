@@ -73,11 +73,29 @@ EDIT_TOOL = ToolDefinition(
 
 APPLY_PATCH_TOOL = ToolDefinition(
     name="apply_patch",
-    description="Apply a unified diff patch to files. Requires 'patch' to be installed.",
+    description=(
+        "Apply a patch to files. Two formats are supported:\n\n"
+        "1. OpenAI patch format (preferred — no external tools needed):\n"
+        "   *** Begin Patch\n"
+        "   *** Update File: path/to/file.py\n"
+        "   @@ -old_line_context\n"
+        "   -removed line\n"
+        "   +added line\n"
+        "    context line\n"
+        "   *** End Patch\n\n"
+        "2. Unified diff format (requires 'patch' binary):\n"
+        "   --- a/path/to/file\n"
+        "   +++ b/path/to/file\n"
+        "   @@ ... @@\n\n"
+        "Auto-detects format from content."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "patch": {"type": "string", "description": "Unified diff patch string"},
+            "patch": {
+                "type": "string",
+                "description": "Patch content in OpenAI format (*** Begin Patch) or unified diff format",
+            },
         },
         "required": ["patch"],
     },
@@ -183,7 +201,196 @@ async def _edit(path: str, old_string: str, new_string: str) -> str:
 
 
 async def _apply_patch(patch: str) -> str:
-    """Apply a unified diff patch — runs 'patch' subprocess asynchronously."""
+    """
+    Apply a patch. Auto-detects format:
+      - OpenAI patch format: starts with '*** Begin Patch'
+      - Unified diff: contains '--- ' / '+++ ' headers
+    """
+    patch = patch.strip()
+    if patch.startswith("*** Begin Patch"):
+        return _apply_openai_patch(patch)
+    return await _apply_unified_patch(patch)
+
+
+def _apply_openai_patch(patch: str) -> str:
+    """
+    Apply OpenAI patch format (as described in apply-patch.ts).
+
+    Format:
+      *** Begin Patch
+      *** Update File: relative/path.ext
+      @@ optional context hint
+      -deleted line
+      +added line
+       context line (space prefix)
+      *** End Patch
+
+    Other directives:
+      *** Add File: path      — create a new file
+      *** Delete File: path   — delete a file
+      *** Rename File: old -> new
+    """
+    import re
+
+    lines = patch.splitlines()
+    results: list[str] = []
+    i = 0
+
+    # Skip '*** Begin Patch'
+    if lines and lines[i].strip() == "*** Begin Patch":
+        i += 1
+
+    while i < len(lines):
+        line = lines[i]
+
+        if line.startswith("*** End Patch"):
+            break
+
+        # --- Add File ---
+        if line.startswith("*** Add File: "):
+            path = line[len("*** Add File: "):].strip()
+            i += 1
+            content_lines: list[str] = []
+            while i < len(lines) and not lines[i].startswith("***"):
+                content_lines.append(lines[i][1:] if lines[i].startswith("+") else lines[i])
+                i += 1
+            p = Path(path).expanduser()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("\n".join(content_lines), encoding="utf-8")
+            results.append(f"Added: {path}")
+            continue
+
+        # --- Delete File ---
+        if line.startswith("*** Delete File: "):
+            path = line[len("*** Delete File: "):].strip()
+            i += 1
+            p = Path(path).expanduser()
+            if p.exists():
+                p.unlink()
+                results.append(f"Deleted: {path}")
+            else:
+                results.append(f"Skipped (not found): {path}")
+            continue
+
+        # --- Rename File ---
+        if line.startswith("*** Rename File: "):
+            spec = line[len("*** Rename File: "):].strip()
+            if " -> " in spec:
+                old, new = spec.split(" -> ", 1)
+                import shutil
+                src = Path(old.strip()).expanduser()
+                dst = Path(new.strip()).expanduser()
+                if src.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+                    results.append(f"Renamed: {old} → {new}")
+                else:
+                    results.append(f"Error: source not found for rename: {old}")
+            i += 1
+            continue
+
+        # --- Update File ---
+        if line.startswith("*** Update File: "):
+            path = line[len("*** Update File: "):].strip()
+            i += 1
+            p = Path(path).expanduser()
+            if not p.exists():
+                results.append(f"Error: file not found: {path}")
+                # Skip to next directive
+                while i < len(lines) and not lines[i].startswith("***"):
+                    i += 1
+                continue
+
+            file_text = p.read_text(encoding="utf-8", errors="replace")
+            file_lines = file_text.splitlines()
+
+            # Collect all hunks for this file
+            hunks: list[list[str]] = []
+            current_hunk: list[str] = []
+            while i < len(lines) and not lines[i].startswith("*** "):
+                l = lines[i]
+                if l.startswith("@@"):
+                    if current_hunk:
+                        hunks.append(current_hunk)
+                    current_hunk = []
+                    i += 1
+                    continue
+                current_hunk.append(l)
+                i += 1
+            if current_hunk:
+                hunks.append(current_hunk)
+
+            # Apply hunks in order
+            try:
+                patched = _apply_hunks(file_lines, hunks, path)
+                p.write_text(patched, encoding="utf-8")
+                results.append(f"Updated: {path}")
+            except Exception as e:
+                results.append(f"Error updating {path}: {e}")
+            continue
+
+        i += 1
+
+    return "\n".join(results) if results else "No changes applied."
+
+
+def _apply_hunks(file_lines: list[str], hunks: list[list[str]], path: str) -> str:
+    """
+    Apply a list of hunks to file_lines. Each hunk is a list of lines:
+      ' ' prefix = context (must match)
+      '-' prefix = delete
+      '+' prefix = insert
+    Returns the patched file as a string.
+    """
+    result = list(file_lines)
+    # Apply hunks with a sliding offset
+    offset = 0
+
+    for hunk in hunks:
+        context = [l[1:] if l.startswith((" ", "-", "+")) else l for l in hunk]
+        search_lines = [l[1:] for l in hunk if not l.startswith("+")]
+
+        # Find the location of the search_lines in result
+        pos = _find_hunk_position(result, search_lines, offset)
+        if pos < 0:
+            raise ValueError(
+                f"Could not locate hunk in {path}. "
+                f"Expected context: {search_lines[:3]}"
+            )
+
+        # Build replacement
+        replacement: list[str] = []
+        for l in hunk:
+            if l.startswith("+"):
+                replacement.append(l[1:])
+            elif l.startswith("-"):
+                pass  # delete
+            else:
+                replacement.append(l[1:] if l.startswith(" ") else l)
+
+        result[pos:pos + len(search_lines)] = replacement
+        offset = pos + len(replacement)
+
+    return "\n".join(result) + ("\n" if file_lines else "")
+
+
+def _find_hunk_position(lines: list[str], search: list[str], start_hint: int = 0) -> int:
+    """Find the first position in lines where search matches, starting near start_hint."""
+    if not search:
+        return start_hint
+    n = len(lines)
+    m = len(search)
+    # Try from start_hint first, then scan all
+    for begin in list(range(start_hint, n)) + list(range(0, start_hint)):
+        if begin + m > n:
+            continue
+        if all(lines[begin + j].rstrip() == search[j].rstrip() for j in range(m)):
+            return begin
+    return -1
+
+
+async def _apply_unified_patch(patch: str) -> str:
+    """Apply a unified diff patch via the system 'patch' command."""
     import tempfile
     import os
 

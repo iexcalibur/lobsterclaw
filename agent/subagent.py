@@ -183,6 +183,9 @@ class SubagentManager:
             cfg = get_config()
             registry: ToolRegistry = self._agent_loop_factory()
 
+            # Set session depth on registry so owner_only / depth_limit checks work
+            registry.set_session_depth(child_depth)
+
             # Apply sandbox mode — restrict dangerous tools in strict mode
             sandbox = getattr(run, "_sandbox", "inherit")
             if sandbox == "strict":
@@ -268,6 +271,30 @@ class SubagentManager:
         await store.update_session_status(run.session_id, "cancelled")
         logger.info("Cancelled sub-agent run_id=%s", run_id)
         return f"Sub-agent '{run_id}' ({run.label}) cancelled."
+
+    async def steer(self, run_id: str, message: str) -> str:
+        """
+        Inject a steer message into a running sub-agent's session history.
+        The sub-agent will see it as a user injection on its next iteration.
+
+        Note: this is best-effort — if the sub-agent's coroutine has already
+        passed the message-read point it won't see it until a later iteration.
+        """
+        run = self._registry.get(run_id)
+        if not run:
+            return f"No sub-agent found with run_id '{run_id}'"
+        if run.status != "running":
+            return f"Sub-agent '{run_id}' is not running (status: {run.status})"
+        store = get_session_store()
+        await store.append_message(
+            run.session_id, "user",
+            f"[Steer from parent] {message}"
+        )
+        logger.info("Steer injected into run_id=%s session=%s", run_id, run.session_id)
+        return (
+            f"Steer message injected into sub-agent '{run_id}' ({run.label}). "
+            f"It will be picked up on the next iteration."
+        )
 
     def format_list(self) -> str:
         runs = self.list_runs()

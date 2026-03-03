@@ -43,7 +43,7 @@ TOOL_DEFINITION = ToolDefinition(
         "properties": {
             "action": {
                 "type": "string",
-                "description": "Action: status | restart | config.get | config.schema | config.set | config.apply | config.patch | update.run",
+                "description": "Action: status | restart | config.get | config.schema | config.set | config.apply | config.patch | update.run | policy",
             },
             "key": {
                 "type": "string",
@@ -61,6 +61,7 @@ TOOL_DEFINITION = ToolDefinition(
         "required": ["action"],
     },
     fn=lambda **kw: _gateway(**kw),
+    owner_only=True,  # Only the main session may control the gateway
 )
 
 
@@ -197,4 +198,13 @@ async def _gateway(
         except Exception as e:
             return f"Update error: {e}"
 
-    return f"Unknown action '{action}'. Use: status, restart, config.get, config.schema, config.set, config.apply, config.patch, update.run"
+    if action == "policy":
+        # Show tool policy summary (allow/deny/owner_only per tool)
+        try:
+            from main import _get_registry
+            registry = _get_registry()
+            return registry.policy_summary()
+        except Exception:
+            return "Policy summary requires the registry to be accessible. Run from main process."
+
+    return f"Unknown action '{action}'. Use: status, restart, config.get, config.schema, config.set, config.apply, config.patch, update.run, policy"

@@ -21,14 +21,32 @@ TOOL_DEFINITION = ToolDefinition(
     name="web_search",
     description=(
         "Search the web and return results with titles, URLs, and descriptions.\n"
-        "Providers: brave (list), perplexity/gemini/grok/kimi (AI answer)."
+        "Providers: brave (ranked list), perplexity/gemini/grok/kimi (AI answer).\n\n"
+        "Filters (Brave-supported; AI providers will include in their prompt):\n"
+        "  count       — number of results (1-10, default 5)\n"
+        "  fresh       — recent results only\n"
+        "  time_range  — pd (past day) | pw (past week) | pm (past month) | py (past year)\n"
+        "  country     — ISO 2-letter country code (e.g. 'us', 'gb', 'de')\n"
+        "  language    — language code (e.g. 'en', 'es', 'zh')\n"
+        "  safe_search — 'strict' | 'moderate' | 'off' (default 'moderate')"
     ),
     parameters={
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query"},
-            "count": {"type": "integer", "description": "Number of results for brave (1-10, default 5)", "default": 5},
-            "fresh": {"type": "boolean", "description": "Request freshness filter / recent results (brave only)", "default": False},
+            "count": {"type": "integer", "description": "Number of results (1-10, default 5)", "default": 5},
+            "fresh": {"type": "boolean", "description": "Request recent results", "default": False},
+            "time_range": {
+                "type": "string",
+                "description": "Time filter: pd (past day) | pw (past week) | pm (past month) | py (past year)",
+            },
+            "country": {"type": "string", "description": "Country code (e.g. 'us', 'gb', 'de')"},
+            "language": {"type": "string", "description": "Language code (e.g. 'en', 'es', 'zh')"},
+            "safe_search": {
+                "type": "string",
+                "description": "Safe search level: strict | moderate | off",
+                "default": "moderate",
+            },
         },
         "required": ["query"],
     },
@@ -36,17 +54,38 @@ TOOL_DEFINITION = ToolDefinition(
 )
 
 
-async def _web_search(query: str, count: int = 5, fresh: bool = False) -> str:
+async def _web_search(
+    query: str,
+    count: int = 5,
+    fresh: bool = False,
+    time_range: str | None = None,
+    country: str | None = None,
+    language: str | None = None,
+    safe_search: str = "moderate",
+) -> str:
     cfg = get_config()
     count = min(max(1, count), cfg.web_search_max_results)
     provider = cfg.web_search_provider.lower()
 
+    # Build a filter hint for AI providers that don't have direct filter params
+    filter_hints: list[str] = []
+    if time_range:
+        label = {"pd": "past day", "pw": "past week", "pm": "past month", "py": "past year"}.get(time_range, time_range)
+        filter_hints.append(f"Results from: {label}")
+    if country:
+        filter_hints.append(f"Country: {country.upper()}")
+    if language:
+        filter_hints.append(f"Language: {language}")
+    augmented_query = query
+    if filter_hints:
+        augmented_query = query + " [" + "; ".join(filter_hints) + "]"
+
     providers = {
-        "brave": lambda: _brave(query, count, cfg.brave_api_key, fresh=fresh),
-        "perplexity": lambda: _perplexity(query, cfg.perplexity_api_key),
-        "gemini": lambda: _gemini(query, cfg.gemini_api_key),
-        "grok": lambda: _grok(query, getattr(cfg, "grok_api_key", "")),
-        "kimi": lambda: _kimi(query, getattr(cfg, "kimi_api_key", "")),
+        "brave": lambda: _brave(query, count, cfg.brave_api_key, fresh=fresh, time_range=time_range, country=country, language=language, safe_search=safe_search),
+        "perplexity": lambda: _perplexity(augmented_query, cfg.perplexity_api_key),
+        "gemini": lambda: _gemini(augmented_query, cfg.gemini_api_key),
+        "grok": lambda: _grok(augmented_query, getattr(cfg, "grok_api_key", "")),
+        "kimi": lambda: _kimi(augmented_query, getattr(cfg, "kimi_api_key", "")),
     }
 
     if provider not in providers:
@@ -72,13 +111,37 @@ async def _web_search(query: str, count: int = 5, fresh: bool = False) -> str:
 # Provider implementations
 # ------------------------------------------------------------------
 
-async def _brave(query: str, count: int, api_key: str, fresh: bool = False) -> str:
+async def _brave(
+    query: str,
+    count: int,
+    api_key: str,
+    fresh: bool = False,
+    time_range: str | None = None,
+    country: str | None = None,
+    language: str | None = None,
+    safe_search: str = "moderate",
+) -> str:
     if not api_key:
         return "Error: BRAVE_API_KEY not set in .env"
 
     params: dict = {"q": query, "count": count}
-    if fresh:
-        params["freshness"] = "pd"  # past day
+
+    # Freshness / time range (time_range takes precedence over fresh flag)
+    if time_range and time_range in ("pd", "pw", "pm", "py"):
+        params["freshness"] = time_range
+    elif fresh:
+        params["freshness"] = "pd"
+
+    # Country / language
+    if country:
+        params["country"] = country.lower()
+    if language:
+        params["search_lang"] = language.lower()
+        params["ui_lang"] = language.lower()
+
+    # Safe search
+    safe_map = {"strict": "strict", "moderate": "moderate", "off": "off"}
+    params["safesearch"] = safe_map.get(safe_search, "moderate")
 
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(

@@ -66,14 +66,16 @@ class CronManager:
         conn = sqlite3.connect(str(self.cfg.cron_db))
         conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
-                id          TEXT PRIMARY KEY,
-                description TEXT NOT NULL,
-                schedule    TEXT NOT NULL,
-                message     TEXT NOT NULL,
-                enabled     INTEGER DEFAULT 1,
-                created_at  TEXT NOT NULL,
-                run_count   INTEGER DEFAULT 0,
-                last_run    TEXT
+                id              TEXT PRIMARY KEY,
+                description     TEXT NOT NULL,
+                schedule        TEXT NOT NULL,
+                message         TEXT NOT NULL,
+                enabled         INTEGER DEFAULT 1,
+                created_at      TEXT NOT NULL,
+                run_count       INTEGER DEFAULT 0,
+                last_run        TEXT,
+                session_target  TEXT DEFAULT 'main',
+                delivery        TEXT DEFAULT 'agent'
             )
         """)
         conn.execute("""
@@ -147,12 +149,19 @@ class CronManager:
         logger.info("Firing cron job: %s", job_id)
         conn = sqlite3.connect(str(self.cfg.cron_db))
         fired_at = datetime.now().isoformat(timespec="seconds")
+        # Fetch session_target + delivery alongside update
         conn.execute(
             "UPDATE jobs SET run_count=run_count+1, last_run=? WHERE id=?",
             (fired_at, job_id),
         )
+        row = conn.execute(
+            "SELECT session_target, delivery FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
         conn.commit()
         conn.close()
+
+        session_target = (row[0] if row else None) or "main"
+        delivery = (row[1] if row else None) or "agent"
 
         if not self._send_fn:
             logger.warning("No send_fn — cannot deliver cron job %s", job_id)
@@ -160,6 +169,27 @@ class CronManager:
             return
 
         try:
+            if delivery == "direct":
+                # Skip AI — send reminder text directly to the user
+                await self._send_fn(f"⏰ *Reminder*\n\n{message}")
+                self._record_run(job_id, fired_at, "ok")
+                return
+
+            if session_target == "isolated":
+                # Spawn a sub-agent for this cron run
+                if self._agent_fn:
+                    import asyncio
+                    asyncio.create_task(
+                        self._fire_isolated(job_id, fired_at, message)
+                    )
+                    return  # result delivered by sub-agent
+                else:
+                    # Fall through to direct if no agent fn
+                    await self._send_fn(f"⏰ *Reminder* (isolated mode unavailable)\n\n{message}")
+                    self._record_run(job_id, fired_at, "ok")
+                    return
+
+            # Default: agent delivery in main session
             if self._agent_fn:
                 reply = await self._agent_fn(f"[Scheduled reminder] {message}")
                 await self._send_fn(reply)
@@ -170,16 +200,44 @@ class CronManager:
             logger.error("Cron job %s fire failed: %s", job_id, e)
             self._record_run(job_id, fired_at, "error", str(e))
 
+    async def _fire_isolated(self, job_id: str, fired_at: str, message: str) -> None:
+        """Spawn an isolated sub-agent for this cron job run."""
+        try:
+            from agent.subagent import get_subagent_manager
+            mgr = get_subagent_manager()
+            result_store = await mgr.spawn(
+                task=f"[Isolated cron job] {message}",
+                label=f"cron-{job_id}",
+                parent_session_id="main",
+            )
+            self._record_run(job_id, fired_at, "ok")
+        except Exception as e:
+            logger.error("Isolated cron job %s failed: %s", job_id, e)
+            self._record_run(job_id, fired_at, "error", str(e))
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def add_job(self, schedule: str, message: str, description: str = "") -> str:
+    async def add_job(
+        self,
+        schedule: str,
+        message: str,
+        description: str = "",
+        session_target: str = "main",
+        delivery: str = "agent",
+    ) -> str:
         # Validate schedule before writing to DB
         try:
             self._parse_trigger(schedule)
         except Exception as e:
             return f"Invalid schedule '{schedule}': {e}"
+
+        # Validate session_target + delivery
+        if session_target not in ("main", "isolated"):
+            return "Error: session_target must be 'main' or 'isolated'"
+        if delivery not in ("agent", "direct"):
+            return "Error: delivery must be 'agent' or 'direct'"
 
         job_id = uuid.uuid4().hex[:8]
         now = datetime.now().isoformat(timespec="seconds")
@@ -187,24 +245,25 @@ class CronManager:
 
         conn = sqlite3.connect(str(self.cfg.cron_db))
         conn.execute(
-            "INSERT INTO jobs(id, description, schedule, message, created_at) VALUES (?,?,?,?,?)",
-            (job_id, desc, schedule, message, now),
+            "INSERT INTO jobs(id, description, schedule, message, created_at, session_target, delivery) VALUES (?,?,?,?,?,?,?)",
+            (job_id, desc, schedule, message, now, session_target, delivery),
         )
         conn.commit()
         conn.close()
 
         self._schedule(job_id, schedule, message)
+        target_note = f"\nSession: {session_target} / delivery: {delivery}" if session_target != "main" or delivery != "agent" else ""
         return (
             f"Job scheduled ✅\n"
             f"ID: `{job_id}`\n"
             f"Schedule: `{schedule}`\n"
-            f"Message: {message}"
+            f"Message: {message}{target_note}"
         )
 
     def list_jobs(self) -> str:
         conn = sqlite3.connect(str(self.cfg.cron_db))
         rows = conn.execute(
-            "SELECT id, description, schedule, message, enabled, run_count, last_run FROM jobs ORDER BY created_at"
+            "SELECT id, description, schedule, message, enabled, run_count, last_run, session_target, delivery FROM jobs ORDER BY created_at"
         ).fetchall()
         conn.close()
 
@@ -212,7 +271,12 @@ class CronManager:
             return "No scheduled jobs."
 
         lines = ["**Scheduled Jobs:**\n"]
-        for job_id, description, schedule, message, enabled, run_count, last_run in rows:
+        for row in rows:
+            job_id, description, schedule, message, enabled, run_count, last_run = row[:7]
+            session_target = row[7] if len(row) > 7 else "main"
+            delivery = row[8] if len(row) > 8 else "agent"
+            _ = session_target  # used below
+            __ = delivery
             status_icon = "✅" if enabled else "⏸️"
             sched_job = None
             try:
@@ -222,11 +286,14 @@ class CronManager:
             next_run = ""
             if sched_job and sched_job.next_run_time:
                 next_run = f"\n   Next run: {str(sched_job.next_run_time)[:19]}"
+            target_str = ""
+            if session_target != "main" or delivery != "agent":
+                target_str = f"\n   Target: {session_target} / {delivery}"
             lines.append(
                 f"{status_icon} `{job_id}` — {description}\n"
                 f"   Schedule: `{schedule}`\n"
                 f"   Message: {message}\n"
-                f"   Runs: {run_count}{next_run}"
+                f"   Runs: {run_count}{next_run}{target_str}"
             )
         return "\n\n".join(lines)
 
