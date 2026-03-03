@@ -226,6 +226,7 @@ class CronManager:
         description: str = "",
         session_target: str = "main",
         delivery: str = "agent",
+        enabled: bool = True,
     ) -> str:
         # Validate schedule before writing to DB
         try:
@@ -233,11 +234,12 @@ class CronManager:
         except Exception as e:
             return f"Invalid schedule '{schedule}': {e}"
 
-        # Validate session_target + delivery
+        # Validate session_target
         if session_target not in ("main", "isolated"):
             return "Error: session_target must be 'main' or 'isolated'"
-        if delivery not in ("agent", "direct"):
-            return "Error: delivery must be 'agent' or 'direct'"
+        # delivery: agent | direct | webhook (webhook stored but not yet wired)
+        if delivery not in ("agent", "direct", "webhook"):
+            delivery = "agent"  # graceful fallback
 
         job_id = uuid.uuid4().hex[:8]
         now = datetime.now().isoformat(timespec="seconds")
@@ -245,26 +247,30 @@ class CronManager:
 
         conn = sqlite3.connect(str(self.cfg.cron_db))
         conn.execute(
-            "INSERT INTO jobs(id, description, schedule, message, created_at, session_target, delivery) VALUES (?,?,?,?,?,?,?)",
-            (job_id, desc, schedule, message, now, session_target, delivery),
+            "INSERT INTO jobs(id, description, schedule, message, created_at, session_target, delivery, enabled) VALUES (?,?,?,?,?,?,?,?)",
+            (job_id, desc, schedule, message, now, session_target, delivery, 1 if enabled else 0),
         )
         conn.commit()
         conn.close()
 
-        self._schedule(job_id, schedule, message)
+        if enabled:
+            self._schedule(job_id, schedule, message)
         target_note = f"\nSession: {session_target} / delivery: {delivery}" if session_target != "main" or delivery != "agent" else ""
+        enabled_note = " (disabled)" if not enabled else ""
         return (
-            f"Job scheduled ✅\n"
+            f"Job scheduled ✅{enabled_note}\n"
             f"ID: `{job_id}`\n"
             f"Schedule: `{schedule}`\n"
             f"Message: {message}{target_note}"
         )
 
-    def list_jobs(self) -> str:
+    def list_jobs(self, include_disabled: bool = False) -> str:
         conn = sqlite3.connect(str(self.cfg.cron_db))
-        rows = conn.execute(
-            "SELECT id, description, schedule, message, enabled, run_count, last_run, session_target, delivery FROM jobs ORDER BY created_at"
-        ).fetchall()
+        query = "SELECT id, description, schedule, message, enabled, run_count, last_run, session_target, delivery FROM jobs"
+        if not include_disabled:
+            query += " WHERE enabled=1"
+        query += " ORDER BY created_at"
+        rows = conn.execute(query).fetchall()
         conn.close()
 
         if not rows:

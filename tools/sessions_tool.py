@@ -69,6 +69,15 @@ SESSIONS_SPAWN_TOOL = ToolDefinition(
             "a2a": {"type": "boolean", "description": "Agent-to-agent communication"},
             "session_key": {"type": "string", "description": "Idempotent session key (also 'sessionKey')"},
             "sessionKey": {"type": "string", "description": "Alias for session_key"},
+            "attachAs": {
+                "type": "string",
+                "description": (
+                    "How to surface attachments in the sub-agent context:\n"
+                    "  inline (default) — embed content directly in the task prompt\n"
+                    "  files            — reference as file paths only\n"
+                    "  omit             — ignore attachments"
+                ),
+            },
             "attachments": {
                 "type": "array",
                 "description": "Attachments: file paths (strings) or {content, name} objects",
@@ -100,6 +109,7 @@ async def _sessions_spawn(
     a2a: bool = False,
     session_key: str | None = None,
     sessionKey: str | None = None,         # OpenClaw field name
+    attachAs: str = "inline",              # inline | files | omit
     attachments=None,
     _session_id: str = "main",
 ) -> str:
@@ -113,24 +123,29 @@ async def _sessions_spawn(
     try:
         mgr = get_subagent_manager()
 
-        # Build task with attachments embedded
+        # Build task with attachments embedded per attachAs mode
         full_task = task
-        if attachments:
+        if attachments and attachAs != "omit":
             from pathlib import Path
             attached_texts = []
             for item in attachments:
                 if isinstance(item, dict):
-                    # {content, name} object
                     name = item.get("name", "attachment")
                     content = item.get("content", "")
-                    attached_texts.append(f"--- Attachment: {name} ---\n{content[:5000]}")
+                    if attachAs == "files":
+                        # files mode: just reference the name, not content
+                        attached_texts.append(f"[Attachment file: {name}]")
+                    else:
+                        attached_texts.append(f"--- Attachment: {name} ---\n{content[:5000]}")
                 else:
-                    # file path string
-                    try:
-                        content = Path(str(item)).expanduser().read_text(encoding="utf-8", errors="replace")
-                        attached_texts.append(f"--- Attachment: {item} ---\n{content[:5000]}")
-                    except Exception as e:
-                        attached_texts.append(f"--- Attachment: {item} (failed to read: {e}) ---")
+                    if attachAs == "files":
+                        attached_texts.append(f"[Attachment file: {item}]")
+                    else:
+                        try:
+                            content = Path(str(item)).expanduser().read_text(encoding="utf-8", errors="replace")
+                            attached_texts.append(f"--- Attachment: {item} ---\n{content[:5000]}")
+                        except Exception as e:
+                            attached_texts.append(f"--- Attachment: {item} (failed to read: {e}) ---")
             if attached_texts:
                 full_task = task + "\n\n" + "\n\n".join(attached_texts)
 
