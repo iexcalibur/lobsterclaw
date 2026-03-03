@@ -16,12 +16,34 @@ ToolDefinition flags:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from config import get_config
 
 logger = logging.getLogger(__name__)
+
+# Patterns that might leak sensitive info in error strings — redact before LLM sees them
+_REDACT_PATTERNS = [
+    # API keys / bearer tokens (long hex/base64 strings)
+    re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9_\-\.]{20,}", re.ASCII),
+    re.compile(r"(?i)(sk-|pk-|ant-|xoxb-|xoxp-)[A-Za-z0-9_\-]{10,}"),
+    # Telegram bot token
+    re.compile(r"\d{8,12}:[A-Za-z0-9_\-]{30,}"),
+    # URLs containing credentials (user:pass@host)
+    re.compile(r"[A-Za-z0-9_\-%.]+:[A-Za-z0-9_\-%.@]+@[a-zA-Z0-9.\-]+"),
+    # Absolute paths leaking username (macOS /Users/<name>, Linux /home/<name>)
+    re.compile(r"/(?:Users|home)/[^/\s]{1,32}/"),
+]
+_REDACT_REPLACE = "[REDACTED]"
+
+
+def _redact_error_string(s: str) -> str:
+    """Strip common secret/path patterns from error strings before returning to LLM."""
+    for pat in _REDACT_PATTERNS:
+        s = pat.sub(lambda m: m.group(0)[:3] + _REDACT_REPLACE, s)
+    return s
 
 ToolFn = Callable[..., Awaitable[Any]]
 
@@ -226,7 +248,7 @@ class ToolRegistry:
             return truncate_tool_result(raw, self._result_max_chars)
         except TypeError as e:
             logger.warning("Tool %s argument error: %s", name, e)
-            return f"Error calling {name}: {e}"
+            return f"Error calling {name}: {_redact_error_string(str(e))}"
         except Exception as e:
             logger.exception("Tool %s failed", name)
-            return f"Error: {e}"
+            return f"Error: {_redact_error_string(str(e))}"

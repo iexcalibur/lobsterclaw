@@ -29,6 +29,13 @@ def _env_list(key: str, default: str = "") -> list[str]:
     return [x.strip() for x in val.split(",") if x.strip()]
 
 
+def _env_float(key: str, default: float = 0.0) -> float:
+    try:
+        return float(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
 @dataclass
 class Config:
     # LLM
@@ -58,6 +65,61 @@ class Config:
     # Voice transcription (Whisper via OpenAI API)
     telegram_voice_transcription: bool = field(
         default_factory=lambda: _env_bool("TELEGRAM_VOICE_TRANSCRIPTION", False)
+    )
+    # Mention gating: group messages only trigger agent if bot is @mentioned or reply-to-bot
+    telegram_mention_required: bool = field(
+        default_factory=lambda: _env_bool("TELEGRAM_MENTION_REQUIRED", False)
+    )
+    # requireTopic: only respond inside this forum thread_id (0 = disabled)
+    telegram_require_topic: int = field(default_factory=lambda: _env_int("TELEGRAM_REQUIRE_TOPIC", 0))
+    # Per-chat policy overrides: JSON dict {"chat_id": "policy"} — checked before global policy
+    telegram_chat_policies_json: str = field(
+        default_factory=lambda: _env("TELEGRAM_CHAT_POLICIES", "{}")
+    )
+    # Callback auth policy: who can press agent inline buttons
+    # "owner" (default) | "allowlist" (owner + allow_from) | "open" (anyone)
+    telegram_callback_policy: str = field(
+        default_factory=lambda: _env("TELEGRAM_CALLBACK_POLICY", "owner")
+    )
+    # Reaction lifecycle emojis
+    telegram_reaction_thinking: str = field(
+        default_factory=lambda: _env("TELEGRAM_REACTION_THINKING", "👀")
+    )
+    telegram_reaction_working: str = field(
+        default_factory=lambda: _env("TELEGRAM_REACTION_WORKING", "⚙")
+    )
+    telegram_reaction_done: str = field(
+        default_factory=lambda: _env("TELEGRAM_REACTION_DONE", "✅")
+    )
+    telegram_reaction_error: str = field(
+        default_factory=lambda: _env("TELEGRAM_REACTION_ERROR", "❌")
+    )
+    telegram_reaction_done_clear_secs: float = field(
+        default_factory=lambda: _env_float("TELEGRAM_REACTION_DONE_CLEAR_SECS", 3.0)
+    )
+    # Reaction fallback list: comma-separated emojis tried in order on REACTION_INVALID
+    telegram_reaction_fallback: list[str] = field(
+        default_factory=lambda: _env_list("TELEGRAM_REACTION_FALLBACK", "👍,🔥")
+    )
+    # Sticker vision: download .webp thumbnail and pass to LLM as image
+    telegram_sticker_vision: bool = field(
+        default_factory=lambda: _env_bool("TELEGRAM_STICKER_VISION", False)
+    )
+    # Sticker cache persistence path (SQLite)
+    telegram_sticker_cache_db: str = field(
+        default_factory=lambda: _env("TELEGRAM_STICKER_CACHE_DB", "~/.pygate/sticker_cache.db")
+    )
+    # Webhook mode: set TELEGRAM_WEBHOOK_URL to use webhooks instead of polling
+    telegram_webhook_url: str = field(default_factory=lambda: _env("TELEGRAM_WEBHOOK_URL", ""))
+    telegram_webhook_port: int = field(default_factory=lambda: _env_int("TELEGRAM_WEBHOOK_PORT", 8443))
+    telegram_webhook_secret: str = field(default_factory=lambda: _env("TELEGRAM_WEBHOOK_SECRET", ""))
+    # Polling offset persistence: survives restarts without re-processing old messages
+    telegram_polling_offset_path: str = field(
+        default_factory=lambda: _env("TELEGRAM_POLLING_OFFSET_PATH", "~/.pygate/telegram_offset.json")
+    )
+    # Multi-account: JSON array of {label, token, owner_id, dm_policy?, group_policy?}
+    telegram_accounts_json: str = field(
+        default_factory=lambda: _env("TELEGRAM_ACCOUNTS", "")
     )
 
     # Tool policy
@@ -155,6 +217,14 @@ class Config:
     llm_thinking_budget: int = field(default_factory=lambda: _env_int("LLM_THINKING_BUDGET", 0))
     # Maximum API retries on transient errors (rate-limit, overload, 5xx)
     llm_max_retries: int = field(default_factory=lambda: _env_int("LLM_MAX_RETRIES", 3))
+    # Streaming: send partial text chunks as editable preview messages
+    llm_streaming: bool = field(default_factory=lambda: _env_bool("LLM_STREAMING", True))
+    # Minimum seconds between streaming preview edits (Telegram rate-limit guard)
+    llm_stream_min_edit_interval: float = field(
+        default_factory=lambda: _env_float("LLM_STREAM_MIN_EDIT_INTERVAL", 1.5)
+    )
+    # Show extended thinking blocks in Telegram (shown as spoiler/code if true)
+    llm_show_thinking: bool = field(default_factory=lambda: _env_bool("LLM_SHOW_THINKING", False))
 
     # General
     data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "~/.pygate"))
@@ -162,12 +232,34 @@ class Config:
     max_history_messages: int = field(default_factory=lambda: _env_int("MAX_HISTORY_MESSAGES", 100))
     max_tool_iterations: int = field(default_factory=lambda: _env_int("MAX_TOOL_ITERATIONS", 10))
 
+    @property
+    def telegram_chat_policies(self) -> dict[str, str]:
+        """Per-chat policy overrides: {str(chat_id): policy_name}."""
+        import json
+        try:
+            raw = self.telegram_chat_policies_json
+            return json.loads(raw) if raw and raw.strip() not in ("", "{}") else {}
+        except Exception:
+            return {}
+
+    @property
+    def telegram_accounts(self) -> list[dict]:
+        """Multi-account list from TELEGRAM_ACCOUNTS JSON."""
+        import json
+        try:
+            raw = self.telegram_accounts_json
+            return json.loads(raw) if raw and raw.strip() not in ("", "[]") else []
+        except Exception:
+            return []
+
     def validate(self) -> "Config":
         errors = []
-        if not self.telegram_bot_token:
-            errors.append("TELEGRAM_BOT_TOKEN is required")
-        if not self.telegram_owner_id:
-            errors.append("TELEGRAM_OWNER_ID is required")
+        # In multi-account mode, individual accounts may override the global token
+        accounts = self.telegram_accounts
+        if not accounts and not self.telegram_bot_token:
+            errors.append("TELEGRAM_BOT_TOKEN is required (or set TELEGRAM_ACCOUNTS)")
+        if not accounts and not self.telegram_owner_id:
+            errors.append("TELEGRAM_OWNER_ID is required (or set TELEGRAM_ACCOUNTS)")
         if self.llm_provider == "anthropic" and not self.anthropic_api_key:
             errors.append("ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic")
         if self.llm_provider == "openai" and not self.openai_api_key:

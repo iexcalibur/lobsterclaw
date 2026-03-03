@@ -1,17 +1,24 @@
 """
 PyGate — Personal AI Assistant
-Entry point: wires all components together and starts the Telegram bot.
+Entry point: wires all components together and starts the Telegram bot(s).
 
 Usage:
     cp .env.example .env        # fill in your keys
     pip install -r requirements.txt
     playwright install chromium  # only needed if BROWSER_ENABLED=true
     python main.py
+
+Multi-account:
+    Set TELEGRAM_ACCOUNTS to a JSON array of account objects, e.g.:
+    [{"label": "main", "token": "...", "owner_id": 123, "dm_policy": "owner"},
+     {"label": "group", "token": "...", "owner_id": 123, "group_policy": "open"}]
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import signal
 import sys
 
 from config import get_config
@@ -109,65 +116,17 @@ def build_registry():
     return registry
 
 
-def main() -> None:
-    logger.info("Starting PyGate...")
-
-    cfg = get_config()
-    logger.info("LLM provider: %s / model: %s", cfg.llm_provider, cfg.llm_model)
-    logger.info("Owner Telegram ID: %s", cfg.telegram_owner_id)
-
-    cfg.data_path.mkdir(parents=True, exist_ok=True)
-
-    # ----------------------------------------------------------------
-    # Build core components
-    # ----------------------------------------------------------------
-
-    from tools.approval import ApprovalGate
-    from agent.history import HistoryManager
-    from agent.loop import AgentLoop
-    from agent.prompt import build_system_prompt
-    from agent.heartbeat import HeartbeatRunner
-    from agent.sessions import SessionStore, set_session_store
-    from agent.subagent import SubagentManager, set_subagent_manager
-    from scheduler.manager import CronManager
-    from channels.telegram import TelegramChannel
-
-    # Session store — SQLite-backed registry of all sessions
-    session_store = SessionStore(cfg.sessions_db)
-    set_session_store(session_store)
-    logger.info("Session store initialized at %s", cfg.sessions_db)
-
-    # Sub-agent manager
-    subagent_mgr = SubagentManager()
-    set_subagent_manager(subagent_mgr)
-
-    approval = ApprovalGate()
-    registry = build_registry()
-    registry.set_approval_gate(approval)
-
-    history = HistoryManager()
-    agent = AgentLoop(registry)
-
-    cron_mgr = CronManager()
-    heartbeat = HeartbeatRunner()
-
-    telegram = TelegramChannel(
-        agent=agent,
-        history=history,
-        approval=approval,
-        build_prompt=build_system_prompt,
-    )
-
-    # ----------------------------------------------------------------
-    # Wire all lazy send / action functions into tools
-    # ----------------------------------------------------------------
-
+def _wire_channel(telegram, registry, approval, cron_mgr, build_system_prompt):
+    """Wire all lazy send / action functions into tools for a given TelegramChannel."""
     from tools import message_tool, media_tool, cron_tool, browser_tool
 
-    # Text message
+    # Set channel reference for target resolution and sticker cache
+    message_tool.set_channel_ref(telegram)
+
+    # Text message (owner send)
     message_tool.set_send_fn(telegram.send_message)
 
-    # Extended Telegram actions for message tool
+    # Extended Telegram actions
     message_tool.set_telegram_fns(
         send_photo=telegram.send_photo,
         send_document=telegram.send_document,
@@ -183,9 +142,6 @@ def main() -> None:
         unpin_all=telegram.unpin_all_messages,
     )
 
-    # Wire approval gate for canvas tool (so it can send photos via Telegram)
-    canvas_tool  # imported above; send fns shared via message_tool globals
-
     # Audio + TTS
     media_tool.set_send_audio(telegram.send_audio)
 
@@ -193,23 +149,108 @@ def main() -> None:
     browser_tool.set_send_photo_fn(telegram.send_photo)
     browser_tool.set_send_document_fn(telegram.send_document)
 
-    # Cron manager
+    # Cron manager (shared)
     cron_tool.set_manager(cron_mgr)
 
+
+def main() -> None:
+    logger.info("Starting PyGate...")
+
+    cfg = get_config()
+    logger.info("LLM provider: %s / model: %s", cfg.llm_provider, cfg.llm_model)
+    cfg.data_path.mkdir(parents=True, exist_ok=True)
+
     # ----------------------------------------------------------------
-    # Sub-agent factory — isolated tool registry + all send fns wired
+    # Build core components
+    # ----------------------------------------------------------------
+
+    from tools.approval import ApprovalGate
+    from agent.history import HistoryManager
+    from agent.loop import AgentLoop
+    from agent.prompt import build_system_prompt
+    from agent.heartbeat import HeartbeatRunner
+    from agent.sessions import SessionStore, set_session_store
+    from agent.subagent import SubagentManager, set_subagent_manager
+    from scheduler.manager import CronManager
+    from channels.telegram import TelegramChannel, AccountConfig
+
+    # Session store
+    session_store = SessionStore(cfg.sessions_db)
+    set_session_store(session_store)
+    logger.info("Session store: %s", cfg.sessions_db)
+
+    # Sub-agent manager
+    subagent_mgr = SubagentManager()
+    set_subagent_manager(subagent_mgr)
+
+    approval = ApprovalGate()
+    registry = build_registry()
+    registry.set_approval_gate(approval)
+
+    history = HistoryManager()
+    agent = AgentLoop(registry)
+
+    cron_mgr = CronManager()
+    heartbeat = HeartbeatRunner()
+
+    # ----------------------------------------------------------------
+    # Build Telegram channel(s) — single or multi-account
+    # ----------------------------------------------------------------
+
+    accounts_cfg = cfg.telegram_accounts
+    channels: list[TelegramChannel] = []
+
+    if accounts_cfg:
+        # Multi-account mode
+        logger.info("Multi-account mode: %d accounts", len(accounts_cfg))
+        for acc in accounts_cfg:
+            account = AccountConfig(
+                label=acc.get("label", "main"),
+                token=acc.get("token", cfg.telegram_bot_token),
+                owner_id=int(acc.get("owner_id", cfg.telegram_owner_id)),
+                dm_policy=acc.get("dm_policy", ""),
+                group_policy=acc.get("group_policy", ""),
+                allow_from=[int(x) for x in acc.get("allow_from", []) if str(x).isdigit()],
+                group_allowlist=[int(x) for x in acc.get("group_allowlist", [])
+                                 if str(x).lstrip("-").isdigit()],
+            )
+            ch = TelegramChannel(
+                agent=agent,
+                history=history,
+                approval=approval,
+                build_prompt=build_system_prompt,
+                account=account,
+            )
+            channels.append(ch)
+            logger.info("Registered account: %s (owner=%s)", account.label, account.owner_id)
+    else:
+        # Single-account mode
+        ch = TelegramChannel(
+            agent=agent,
+            history=history,
+            approval=approval,
+            build_prompt=build_system_prompt,
+        )
+        channels.append(ch)
+
+    # Use the primary (first) channel for all tool wiring
+    primary = channels[0]
+    _wire_channel(primary, registry, approval, cron_mgr, build_system_prompt)
+
+    # ----------------------------------------------------------------
+    # Sub-agent factory
     # ----------------------------------------------------------------
 
     def subagent_registry_factory():
         sub_registry = build_registry()
         sub_registry.set_approval_gate(approval)
-        # Re-wire send functions into the sub-agent's tool modules
-        # Note: module-level globals are shared, so setting them here is safe
-        message_tool.set_send_fn(telegram.send_message)
+        from tools import message_tool
+        message_tool.set_send_fn(primary.send_message)
+        message_tool.set_channel_ref(primary)
         return sub_registry
 
     subagent_mgr.configure(
-        send_fn=telegram.send_message,
+        send_fn=primary.send_message,
         agent_loop_factory=subagent_registry_factory,
     )
 
@@ -222,13 +263,13 @@ def main() -> None:
         return await agent.run([{"role": "user", "content": message}], system)
 
     cron_mgr.configure(
-        send_fn=telegram.send_message,
+        send_fn=primary.send_message,
         agent_fn=lambda msg: agent_for_bg(msg),
     )
 
     heartbeat.configure(
         agent_fn=agent_for_bg,
-        send_fn=telegram.send_message,
+        send_fn=primary.send_message,
     )
 
     # ----------------------------------------------------------------
@@ -242,7 +283,6 @@ def main() -> None:
             heartbeat.start(cron_mgr.scheduler)
             logger.info("Heartbeat runner attached (schedule: %s)", cfg.heartbeat_schedule)
     elif cfg.heartbeat_enabled:
-        # Heartbeat without cron: start its own scheduler
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         hb_scheduler = AsyncIOScheduler()
         hb_scheduler.start()
@@ -250,11 +290,7 @@ def main() -> None:
         logger.info("Heartbeat-only scheduler started")
 
     # ----------------------------------------------------------------
-    # Start Telegram bot (blocking)
-    # ----------------------------------------------------------------
-
-    # ----------------------------------------------------------------
-    # Load plugins and register their tools
+    # Load plugins
     # ----------------------------------------------------------------
 
     from tools.plugin_loader import register_plugins
@@ -263,12 +299,49 @@ def main() -> None:
         logger.info("Loaded plugin tools: %s", ", ".join(plugin_tools))
 
     # ----------------------------------------------------------------
-    # Start Telegram bot (blocking)
+    # Start Telegram bot(s)
     # ----------------------------------------------------------------
 
     all_tools = registry.get_names()
     logger.info("Bot ready. %d tools: %s", len(all_tools), ", ".join(all_tools))
-    telegram.run()
+
+    if len(channels) == 1:
+        # Simple single-account blocking path
+        logger.info("Starting single-account bot...")
+        channels[0].run()
+    else:
+        # Multi-account: run all concurrently via asyncio
+        logger.info("Starting %d accounts concurrently...", len(channels))
+        asyncio.run(_run_all_accounts(channels))
+
+
+async def _run_all_accounts(channels: list) -> None:
+    """Run multiple TelegramChannel instances concurrently."""
+    stop_event = asyncio.Event()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+
+    # Start all channels
+    start_tasks = [asyncio.create_task(ch.run_async()) for ch in channels]
+    try:
+        await asyncio.gather(*start_tasks, return_exceptions=True)
+    except Exception as e:
+        logger.warning("Error starting accounts: %s", e)
+
+    logger.info("All accounts running. Waiting for shutdown signal...")
+    await stop_event.wait()
+
+    # Graceful shutdown
+    logger.info("Shutting down all accounts...")
+    stop_tasks = [asyncio.create_task(ch.stop_async()) for ch in channels]
+    await asyncio.gather(*stop_tasks, return_exceptions=True)
+    logger.info("All accounts stopped.")
 
 
 if __name__ == "__main__":

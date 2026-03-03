@@ -85,6 +85,16 @@ def set_send_to_fn(fn: Callable) -> None:
     _send_to_fn = fn
 
 
+# Telegram channel instance for target resolution (@username / t.me / :topic:)
+_channel_ref: object | None = None
+
+
+def set_channel_ref(channel) -> None:
+    """Set a reference to TelegramChannel so we can call resolve_chat_id."""
+    global _channel_ref
+    _channel_ref = channel
+
+
 def set_telegram_fns(
     send_photo=None,
     send_document=None,
@@ -431,14 +441,25 @@ async def _message(
     cfg = get_config()
     owner_id = cfg.telegram_owner_id
 
-    # Resolve 'to' or 'chatId' into a numeric chat_id where possible
+    # Resolve 'to' or 'chatId' into a numeric chat_id where possible.
+    # Also handles @username, https://t.me/slug, :topic:<chat_id>:<thread_id>
     raw_to = to or (str(chatId) if chatId else None)
     if chat_id is None and raw_to is not None:
         try:
             chat_id = int(raw_to)
         except (ValueError, TypeError):
-            # username / string target — pass through as-is for routing
-            pass
+            # Non-numeric: attempt async resolution via TelegramChannel
+            if _channel_ref is not None:
+                resolve_fn = getattr(_channel_ref, "resolve_chat_id", None)
+                if resolve_fn is not None:
+                    try:
+                        resolved = await resolve_fn(raw_to)
+                        try:
+                            chat_id = int(resolved)
+                        except (ValueError, TypeError):
+                            pass  # unresolvable — will stay None → owner
+                    except Exception as e:
+                        logger.debug("resolve_chat_id failed for %r: %s", raw_to, e)
     target: int | str = chat_id or owner_id
 
     # ---- asVoice: synthesise TTS and send as voice note ----
@@ -792,9 +813,29 @@ def _looks_like_image(path_or_url: str) -> bool:
     return s.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp"))
 
 
+def _get_effective_sticker_cache() -> dict[str, list[dict]]:
+    """Return the persistent sticker cache from the channel reference if available."""
+    if _channel_ref is not None:
+        get_fn = getattr(_channel_ref, "get_sticker_cache", None)
+        if get_fn is not None:
+            return get_fn()
+    return _sticker_cache
+
+
+def _update_sticker_cache(set_name: str, stickers: list[dict]) -> None:
+    """Persist sticker cache entry via channel reference (SQLite-backed)."""
+    if _channel_ref is not None:
+        update_fn = getattr(_channel_ref, "update_sticker_cache", None)
+        if update_fn is not None:
+            update_fn(set_name, stickers)
+            return
+    _sticker_cache[set_name] = stickers
+
+
 async def _search_sticker(query: str, limit: int = 5) -> str:
-    if query in _sticker_cache:
-        stickers = _sticker_cache[query][:limit]
+    cache = _get_effective_sticker_cache()
+    if query in cache:
+        stickers = cache[query][:limit]
         return _ok(
             count=len(stickers),
             stickers=[
@@ -822,7 +863,7 @@ async def _search_sticker(query: str, limit: int = 5) -> str:
                  "description": s.get("emoji", "")}
                 for s in raw_stickers
             ]
-            _sticker_cache[query] = stickers
+            _update_sticker_cache(query, stickers)
             return _ok(
                 count=len(stickers[:limit]),
                 stickers=[
