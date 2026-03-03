@@ -95,6 +95,7 @@ def main() -> None:
     from agent.history import HistoryManager
     from agent.loop import AgentLoop
     from agent.prompt import build_system_prompt
+    from agent.heartbeat import HeartbeatRunner
     from scheduler.manager import CronManager
     from channels.telegram import TelegramChannel
 
@@ -106,6 +107,7 @@ def main() -> None:
     agent = AgentLoop(registry)
 
     cron_mgr = CronManager()
+    heartbeat = HeartbeatRunner()
 
     telegram = TelegramChannel(
         agent=agent,
@@ -124,21 +126,30 @@ def main() -> None:
     media_tool.set_send_audio(telegram.send_audio)
     cron_tool.set_manager(cron_mgr)
 
-    # Cron fires agent loop so reminders have full tool access
-    async def agent_for_cron(message: str) -> str:
-        # Run with a minimal history (just the cron trigger message)
-        system = build_system_prompt(cfg, registry.get_names())
+    # Shared agent runner for background tasks (cron + heartbeat)
+    async def agent_for_bg(message: str, system_prompt: str | None = None) -> str:
+        system = system_prompt or build_system_prompt(cfg, registry.get_names())
         return await agent.run([{"role": "user", "content": message}], system)
 
+    # Cron fires agent loop so reminders have full tool access
     cron_mgr.configure(
         send_fn=telegram.send_message,
-        agent_fn=agent_for_cron,
+        agent_fn=lambda msg: agent_for_bg(msg),
     )
 
-    # Start cron scheduler
+    # Heartbeat fires agent loop with HEARTBEAT.md context
+    heartbeat.configure(
+        agent_fn=agent_for_bg,
+        send_fn=telegram.send_message,
+    )
+
+    # Start cron + heartbeat on a shared scheduler
     if cfg.cron_enabled:
         cron_mgr.start()
         logger.info("Cron scheduler started")
+        if getattr(cfg, "heartbeat_enabled", False):
+            heartbeat.start(cron_mgr.scheduler)
+            logger.info("Heartbeat runner attached")
 
     # ----------------------------------------------------------------
     # Start Telegram bot (blocking)

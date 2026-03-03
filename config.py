@@ -86,6 +86,12 @@ class Config:
     cron_enabled: bool = field(default_factory=lambda: _env_bool("CRON_ENABLED", True))
     cron_db_path: str = field(default_factory=lambda: _env("CRON_DB_PATH", "~/.pygate/cron.db"))
 
+    # Heartbeat (periodic agent wake)
+    heartbeat_enabled: bool = field(default_factory=lambda: _env_bool("HEARTBEAT_ENABLED", False))
+    heartbeat_schedule: str = field(
+        default_factory=lambda: _env("HEARTBEAT_SCHEDULE", "0 * * * *")
+    )
+
     # TTS
     tts_enabled: bool = field(default_factory=lambda: _env_bool("TTS_ENABLED", True))
     tts_voice: str = field(default_factory=lambda: _env("TTS_VOICE", "en-US-GuyNeural"))

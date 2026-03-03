@@ -1,8 +1,20 @@
+"""
+Memory tools — mirrors OpenClaw's memory_search / memory_get / memory_write.
+
+Two storage tiers:
+  1. workspace/memory/*.md  — human-readable markdown files (readable + editable by user too)
+  2. SQLite FTS5 index       — rebuilt on demand from the MD files for fast full-text search
+
+memory_write  → writes/updates a markdown file in workspace/memory/
+memory_get    → reads a specific memory file by key (filename without .md)
+memory_search → full-text search across all memory MD files + MEMORY.md
+"""
+
 from __future__ import annotations
 
-import json
-import sqlite3
 import logging
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 from config import get_config
@@ -12,12 +24,20 @@ logger = logging.getLogger(__name__)
 
 MEMORY_SEARCH_TOOL = ToolDefinition(
     name="memory_search",
-    description="Search long-term memory for relevant notes/facts using keyword search.",
+    description=(
+        "Search long-term memory for relevant notes and facts. "
+        "Searches across MEMORY.md and all files in workspace/memory/. "
+        "Run this before answering questions about the user's past preferences, projects, or decisions."
+    ),
     parameters={
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Keywords to search for"},
-            "limit": {"type": "integer", "description": "Max results to return (default 5)", "default": 5},
+            "limit": {
+                "type": "integer",
+                "description": "Max results to return (default 5)",
+                "default": 5,
+            },
         },
         "required": ["query"],
     },
@@ -26,11 +46,18 @@ MEMORY_SEARCH_TOOL = ToolDefinition(
 
 MEMORY_GET_TOOL = ToolDefinition(
     name="memory_get",
-    description="Read a specific memory entry by its key/name.",
+    description=(
+        "Read a specific memory file by its key name. "
+        "Key is the filename without .md (e.g. 'preferences', 'projects', 'contacts'). "
+        "Use 'MEMORY' to read the top-level MEMORY.md."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "key": {"type": "string", "description": "The memory key/name to retrieve"},
+            "key": {
+                "type": "string",
+                "description": "Memory key (filename without .md, e.g. 'preferences')",
+            },
         },
         "required": ["key"],
     },
@@ -39,12 +66,24 @@ MEMORY_GET_TOOL = ToolDefinition(
 
 MEMORY_WRITE_TOOL = ToolDefinition(
     name="memory_write",
-    description="Save or update a memory entry. Use to remember facts about the user or ongoing tasks.",
+    description=(
+        "Save or update a memory entry as a markdown file. "
+        "Use this to remember facts about the user, ongoing tasks, preferences, or research. "
+        "Key becomes the filename (e.g. key='preferences' → workspace/memory/preferences.md)."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "key": {"type": "string", "description": "Short unique name for this memory"},
-            "content": {"type": "string", "description": "The content to remember"},
+            "key": {
+                "type": "string",
+                "description": "Short unique name (no spaces, use underscores or hyphens)",
+            },
+            "content": {"type": "string", "description": "Markdown content to remember"},
+            "append": {
+                "type": "boolean",
+                "description": "If true, append to existing file instead of replacing (default false)",
+                "default": False,
+            },
         },
         "required": ["key", "content"],
     },
@@ -52,21 +91,61 @@ MEMORY_WRITE_TOOL = ToolDefinition(
 )
 
 
-def _get_db() -> sqlite3.Connection:
-    cfg = get_config()
-    db_path = cfg.memory_path / "memory.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(
+def _get_memory_dir() -> Path:
+    """workspace/memory/ — where all memory MD files live."""
+    base = Path(__file__).parent.parent / "workspace"
+    memory_dir = base / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    return memory_dir
+
+
+def _get_memory_md_path() -> Path:
+    """Top-level MEMORY.md in workspace root."""
+    return Path(__file__).parent.parent / "workspace" / "MEMORY.md"
+
+
+def _get_fts_db() -> sqlite3.Connection:
+    """In-memory FTS index rebuilt each time — keeps it always fresh from MD files."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE memories USING fts5(
             key UNINDEXED,
+            filepath UNINDEXED,
             content,
-            updated_at UNINDEXED,
             tokenize='porter ascii'
         )
-    """)
-    conn.commit()
+        """
+    )
     return conn
+
+
+def _build_fts_index(conn: sqlite3.Connection) -> None:
+    """Index all MD files in workspace/memory/ plus the top-level MEMORY.md."""
+    entries: list[tuple[str, str, str]] = []
+
+    # Top-level MEMORY.md
+    memory_md = _get_memory_md_path()
+    if memory_md.exists():
+        content = memory_md.read_text(encoding="utf-8").strip()
+        if content:
+            entries.append(("MEMORY", str(memory_md), content))
+
+    # workspace/memory/*.md files
+    memory_dir = _get_memory_dir()
+    for md_file in sorted(memory_dir.glob("*.md")):
+        if md_file.name == "README.md":
+            continue
+        key = md_file.stem
+        content = md_file.read_text(encoding="utf-8").strip()
+        if content:
+            entries.append((key, str(md_file), content))
+
+    if entries:
+        conn.executemany(
+            "INSERT INTO memories(key, filepath, content) VALUES (?, ?, ?)", entries
+        )
+        conn.commit()
 
 
 async def _memory_search(query: str, limit: int = 5) -> str:
@@ -75,20 +154,25 @@ async def _memory_search(query: str, limit: int = 5) -> str:
         return "Memory is disabled (MEMORY_ENABLED=false)"
 
     try:
-        conn = _get_db()
+        conn = _get_fts_db()
+        _build_fts_index(conn)
         rows = conn.execute(
-            "SELECT key, content, updated_at FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT ?",
+            "SELECT key, content FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT ?",
             (query, limit),
         ).fetchall()
         conn.close()
 
         if not rows:
-            return "No matching memories found."
-        lines = []
-        for key, content, updated_at in rows:
-            lines.append(f"**{key}** (updated: {updated_at})\n{content}")
-        return "\n\n---\n\n".join(lines)
+            return f"No memory entries matched '{query}'."
+
+        results = []
+        for key, content in rows:
+            # Show first 800 chars to avoid overwhelming context
+            preview = content[:800] + ("…" if len(content) > 800 else "")
+            results.append(f"### [{key}]\n{preview}")
+        return "\n\n---\n\n".join(results)
     except Exception as e:
+        logger.exception("memory_search failed")
         return f"Error searching memory: {e}"
 
 
@@ -97,35 +181,54 @@ async def _memory_get(key: str) -> str:
     if not cfg.memory_enabled:
         return "Memory is disabled (MEMORY_ENABLED=false)"
 
+    # Special case: MEMORY → top-level MEMORY.md
+    if key.upper() == "MEMORY":
+        path = _get_memory_md_path()
+    else:
+        path = _get_memory_dir() / f"{key}.md"
+
+    if not path.exists():
+        return (
+            f"No memory file found for key '{key}'. "
+            f"Available keys: {_list_keys()}"
+        )
+
     try:
-        conn = _get_db()
-        row = conn.execute(
-            "SELECT content, updated_at FROM memories WHERE key = ?", (key,)
-        ).fetchone()
-        conn.close()
-        if not row:
-            return f"No memory found with key '{key}'"
-        content, updated_at = row
-        return f"**{key}** (updated: {updated_at})\n{content}"
+        return path.read_text(encoding="utf-8").strip()
     except Exception as e:
-        return f"Error reading memory: {e}"
+        return f"Error reading memory '{key}': {e}"
 
 
-async def _memory_write(key: str, content: str) -> str:
+async def _memory_write(key: str, content: str, append: bool = False) -> str:
     cfg = get_config()
     if not cfg.memory_enabled:
         return "Memory is disabled (MEMORY_ENABLED=false)"
 
-    from datetime import datetime
-    now = datetime.now().isoformat(timespec="seconds")
+    # Sanitize key — no path traversal
+    safe_key = key.replace("/", "_").replace("\\", "_").strip(". ")
+    if not safe_key:
+        return "Invalid key"
+
+    path = _get_memory_dir() / f"{safe_key}.md"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     try:
-        conn = _get_db()
-        # Delete existing entry if present, then insert
-        conn.execute("DELETE FROM memories WHERE key = ?", (key,))
-        conn.execute("INSERT INTO memories(key, content, updated_at) VALUES (?, ?, ?)", (key, content, now))
-        conn.commit()
-        conn.close()
-        return f"Memory saved: '{key}'"
+        if append and path.exists():
+            existing = path.read_text(encoding="utf-8")
+            updated = f"{existing.rstrip()}\n\n<!-- updated {now} -->\n{content}"
+            path.write_text(updated, encoding="utf-8")
+            return f"Memory '{safe_key}' updated (appended)"
+        else:
+            header = f"# {safe_key}\n\n_Last updated: {now}_\n\n"
+            path.write_text(header + content, encoding="utf-8")
+            return f"Memory '{safe_key}' saved → workspace/memory/{safe_key}.md"
     except Exception as e:
-        return f"Error saving memory: {e}"
+        return f"Error saving memory '{safe_key}': {e}"
+
+
+def _list_keys() -> str:
+    memory_dir = _get_memory_dir()
+    keys = [f.stem for f in sorted(memory_dir.glob("*.md")) if f.name != "README.md"]
+    if _get_memory_md_path().exists():
+        keys = ["MEMORY"] + keys
+    return ", ".join(keys) if keys else "(none yet)"

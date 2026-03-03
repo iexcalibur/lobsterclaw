@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 
 from config import Config
 
 
-def build_system_prompt(cfg: Config, tool_names: list[str] | None = None) -> str:
+def build_system_prompt(
+    cfg: Config,
+    tool_names: list[str] | None = None,
+    workspace_dir: Path | None = None,
+    include_heartbeat: bool = False,
+) -> str:
+    from agent.workspace import load_workspace_context
+
     now = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
 
     tools_section = ""
@@ -21,15 +29,25 @@ def build_system_prompt(cfg: Config, tool_names: list[str] | None = None) -> str
             f"Approve/Deny button. Wait for their decision."
         )
 
-    return f"""You are a personal AI assistant running privately for one person only.
+    # Memory instruction — always remind agent to check memory before answering
+    memory_instruction = (
+        "\n\nBefore answering questions about the user's preferences, past decisions, "
+        "ongoing projects, or personal details: run memory_search on MEMORY.md and memory/ files "
+        "first. Use memory_get to pull specific entries. If unsure after searching, say so."
+    )
 
-Current time: {now}
+    # Load workspace MD files (SOUL, USER, MEMORY, IDENTITY, TOOLS)
+    workspace_context = load_workspace_context(
+        workspace_dir=workspace_dir,
+        include_heartbeat=include_heartbeat,
+    )
+    workspace_section = f"\n\n---\n\n{workspace_context}" if workspace_context else ""
 
-Core principles:
-- Be concise and direct. Skip filler phrases.
-- If a request is ambiguous, ask one clarifying question before acting.
-- Never take irreversible actions (delete, send, post) without confirming first.
-- When scheduling reminders, include context so the reminder makes sense when it fires.
-- You can send Telegram messages, search the web, fetch URLs, manage reminders, \
-read/write files, run shell commands (if enabled), and control a browser (if enabled).
-- Only perform the action the user asked for. Do not do additional things unprompted.{tools_section}{confirmation_note}"""
+    return (
+        f"You are a personal AI assistant running privately for one person only.\n\n"
+        f"Current time: {now}"
+        f"{tools_section}"
+        f"{confirmation_note}"
+        f"{memory_instruction}"
+        f"{workspace_section}"
+    )
