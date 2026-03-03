@@ -57,6 +57,22 @@ class HeartbeatRunner:
     async def _fire(self) -> None:
         logger.info("Heartbeat firing")
 
+        # Active-hours guard: skip if current local hour is outside configured window
+        import datetime as _dt
+        _now_hour = _dt.datetime.now().hour
+        _start = getattr(self.cfg, "heartbeat_active_hours_start", 0)
+        _end = getattr(self.cfg, "heartbeat_active_hours_end", 23)
+        if _start <= _end:
+            # Normal range e.g. 8..22
+            if not (_start <= _now_hour <= _end):
+                logger.debug("Heartbeat suppressed outside active hours %d-%d (now=%d)", _start, _end, _now_hour)
+                return
+        else:
+            # Wrapping range e.g. 22..6 (overnight)
+            if not (_now_hour >= _start or _now_hour <= _end):
+                logger.debug("Heartbeat suppressed outside active hours %d-%d (now=%d)", _start, _end, _now_hour)
+                return
+
         # Check if HEARTBEAT.md has any actual tasks
         heartbeat_path = DEFAULT_WORKSPACE_DIR / "HEARTBEAT.md"
         if not heartbeat_path.exists():

@@ -41,6 +41,24 @@ class Config:
     # Telegram
     telegram_bot_token: str = field(default_factory=lambda: _env("TELEGRAM_BOT_TOKEN"))
     telegram_owner_id: int = field(default_factory=lambda: _env_int("TELEGRAM_OWNER_ID"))
+    # Multi-user DM allowlist: comma-separated Telegram user IDs (besides owner)
+    telegram_allow_from: list[int] = field(
+        default_factory=lambda: [int(x) for x in _env_list("TELEGRAM_ALLOW_FROM") if x.isdigit()]
+    )
+    # DM policy: "owner" (default, owner only) | "allowlist" (owner + allow_from) | "open" (anyone)
+    telegram_dm_policy: str = field(default_factory=lambda: _env("TELEGRAM_DM_POLICY", "owner"))
+    # Group policy: "disabled" (default) | "open" (anyone) | "allowlist"
+    telegram_group_policy: str = field(default_factory=lambda: _env("TELEGRAM_GROUP_POLICY", "disabled"))
+    # Group allowlist: comma-separated chat IDs
+    telegram_group_allowlist: list[int] = field(
+        default_factory=lambda: [int(x) for x in _env_list("TELEGRAM_GROUP_ALLOWLIST") if x.lstrip("-").isdigit()]
+    )
+    # Link previews in outgoing messages
+    telegram_link_preview: bool = field(default_factory=lambda: _env_bool("TELEGRAM_LINK_PREVIEW", True))
+    # Voice transcription (Whisper via OpenAI API)
+    telegram_voice_transcription: bool = field(
+        default_factory=lambda: _env_bool("TELEGRAM_VOICE_TRANSCRIPTION", False)
+    )
 
     # Tool policy
     tools_allow: list[str] = field(
@@ -76,6 +94,7 @@ class Config:
 
     # Exec
     exec_enabled: bool = field(default_factory=lambda: _env_bool("EXEC_ENABLED", False))
+    exec_elevated_enabled: bool = field(default_factory=lambda: _env_bool("EXEC_ELEVATED_ENABLED", False))
     exec_timeout_seconds: int = field(default_factory=lambda: _env_int("EXEC_TIMEOUT_SECONDS", 30))
     exec_working_dir: str = field(default_factory=lambda: _env("EXEC_WORKING_DIR", "~"))
     exec_confirmation_timeout_seconds: int = field(
@@ -109,6 +128,13 @@ class Config:
     heartbeat_schedule: str = field(
         default_factory=lambda: _env("HEARTBEAT_SCHEDULE", "0 * * * *")
     )
+    # Active hours: heartbeat/cron wakes only fire in this local hour range (0-23, inclusive)
+    heartbeat_active_hours_start: int = field(
+        default_factory=lambda: _env_int("HEARTBEAT_ACTIVE_HOURS_START", 0)
+    )
+    heartbeat_active_hours_end: int = field(
+        default_factory=lambda: _env_int("HEARTBEAT_ACTIVE_HOURS_END", 23)
+    )
 
     # TTS
     tts_enabled: bool = field(default_factory=lambda: _env_bool("TTS_ENABLED", True))
@@ -123,6 +149,12 @@ class Config:
     tool_result_max_chars: int = field(
         default_factory=lambda: _env_int("TOOL_RESULT_MAX_CHARS", 50_000)
     )
+
+    # LLM advanced
+    # Extended thinking budget for Anthropic (0 = disabled; >0 = token budget passed to the API)
+    llm_thinking_budget: int = field(default_factory=lambda: _env_int("LLM_THINKING_BUDGET", 0))
+    # Maximum API retries on transient errors (rate-limit, overload, 5xx)
+    llm_max_retries: int = field(default_factory=lambda: _env_int("LLM_MAX_RETRIES", 3))
 
     # General
     data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "~/.pygate"))

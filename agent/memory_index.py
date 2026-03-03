@@ -120,21 +120,33 @@ class MemoryIndex:
 
         safe_query = _sanitize_fts(query)
         try:
+            # FTS5 rank is negative BM25 (lower = more relevant); normalize to 0-1
             rows = conn.execute(
-                "SELECT key, content FROM m WHERE m MATCH ? ORDER BY rank LIMIT ?",
+                "SELECT key, content, rank FROM m WHERE m MATCH ? ORDER BY rank LIMIT ?",
                 (safe_query, limit),
             ).fetchall()
         except sqlite3.OperationalError:
             # Fallback: substring match
             ql = query.lower()
-            rows = [(k, c) for k, c, _ in chunks if ql in c.lower()][:limit]
+            rows = [(k, c, 0.0) for k, c, _ in chunks if ql in c.lower()][:limit]
 
         conn.close()
 
+        if not rows:
+            return []
+
+        # Normalize BM25 scores (rank is negative; most relevant has the most-negative value)
+        raw_ranks = [float(row[2]) for row in rows]
+        min_rank = min(raw_ranks)  # most negative = best
+        max_rank = max(raw_ranks)  # 0 or least negative = worst
+        rank_range = max_rank - min_rank if max_rank != min_rank else 1.0
+
         results = []
-        for key, content in rows:
+        for key, content, rank in rows:
+            # Map: min_rank → score=1.0, max_rank → score=0.1
+            norm_score = 1.0 - 0.9 * ((float(rank) - min_rank) / rank_range)
             snippet = content[:600] + ("…" if len(content) > 600 else "")
-            results.append(SearchResult(key=key, snippet=snippet, score=1.0, source="fts"))
+            results.append(SearchResult(key=key, snippet=snippet, score=round(norm_score, 3), source="fts"))
         return results
 
     # ------------------------------------------------------------------

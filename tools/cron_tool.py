@@ -329,6 +329,7 @@ def _job_to_manager_params(job: dict) -> dict:
         "session_target": session_target,
         "delivery": delivery,
         "enabled": job.get("enabled", True),
+        "delete_after_run": bool(job.get("deleteAfterRun", job.get("delete_after_run", False))),
     }
 
 

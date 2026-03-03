@@ -64,6 +64,9 @@ _delete_fn: Callable | None = None        # delete_message(chat_id, message_id)
 _react_fn: Callable | None = None         # react_to_message(chat_id, msg_id, emoji, remove)
 _send_buttons_fn: Callable | None = None  # send_with_buttons(text, buttons_2d, chat_id)
 _create_forum_topic_fn: Callable | None = None  # create_forum_topic(chat_id, name, **kwargs)
+_pin_fn: Callable | None = None                 # pin_message(chat_id, message_id, **kwargs)
+_unpin_fn: Callable | None = None               # unpin_message(chat_id, message_id)
+_unpin_all_fn: Callable | None = None           # unpin_all_messages(chat_id)
 
 # Most-recently-received inbound message_id — fallback for react without explicit id
 _current_message_id: int | None = None
@@ -92,10 +95,13 @@ def set_telegram_fns(
     send_buttons=None,
     create_forum_topic=None,
     send_to=None,
+    pin=None,
+    unpin=None,
+    unpin_all=None,
 ) -> None:
     global _send_photo_fn, _send_document_fn, _send_sticker_fn
     global _edit_fn, _delete_fn, _react_fn, _send_buttons_fn, _create_forum_topic_fn
-    global _send_to_fn
+    global _send_to_fn, _pin_fn, _unpin_fn, _unpin_all_fn
     if send_photo:
         _send_photo_fn = send_photo
     if send_document:
@@ -114,6 +120,12 @@ def set_telegram_fns(
         _create_forum_topic_fn = create_forum_topic
     if send_to:
         _send_to_fn = send_to
+    if pin:
+        _pin_fn = pin
+    if unpin:
+        _unpin_fn = unpin
+    if unpin_all:
+        _unpin_all_fn = unpin_all
 
 
 def set_current_message_id(msg_id: int | None) -> None:
@@ -160,6 +172,13 @@ _ACTION_ALIASES: dict[str, str] = {
     "create_forum_topic": "create_forum_topic",
     "topic_create":       "create_forum_topic",
     "topic-create":       "create_forum_topic",
+    # pin / unpin
+    "pinmessage":         "pin",
+    "pin_message":        "pin",
+    "unpinmessage":       "unpin",
+    "unpin_message":      "unpin",
+    "unpinallmessages":   "unpin_all",
+    "unpin_all_messages": "unpin_all",
 }
 
 
@@ -252,7 +271,10 @@ TOOL_DEFINITION = ToolDefinition(
         "  delete / deleteMessage         — delete message\n"
         "  react / reactMessage           — emoji reaction (remove=true to clear)\n"
         "  buttons / sendButtons          — send message with inline keyboard\n"
-        "  create_forum_topic / createForumTopic / topic-create — create forum topic\n\n"
+        "  create_forum_topic / createForumTopic / topic-create — create forum topic\n"
+        "  pin / pinMessage       — pin a message in chat\n"
+        "  unpin / unpinMessage   — unpin a specific message\n"
+        "  unpin_all              — unpin all messages in chat\n\n"
         "Key fields:\n"
         "  to / chat_id     — target chat (defaults to owner if omitted)\n"
         "  content / text   — message text (omittable when mediaUrl set)\n"
@@ -425,7 +447,9 @@ async def _message(
             from tools.media_tool import _tts
             import tempfile, os
             tmp = tempfile.mktemp(suffix=".mp3")
-            await _tts(text=text, voice="en-US-ChristopherNeural", output_path=tmp)
+            # Use configured TTS voice (not hardcoded)
+            tts_voice = cfg.tts_voice if hasattr(cfg, "tts_voice") else "en-US-GuyNeural"
+            await _tts(text=text, voice=tts_voice, output_path=tmp)
             if os.path.exists(tmp):
                 from tools.media_tool import _send_audio_fn
                 if _send_audio_fn:
@@ -709,12 +733,52 @@ async def _message(
         except Exception as e:
             return _err("create_topic_failed", str(e))
 
+    # ================================================================
+    # pin / unpin
+    # ================================================================
+    if action == "pin":
+        effective_mid = message_id or messageId
+        effective_cid = chat_id or owner_id
+        if not effective_mid:
+            return _err("missing_message_id", "Provide 'messageId' to pin.")
+        if not _pin_fn:
+            return _err("not_configured", "pin_message not wired.")
+        try:
+            await _pin_fn(effective_cid, effective_mid, disable_notification=silent)
+            return _ok(pinned=True, messageId=effective_mid, chatId=effective_cid)
+        except Exception as e:
+            return _err("pin_failed", str(e))
+
+    if action == "unpin":
+        effective_mid = message_id or messageId
+        effective_cid = chat_id or owner_id
+        if not effective_mid:
+            return _err("missing_message_id", "Provide 'messageId' to unpin.")
+        if not _unpin_fn:
+            return _err("not_configured", "unpin_message not wired.")
+        try:
+            await _unpin_fn(effective_cid, effective_mid)
+            return _ok(unpinned=True, messageId=effective_mid, chatId=effective_cid)
+        except Exception as e:
+            return _err("unpin_failed", str(e))
+
+    if action == "unpin_all":
+        effective_cid = chat_id or owner_id
+        if not _unpin_all_fn:
+            return _err("not_configured", "unpin_all_messages not wired.")
+        try:
+            await _unpin_all_fn(effective_cid)
+            return _ok(unpinnedAll=True, chatId=effective_cid)
+        except Exception as e:
+            return _err("unpin_all_failed", str(e))
+
     all_actions = (
         "send/sendMessage, send_photo/sendPhoto, send_document/sendDocument, "
         "send_sticker/sendSticker/sticker, search_sticker/searchSticker/sticker-search, "
         "sticker_cache_stats/stickerCacheStats, "
         "edit/editMessage, delete/deleteMessage, react/reactMessage, "
-        "buttons/sendButtons, create_forum_topic/createForumTopic/topic-create"
+        "buttons/sendButtons, create_forum_topic/createForumTopic/topic-create, "
+        "pin/pinMessage, unpin/unpinMessage, unpin_all"
     )
     return _err("unknown_action", f"Unknown action '{action}'. Use: {all_actions}")
 

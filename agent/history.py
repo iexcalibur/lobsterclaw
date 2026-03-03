@@ -77,8 +77,9 @@ class HistoryManager:
                 "INSERT INTO history(user_id, role, content, ts) VALUES (?,?,?,?)",
                 (user_id, role, content, now),
             )
-            # Prune old rows — keep only 2x max_history_messages per user to avoid unlimited growth
-            max_keep = self.cfg.max_history_messages * 2
+            # Prune old rows — keep max_history_messages + 20 buffer to avoid excessive DB growth
+            # Using the same limit as the in-memory cache prevents them from drifting out of sync.
+            max_keep = self.cfg.max_history_messages + 20
             conn.execute(
                 """
                 DELETE FROM history WHERE id IN (

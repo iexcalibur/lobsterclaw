@@ -5,10 +5,15 @@ Integrates:
   - Tool loop detection (agent/loop_detection.py)
   - Context window compaction (agent/compaction.py)
   - Tool result truncation (tools/registry.py)
+  - API retry on transient errors (rate-limit, overload, 5xx)
+  - Extended thinking budget (Anthropic)
+  - Per-session model override
+  - Error sanitization (no raw tracebacks to user)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING
@@ -24,6 +29,49 @@ if TYPE_CHECKING:
     from tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# Errors that are transient and safe to retry
+_ANTHROPIC_RETRY_TYPES = (
+    anthropic.RateLimitError,
+    anthropic.InternalServerError,
+    anthropic.APIConnectionError,
+)
+_OPENAI_RETRY_TYPES = (
+    openai.RateLimitError,
+    openai.APIConnectionError,
+    openai.InternalServerError,
+)
+
+
+async def _retry_api(coro_factory, max_retries: int, label: str):
+    """Retry an API call up to max_retries times with exponential back-off."""
+    delay = 2.0
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_factory()
+        except (*_ANTHROPIC_RETRY_TYPES, *_OPENAI_RETRY_TYPES) as e:  # type: ignore[misc]
+            last_exc = e
+            if attempt < max_retries:
+                wait = delay * (2 ** attempt)
+                logger.warning("%s transient error (attempt %d/%d): %s — retrying in %.1fs",
+                               label, attempt + 1, max_retries + 1, e, wait)
+                await asyncio.sleep(wait)
+            else:
+                logger.error("%s failed after %d retries: %s", label, max_retries, e)
+        except Exception as e:
+            raise e  # non-transient — don't retry
+    raise last_exc  # type: ignore[misc]
+
+
+def _sanitize_error(e: Exception) -> str:
+    """Convert exception to a safe user-facing message (no raw tracebacks)."""
+    name = type(e).__name__
+    msg = str(e)
+    # Truncate very long error messages (e.g. full HTTP bodies)
+    if len(msg) > 400:
+        msg = msg[:400] + "…"
+    return f"[{name}] {msg}"
 
 
 class AgentLoop:
@@ -45,16 +93,25 @@ class AgentLoop:
         messages: list[dict],
         system_prompt: str,
         session_id: str | None = None,
+        model_override: str | None = None,
+        thinking_budget: int | None = None,
     ) -> str:
         """
         Run the agent loop on the given message history and return the final text reply.
-        session_id is used for logging/tracing only.
+
+        Args:
+            messages: conversation history
+            system_prompt: system prompt text
+            session_id: used for logging/tracing
+            model_override: override the default model for this session
+            thinking_budget: extended thinking token budget (Anthropic only; None = use config)
         """
         # Compact history if it's grown too large for the context window
-        if needs_compaction(messages, self.cfg.llm_model, self.cfg.llm_max_tokens):
+        effective_model = model_override or self.cfg.llm_model
+        if needs_compaction(messages, effective_model, self.cfg.llm_max_tokens):
             messages = await compact_messages(
                 messages=messages,
-                model=self.cfg.llm_model,
+                model=effective_model,
                 api_key=self.cfg.anthropic_api_key
                 if self.cfg.llm_provider == "anthropic"
                 else self.cfg.openai_api_key,
@@ -62,38 +119,72 @@ class AgentLoop:
             )
 
         if self.cfg.llm_provider == "anthropic":
-            return await self._run_anthropic(messages, system_prompt)
-        return await self._run_openai(messages, system_prompt)
+            return await self._run_anthropic(
+                messages, system_prompt,
+                session_id=session_id,
+                model=effective_model,
+                thinking_budget=thinking_budget,
+            )
+        return await self._run_openai(
+            messages, system_prompt,
+            session_id=session_id,
+            model=effective_model,
+        )
 
     # ------------------------------------------------------------------
     # Anthropic
     # ------------------------------------------------------------------
 
-    async def _run_anthropic(self, messages: list[dict], system_prompt: str) -> str:
+    async def _run_anthropic(
+        self,
+        messages: list[dict],
+        system_prompt: str,
+        session_id: str | None = None,
+        model: str | None = None,
+        thinking_budget: int | None = None,
+    ) -> str:
         tools = self.registry.get_anthropic_tools()
         working = list(messages)
         loop_detector = LoopDetectionState()
+        max_retries = getattr(self.cfg, "llm_max_retries", 3)
+        effective_model = model or self.cfg.llm_model
+
+        # Determine extended thinking budget
+        budget = thinking_budget
+        if budget is None:
+            budget = getattr(self.cfg, "llm_thinking_budget", 0)
 
         for iteration in range(self.cfg.max_tool_iterations):
             # Re-check compaction on each iteration — tool results can balloon history
-            if needs_compaction(working, self.cfg.llm_model, self.cfg.llm_max_tokens):
+            if needs_compaction(working, effective_model, self.cfg.llm_max_tokens):
                 working = await compact_messages(
                     messages=working,
-                    model=self.cfg.llm_model,
+                    model=effective_model,
                     api_key=self.cfg.anthropic_api_key,
                     provider="anthropic",
                 )
 
             kwargs: dict = {
-                "model": self.cfg.llm_model,
+                "model": effective_model,
                 "max_tokens": self.cfg.llm_max_tokens,
                 "system": system_prompt,
                 "messages": working,
             }
             if tools:
                 kwargs["tools"] = tools
+            # Extended thinking (Anthropic: claude-3-7 and above)
+            if budget and budget > 0:
+                kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
 
-            response = await self._anthropic.messages.create(**kwargs)
+            try:
+                response = await _retry_api(
+                    lambda: self._anthropic.messages.create(**kwargs),
+                    max_retries=max_retries,
+                    label="anthropic",
+                )
+            except Exception as e:
+                logger.error("Anthropic API fatal error: %s", e)
+                return f"Sorry, I couldn't reach the AI service: {_sanitize_error(e)}"
 
             if response.stop_reason == "end_turn":
                 for block in response.content:
@@ -123,13 +214,16 @@ class AgentLoop:
                         continue
 
                     logger.info("Tool call [%d/%d]: %s", iteration + 1, self.cfg.max_tool_iterations, block.name)
-                    # Inject _session_id so session-aware tools (sessions_spawn, session_status) know their context
                     args_with_ctx = dict(block.input)
                     if session_id:
                         args_with_ctx.setdefault("_session_id", session_id)
-                    result = await self.registry.execute(block.name, args_with_ctx)
+                    try:
+                        result = await self.registry.execute(block.name, args_with_ctx)
+                    except Exception as e:
+                        logger.exception("Unhandled tool error: %s", block.name)
+                        result = f"Tool error: {_sanitize_error(e)}"
 
-                    # Append loop warning as a prefix to the result if in warn state
+                    # Append loop warning as prefix if in warn state
                     if check.action == "warn":
                         result = f"⚠️ {check.message}\n\n{result}"
 
@@ -151,25 +245,42 @@ class AgentLoop:
     # OpenAI
     # ------------------------------------------------------------------
 
-    async def _run_openai(self, messages: list[dict], system_prompt: str) -> str:
+    async def _run_openai(
+        self,
+        messages: list[dict],
+        system_prompt: str,
+        session_id: str | None = None,
+        model: str | None = None,
+    ) -> str:
         tools = self.registry.get_openai_tools()
         working = [{"role": "system", "content": system_prompt}] + list(messages)
         loop_detector = LoopDetectionState()
+        max_retries = getattr(self.cfg, "llm_max_retries", 3)
+        effective_model = model or self.cfg.llm_model
 
         for iteration in range(self.cfg.max_tool_iterations):
-            if needs_compaction(working, self.cfg.llm_model, self.cfg.llm_max_tokens):
+            if needs_compaction(working, effective_model, self.cfg.llm_max_tokens):
                 working = await compact_messages(
                     messages=working,
-                    model=self.cfg.llm_model,
+                    model=effective_model,
                     api_key=self.cfg.openai_api_key,
                     provider="openai",
                 )
 
-            kwargs: dict = {"model": self.cfg.llm_model, "messages": working}
+            kwargs: dict = {"model": effective_model, "messages": working}
             if tools:
                 kwargs["tools"] = tools
 
-            response = await self._openai.chat.completions.create(**kwargs)
+            try:
+                response = await _retry_api(
+                    lambda: self._openai.chat.completions.create(**kwargs),
+                    max_retries=max_retries,
+                    label="openai",
+                )
+            except Exception as e:
+                logger.error("OpenAI API fatal error: %s", e)
+                return f"Sorry, I couldn't reach the AI service: {_sanitize_error(e)}"
+
             choice = response.choices[0]
 
             if choice.finish_reason == "stop":
@@ -197,7 +308,11 @@ class AgentLoop:
                     args_with_ctx = dict(args)
                     if session_id:
                         args_with_ctx.setdefault("_session_id", session_id)
-                    result = await self.registry.execute(tool_call.function.name, args_with_ctx)
+                    try:
+                        result = await self.registry.execute(tool_call.function.name, args_with_ctx)
+                    except Exception as e:
+                        logger.exception("Unhandled tool error: %s", tool_call.function.name)
+                        result = f"Tool error: {_sanitize_error(e)}"
 
                     if check.action == "warn":
                         result = f"⚠️ {check.message}\n\n{result}"

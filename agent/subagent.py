@@ -45,6 +45,8 @@ class SubagentRun:
     status: str = "running"   # running | completed | error | cancelled
     result: str | None = None
     task_handle: asyncio.Task | None = field(default=None, repr=False)
+    # Inbox queue: allows sessions_send to inject messages into a running sub-agent
+    inbox: asyncio.Queue = field(default_factory=asyncio.Queue, repr=False)
 
 
 class SubagentManager:
@@ -184,7 +186,7 @@ class SubagentManager:
             registry: ToolRegistry = self._agent_loop_factory()
 
             # Set session depth on registry so owner_only / depth_limit checks work
-            registry.set_session_depth(child_depth)
+            registry.set_session_depth(run.depth)
 
             # Apply sandbox mode — restrict dangerous tools in strict mode
             sandbox = getattr(run, "_sandbox", "inherit")
@@ -271,6 +273,28 @@ class SubagentManager:
         await store.update_session_status(run.session_id, "cancelled")
         logger.info("Cancelled sub-agent run_id=%s", run_id)
         return f"Sub-agent '{run_id}' ({run.label}) cancelled."
+
+    async def send_to_run(self, run_id: str, message: str, role: str = "user") -> str:
+        """
+        Inject a message into a running sub-agent's inbox queue.
+        The sub-agent will pick it up after its current tool iteration completes.
+        """
+        run = self._registry.get(run_id)
+        if not run:
+            # Also try finding by session_id
+            for r in self._registry.values():
+                if r.session_id == run_id:
+                    run = r
+                    break
+        if not run:
+            return f"No sub-agent found with run_id or session_id '{run_id}'"
+        if run.status != "running":
+            return f"Sub-agent '{run_id}' is not running (status: {run.status})"
+        await run.inbox.put((role, message))
+        store = get_session_store()
+        tag = "[System]" if role == "system" else "[Injected]"
+        await store.append_message(run.session_id, role, f"{tag}: {message}")
+        return f"Message queued for sub-agent '{run_id}' ({run.label})."
 
     async def steer(self, run_id: str, message: str) -> str:
         """

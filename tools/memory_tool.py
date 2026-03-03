@@ -164,7 +164,14 @@ def _get_memory_dir() -> Path:
 
 
 def _get_memory_md_path() -> Path:
-    """Top-level MEMORY.md in workspace root."""
+    """Top-level MEMORY.md — checked in config memory_dir first, then workspace root."""
+    cfg = get_config()
+    # Check config directory first (non-default path)
+    if cfg.memory_dir and cfg.memory_dir != "~/.pygate/memory":
+        candidate = Path(cfg.memory_dir).expanduser().parent / "MEMORY.md"
+        if candidate.exists():
+            return candidate
+    # Default: workspace/MEMORY.md relative to project root
     return Path(__file__).parent.parent / "workspace" / "MEMORY.md"
 
 

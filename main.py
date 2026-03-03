@@ -178,6 +178,9 @@ def main() -> None:
         send_buttons=telegram.send_with_buttons,
         create_forum_topic=telegram.create_forum_topic,
         send_to=telegram.send_to,
+        pin=telegram.pin_message,
+        unpin=telegram.unpin_message,
+        unpin_all=telegram.unpin_all_messages,
     )
 
     # Wire approval gate for canvas tool (so it can send photos via Telegram)

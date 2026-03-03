@@ -75,9 +75,16 @@ class CronManager:
                 run_count       INTEGER DEFAULT 0,
                 last_run        TEXT,
                 session_target  TEXT DEFAULT 'main',
-                delivery        TEXT DEFAULT 'agent'
+                delivery        TEXT DEFAULT 'agent',
+                delete_after_run INTEGER DEFAULT 0
             )
         """)
+        # Migrate: add delete_after_run column if it doesn't exist (for existing DBs)
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN delete_after_run INTEGER DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.execute("""
             CREATE TABLE IF NOT EXISTS job_runs (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,19 +156,20 @@ class CronManager:
         logger.info("Firing cron job: %s", job_id)
         conn = sqlite3.connect(str(self.cfg.cron_db))
         fired_at = datetime.now().isoformat(timespec="seconds")
-        # Fetch session_target + delivery alongside update
+        # Fetch session_target, delivery, delete_after_run alongside update
         conn.execute(
             "UPDATE jobs SET run_count=run_count+1, last_run=? WHERE id=?",
             (fired_at, job_id),
         )
         row = conn.execute(
-            "SELECT session_target, delivery FROM jobs WHERE id=?", (job_id,)
+            "SELECT session_target, delivery, delete_after_run FROM jobs WHERE id=?", (job_id,)
         ).fetchone()
         conn.commit()
         conn.close()
 
         session_target = (row[0] if row else None) or "main"
         delivery = (row[1] if row else None) or "agent"
+        delete_after_run = bool(row[2]) if row and len(row) > 2 else False
 
         if not self._send_fn:
             logger.warning("No send_fn — cannot deliver cron job %s", job_id)
@@ -173,39 +181,54 @@ class CronManager:
                 # Skip AI — send reminder text directly to the user
                 await self._send_fn(f"⏰ *Reminder*\n\n{message}")
                 self._record_run(job_id, fired_at, "ok")
-                return
-
-            if session_target == "isolated":
+            elif session_target == "isolated":
                 # Spawn a sub-agent for this cron run
                 if self._agent_fn:
                     import asyncio
                     asyncio.create_task(
                         self._fire_isolated(job_id, fired_at, message)
                     )
-                    return  # result delivered by sub-agent
+                    # Note: delete_after_run handled in _fire_isolated
+                    return
                 else:
-                    # Fall through to direct if no agent fn
                     await self._send_fn(f"⏰ *Reminder* (isolated mode unavailable)\n\n{message}")
                     self._record_run(job_id, fired_at, "ok")
-                    return
-
-            # Default: agent delivery in main session
-            if self._agent_fn:
-                reply = await self._agent_fn(f"[Scheduled reminder] {message}")
-                await self._send_fn(reply)
             else:
-                await self._send_fn(f"⏰ *Reminder*\n\n{message}")
-            self._record_run(job_id, fired_at, "ok")
+                # Default: agent delivery in main session
+                if self._agent_fn:
+                    reply = await self._agent_fn(f"[Scheduled reminder] {message}")
+                    await self._send_fn(reply)
+                else:
+                    await self._send_fn(f"⏰ *Reminder*\n\n{message}")
+                self._record_run(job_id, fired_at, "ok")
         except Exception as e:
             logger.error("Cron job %s fire failed: %s", job_id, e)
             self._record_run(job_id, fired_at, "error", str(e))
+        finally:
+            # deleteAfterRun: remove from DB and scheduler after first successful execution
+            if delete_after_run:
+                try:
+                    self.remove_job(job_id)
+                    logger.info("deleteAfterRun: removed job %s", job_id)
+                except Exception as e:
+                    logger.warning("deleteAfterRun cleanup failed for %s: %s", job_id, e)
 
     async def _fire_isolated(self, job_id: str, fired_at: str, message: str) -> None:
         """Spawn an isolated sub-agent for this cron job run."""
+        # Fetch delete_after_run for this job
+        delete_after = False
+        try:
+            conn = sqlite3.connect(str(self.cfg.cron_db))
+            row = conn.execute("SELECT delete_after_run FROM jobs WHERE id=?", (job_id,)).fetchone()
+            conn.close()
+            delete_after = bool(row[0]) if row else False
+        except Exception:
+            pass
+
         try:
             from agent.subagent import get_subagent_manager
             mgr = get_subagent_manager()
-            result_store = await mgr.spawn(
+            await mgr.spawn(
                 task=f"[Isolated cron job] {message}",
                 label=f"cron-{job_id}",
                 parent_session_id="main",
@@ -214,6 +237,13 @@ class CronManager:
         except Exception as e:
             logger.error("Isolated cron job %s failed: %s", job_id, e)
             self._record_run(job_id, fired_at, "error", str(e))
+        finally:
+            if delete_after:
+                try:
+                    self.remove_job(job_id)
+                    logger.info("deleteAfterRun: removed isolated job %s", job_id)
+                except Exception as e:
+                    logger.warning("deleteAfterRun cleanup failed for %s: %s", job_id, e)
 
     # ------------------------------------------------------------------
     # Public API
@@ -227,6 +257,7 @@ class CronManager:
         session_target: str = "main",
         delivery: str = "agent",
         enabled: bool = True,
+        delete_after_run: bool = False,
     ) -> str:
         # Validate schedule before writing to DB
         try:
@@ -247,8 +278,8 @@ class CronManager:
 
         conn = sqlite3.connect(str(self.cfg.cron_db))
         conn.execute(
-            "INSERT INTO jobs(id, description, schedule, message, created_at, session_target, delivery, enabled) VALUES (?,?,?,?,?,?,?,?)",
-            (job_id, desc, schedule, message, now, session_target, delivery, 1 if enabled else 0),
+            "INSERT INTO jobs(id, description, schedule, message, created_at, session_target, delivery, enabled, delete_after_run) VALUES (?,?,?,?,?,?,?,?,?)",
+            (job_id, desc, schedule, message, now, session_target, delivery, 1 if enabled else 0, 1 if delete_after_run else 0),
         )
         conn.commit()
         conn.close()
@@ -257,11 +288,12 @@ class CronManager:
             self._schedule(job_id, schedule, message)
         target_note = f"\nSession: {session_target} / delivery: {delivery}" if session_target != "main" or delivery != "agent" else ""
         enabled_note = " (disabled)" if not enabled else ""
+        delete_note = "\nOne-shot: deletes after first run" if delete_after_run else ""
         return (
             f"Job scheduled ✅{enabled_note}\n"
             f"ID: `{job_id}`\n"
             f"Schedule: `{schedule}`\n"
-            f"Message: {message}{target_note}"
+            f"Message: {message}{target_note}{delete_note}"
         )
 
     def list_jobs(self, include_disabled: bool = False) -> str:

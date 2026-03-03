@@ -10,6 +10,28 @@ logger = logging.getLogger(__name__)
 
 SendFn = Callable[[str, str], Awaitable[None]]  # (text, request_id) -> None
 
+# Tool-specific pretty-print formatters (maps tool_name → formatter)
+_TOOL_FORMATTERS: dict[str, Callable[[dict], str]] = {}
+
+
+def register_tool_formatter(tool_name: str, formatter: Callable[[dict], str]) -> None:
+    """Register a custom args-to-text formatter for a specific tool name."""
+    _TOOL_FORMATTERS[tool_name] = formatter
+
+
+def _default_format_args(tool_name: str, args: dict) -> str:
+    """Format tool args for the approval message (tool-specific overrides supported)."""
+    formatter = _TOOL_FORMATTERS.get(tool_name)
+    if formatter:
+        try:
+            return formatter(args)
+        except Exception:
+            pass
+    raw = json.dumps(args, indent=2, ensure_ascii=False)
+    if len(raw) > 600:
+        raw = raw[:600].rsplit("\n", 1)[0] + "\n…"
+    return raw
+
 
 class ApprovalGate:
     """Pauses tool execution and asks the user to Approve or Deny via Telegram."""
@@ -17,11 +39,18 @@ class ApprovalGate:
     def __init__(self) -> None:
         self._pending: dict[str, asyncio.Future] = {}
         self._send_fn: SendFn | None = None
+        self._notify_fn: Callable[[str], Awaitable[None]] | None = None  # for timeout notifications
         self._timeout: int = 120
 
-    def configure(self, send_fn: SendFn, timeout: int = 120) -> None:
+    def configure(
+        self,
+        send_fn: SendFn,
+        timeout: int = 120,
+        notify_fn: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         self._send_fn = send_fn
         self._timeout = timeout
+        self._notify_fn = notify_fn
 
     async def request(self, tool_name: str, args: dict) -> bool:
         if not self._send_fn:
@@ -33,15 +62,13 @@ class ApprovalGate:
         future: asyncio.Future[bool] = loop.create_future()
         self._pending[request_id] = future
 
-        # Safe preview: truncate at last complete line to avoid broken JSON mid-string
-        raw_preview = json.dumps(args, indent=2)
-        if len(raw_preview) > 600:
-            raw_preview = raw_preview[:600].rsplit("\n", 1)[0] + "\n..."
-        args_preview = raw_preview
+        args_preview = _default_format_args(tool_name, args)
 
         try:
             await self._send_fn(
-                f"🔐 *Approval Required*\n\nTool: `{tool_name}`\n```\n{args_preview}\n```",
+                f"🔐 *Approval Required*\n\nTool: `{tool_name}`\n```\n{args_preview}\n```\n\n"
+                f"Reply `✅ {request_id}` to approve or `❌ {request_id}` to deny "
+                f"(timeout: {self._timeout}s)",
                 request_id,
             )
         except Exception as e:
@@ -55,6 +82,14 @@ class ApprovalGate:
         except asyncio.TimeoutError:
             self._pending.pop(request_id, None)
             logger.info("Approval timed out for '%s' (id=%s)", tool_name, request_id)
+            # Notify user that the approval request timed out
+            if self._notify_fn:
+                try:
+                    await self._notify_fn(
+                        f"⏱ *Approval timed out* for `{tool_name}` (id=`{request_id}`) — action denied."
+                    )
+                except Exception:
+                    pass
             return False
 
     def resolve(self, request_id: str, approved: bool) -> bool:

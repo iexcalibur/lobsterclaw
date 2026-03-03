@@ -241,7 +241,13 @@ SESSIONS_LIST_TOOL = ToolDefinition(
 )
 
 
-async def _sessions_list(status: str | None = None, limit: int = 20) -> str:
+async def _sessions_list(
+    status: str | None = None,
+    kinds: list | None = None,
+    activeMinutes: int | None = None,
+    messageLimit: int = 0,
+    limit: int = 20,
+) -> str:
     from agent.sessions import get_session_store
     from datetime import datetime, timezone, timedelta
     try:
@@ -341,13 +347,9 @@ async def _sessions_history(
         session = await store.get_session(effective_id)
         if not session:
             return f"Session '{effective_id}' not found."
-        history = await store.get_messages_formatted(effective_id, limit=limit)
-        if not includeTools:
-            # Strip tool call/result lines
-            history = "\n".join(
-                line for line in history.splitlines()
-                if not (line.strip().startswith("[Tool") or line.strip().startswith("[Result"))
-            )
+        history = await store.get_messages_formatted(
+            effective_id, limit=limit, include_tools=bool(includeTools)
+        )
         return f"Session `{effective_id}` ({session.label}) — last {limit} messages:\n\n{history}"
     except Exception as e:
         return f"Error reading session history: {e}"
@@ -419,6 +421,17 @@ async def _sessions_send(
         if session.status != "active":
             return f"Session '{effective_id}' is {session.status} — cannot send to it."
         effective_role = role if role in ("user", "assistant", "system") else "user"
+
+        # If the target is a sub-agent session, route through SubagentManager inbox
+        if session.depth > 0:
+            try:
+                from agent.subagent import get_subagent_manager
+                mgr = get_subagent_manager()
+                result = await mgr.send_to_run(effective_id, message, role=effective_role)
+                return result
+            except RuntimeError:
+                pass  # SubagentManager not initialized — fall through to direct append
+
         tag = "[System]" if effective_role == "system" else "[Injected]"
         await store.append_message(effective_id, effective_role, f"{tag}: {message}")
         return (

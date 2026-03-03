@@ -240,7 +240,12 @@ class SessionStore:
         conn.close()
         return [{"role": r["role"], "content": r["content"]} for r in rows]
 
-    async def get_messages_formatted(self, session_id: str, limit: int = 50) -> str:
+    async def get_messages_formatted(
+        self,
+        session_id: str,
+        limit: int = 50,
+        include_tools: bool = True,
+    ) -> str:
         messages = await self.get_messages(session_id, limit)
         if not messages:
             return "No messages found."
@@ -248,15 +253,24 @@ class SessionStore:
         for msg in messages:
             role = msg["role"].upper()
             content = msg["content"]
+            # Skip tool-use / tool-result blocks when include_tools is False
+            if not include_tools and role in ("TOOL", "TOOL_RESULT"):
+                continue
+            # Also skip assistant blocks that are purely tool_use JSON arrays
+            if not include_tools and role == "ASSISTANT":
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list) and all(
+                        isinstance(b, dict) and b.get("type") in ("tool_use", "thinking")
+                        for b in parsed
+                    ):
+                        continue
+                except (json.JSONDecodeError, TypeError):
+                    pass
             if len(content) > 500:
                 content = content[:500] + "…"
             lines.append(f"[{role}]: {content}")
-        return "\n\n".join(lines)
-
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
+        return "\n\n".join(lines) if lines else "No user/assistant messages found."
 
     async def delete_session(self, session_id: str) -> None:
         """Delete a session and all its messages."""
