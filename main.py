@@ -37,6 +37,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Reduce noisy transport logs unless explicitly debugging.
+if cfg.log_level.upper() != "DEBUG":
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 def build_registry():
     """Build and return a ToolRegistry with all tools registered and policy applied."""

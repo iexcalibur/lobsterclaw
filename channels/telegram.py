@@ -620,13 +620,10 @@ class TelegramChannel:
             if reply_body:
                 text = f'[Reply to: "{reply_body}"]\n{text}'
 
-        # Forwarded message attribution
-        if msg.forward_from:
-            fwd = msg.forward_from
-            name = f"{fwd.first_name or ''} {fwd.last_name or ''}".strip()
-            text = f"[Forwarded from {name}]\n{text}"
-        elif msg.forward_from_chat:
-            text = f"[Forwarded from channel: {msg.forward_from_chat.title or ''}]\n{text}"
+        # Forwarded message attribution (supports PTB v22+ and older fields)
+        fwd_prefix = _extract_forward_prefix(msg)
+        if fwd_prefix:
+            text = f"{fwd_prefix}\n{text}"
 
         await self._run_agent(update, text)
 
@@ -846,7 +843,13 @@ class TelegramChannel:
         Try setting a reaction. Returns True on success.
         On REACTION_INVALID, tries fallback list.
         """
+        if not getattr(self.cfg, "telegram_reactions_enabled", True):
+            return False
         from telegram import ReactionTypeEmoji
+        # Empty emoji means reaction lifecycle is disabled for that stage.
+        # Skip API calls unless this is an explicit remove request.
+        if not remove and not emoji:
+            return False
         try:
             if remove or not emoji:
                 await self._bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[])
@@ -952,9 +955,10 @@ class TelegramChannel:
             self.cfg, tool_names, runtime_info=_runtime_info
         )
         messages = self.history.get_for_llm(context_key)
+        reactions_enabled = getattr(self.cfg, "telegram_reactions_enabled", True)
 
         # Reaction: thinking phase
-        if inbound_msg_id:
+        if inbound_msg_id and reactions_enabled:
             asyncio.create_task(self._reaction_thinking(chat_id, inbound_msg_id))
 
         # Typing indicator
@@ -971,7 +975,7 @@ class TelegramChannel:
             nonlocal first_tool_fired
             if not first_tool_fired:
                 first_tool_fired = True
-                if inbound_msg_id:
+                if inbound_msg_id and reactions_enabled:
                     asyncio.create_task(self._reaction_working(chat_id, inbound_msg_id))
 
         use_streaming = getattr(self.cfg, "llm_streaming", True)
@@ -987,10 +991,10 @@ class TelegramChannel:
         except Exception as e:
             logger.exception("[%s] Agent run failed", self._label)
             reply = f"Sorry, something went wrong: {type(e).__name__}"
-            if inbound_msg_id:
+            if inbound_msg_id and reactions_enabled:
                 asyncio.create_task(self._reaction_error(chat_id, inbound_msg_id))
         else:
-            if inbound_msg_id:
+            if inbound_msg_id and reactions_enabled:
                 asyncio.create_task(self._reaction_done(chat_id, inbound_msg_id))
         finally:
             typing_task.cancel()
@@ -1750,6 +1754,58 @@ def _extract_reply_body(reply_msg: Message) -> str | None:
         return "[voice]"
     if reply_msg.document:
         return f"[document: {reply_msg.document.file_name or 'file'}]"
+    return None
+
+
+def _extract_forward_prefix(msg: Message) -> str | None:
+    """
+    Build a human-readable prefix for forwarded messages.
+
+    PTB v22+ uses `forward_origin` (MessageOrigin*). Older versions exposed
+    `forward_from` / `forward_from_chat`; we keep a fallback for compatibility.
+    """
+    origin = getattr(msg, "forward_origin", None)
+    if origin:
+        # Forwarded from a user account
+        user = getattr(origin, "user", None)
+        if user:
+            name = f"{user.first_name or ''} {getattr(user, 'last_name', '') or ''}".strip()
+            if not name:
+                name = getattr(user, "username", "") or str(getattr(user, "id", "user"))
+            return f"[Forwarded from {name}]"
+
+        # Forwarded while hiding original sender identity
+        hidden_name = getattr(origin, "sender_user_name", None)
+        if hidden_name:
+            return f"[Forwarded from {hidden_name}]"
+
+        # Forwarded from chat/channel
+        chat = getattr(origin, "chat", None)
+        if chat:
+            title = (
+                getattr(chat, "title", None)
+                or getattr(chat, "username", None)
+                or str(getattr(chat, "id", "channel"))
+            )
+            return f"[Forwarded from channel: {title}]"
+
+    # Legacy fields (older PTB versions)
+    fwd_user = getattr(msg, "forward_from", None)
+    if fwd_user:
+        name = f"{fwd_user.first_name or ''} {getattr(fwd_user, 'last_name', '') or ''}".strip()
+        if not name:
+            name = getattr(fwd_user, "username", "") or str(getattr(fwd_user, "id", "user"))
+        return f"[Forwarded from {name}]"
+
+    fwd_chat = getattr(msg, "forward_from_chat", None)
+    if fwd_chat:
+        title = (
+            getattr(fwd_chat, "title", None)
+            or getattr(fwd_chat, "username", None)
+            or str(getattr(fwd_chat, "id", "channel"))
+        )
+        return f"[Forwarded from channel: {title}]"
+
     return None
 
 

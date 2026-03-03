@@ -81,6 +81,10 @@ class Config:
     telegram_callback_policy: str = field(
         default_factory=lambda: _env("TELEGRAM_CALLBACK_POLICY", "owner")
     )
+    # Global switch for auto reaction lifecycle on inbound messages.
+    telegram_reactions_enabled: bool = field(
+        default_factory=lambda: _env_bool("TELEGRAM_REACTIONS_ENABLED", True)
+    )
     # Reaction lifecycle emojis
     telegram_reaction_thinking: str = field(
         default_factory=lambda: _env("TELEGRAM_REACTION_THINKING", "👀")
