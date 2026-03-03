@@ -27,41 +27,77 @@ _start_time = datetime.now()
 TOOL_DEFINITION = ToolDefinition(
     name="gateway",
     description=(
-        "Control the PyGate process itself.\n"
+        "Control the PyGate process and remote gateways.\n\n"
+        "Field parity with OpenClaw gateway-tool.ts:\n"
+        "  action       — required: see actions below\n"
+        "  gatewayUrl   — remote gateway base URL (for remote ops)\n"
+        "  gatewayToken — auth token for remote gateway\n"
+        "  timeoutMs    — request timeout for remote ops (default 10000ms)\n"
+        "  baseHash     — expected config hash for write-safety checks\n"
+        "  sessionKey   — associate update with a session key\n"
+        "  note         — human-readable note for config changes\n"
+        "  restartDelayMs — milliseconds to wait before restart (default 1000ms)\n\n"
         "Actions:\n"
-        "  status         — show uptime and process info\n"
-        "  restart        — restart the bot process\n"
-        "  config.get     — view current configuration (sensitive values redacted)\n"
-        "  config.schema  — show all available config keys and their types\n"
-        "  config.set     — set a single config value in .env (key + value, requires restart)\n"
-        "  config.apply   — replace .env entirely with the provided raw content\n"
-        "  config.patch   — merge-patch .env with key=value pairs (partial update)\n"
-        "  update.run     — git pull latest code and restart"
+        "  status        — show uptime and process info\n"
+        "  restart       — restart the bot process\n"
+        "  config.get    — view current config (sensitive values redacted)\n"
+        "  config.schema — show all config keys and types\n"
+        "  config.set    — set a single key=value in .env\n"
+        "  config.apply  — replace .env with provided raw content\n"
+        "  config.patch  — merge KEY=VALUE lines into .env\n"
+        "  update.run    — git pull and restart\n"
+        "  policy        — show tool allow/deny policy"
     ),
     parameters={
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "description": "Action: status | restart | config.get | config.schema | config.set | config.apply | config.patch | update.run | policy",
+                "description": "Action to perform",
             },
-            "key": {
-                "type": "string",
-                "description": "Config key to set (for config.set action)",
-            },
-            "value": {
-                "type": "string",
-                "description": "Config value to set (for config.set action)",
-            },
+            "key": {"type": "string", "description": "Config key (config.set)"},
+            "value": {"type": "string", "description": "Config value (config.set)"},
             "raw": {
                 "type": "string",
-                "description": "Raw .env file content (for config.apply) or KEY=VALUE lines to merge (for config.patch)",
+                "description": "Raw .env content (config.apply) or KEY=VALUE lines (config.patch)",
+            },
+            # Remote gateway fields (OpenClaw parity)
+            "gatewayUrl": {
+                "type": "string",
+                "description": "Remote gateway base URL for remote operations",
+            },
+            "gatewayToken": {
+                "type": "string",
+                "description": "Auth token for remote gateway",
+            },
+            "timeoutMs": {
+                "type": "integer",
+                "description": "Request timeout for remote gateway ops (ms, default 10000)",
+                "default": 10000,
+            },
+            # Write-safety fields (OpenClaw parity)
+            "baseHash": {
+                "type": "string",
+                "description": "Expected config hash to detect concurrent edits (write-safety check)",
+            },
+            "sessionKey": {
+                "type": "string",
+                "description": "Session key to associate with this config change",
+            },
+            "note": {
+                "type": "string",
+                "description": "Human-readable note logged with config changes",
+            },
+            "restartDelayMs": {
+                "type": "integer",
+                "description": "Milliseconds to wait before restart (default 1000)",
+                "default": 1000,
             },
         },
         "required": ["action"],
     },
     fn=lambda **kw: _gateway(**kw),
-    owner_only=True,  # Only the main session may control the gateway
+    owner_only=True,
 )
 
 
@@ -70,6 +106,15 @@ async def _gateway(
     key: str | None = None,
     value: str | None = None,
     raw: str | None = None,
+    # Remote gateway fields (OpenClaw parity)
+    gatewayUrl: str | None = None,
+    gatewayToken: str | None = None,
+    timeoutMs: int = 10000,
+    # Write-safety fields
+    baseHash: str | None = None,
+    sessionKey: str | None = None,
+    note: str | None = None,
+    restartDelayMs: int = 1000,
 ) -> str:
     action = action.lower().strip()
 
@@ -86,12 +131,15 @@ async def _gateway(
         )
 
     if action == "restart":
-        logger.info("Gateway restart requested by agent")
-        # Schedule restart after returning response
+        logger.info("Gateway restart requested by agent (note=%s, sessionKey=%s)", note, sessionKey)
+        # If remote gateway, delegate via HTTP
+        if gatewayUrl:
+            return await _remote_gateway_call(gatewayUrl, gatewayToken, "restart", timeoutMs=timeoutMs)
         import asyncio
+        delay_s = restartDelayMs / 1000.0
         loop = asyncio.get_running_loop()
-        loop.call_later(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM))
-        return "PyGate restart scheduled in 1 second... ✅"
+        loop.call_later(delay_s, lambda: os.kill(os.getpid(), signal.SIGTERM))
+        return f"PyGate restart scheduled in {restartDelayMs}ms... ✅"
 
     if action == "config.schema":
         import dataclasses
@@ -119,10 +167,20 @@ async def _gateway(
     if action == "config.set":
         if not key or value is None:
             return "Error: 'key' and 'value' are required for config.set"
+        if gatewayUrl:
+            return await _remote_gateway_call(gatewayUrl, gatewayToken, "config.set",
+                                               params={"key": key, "value": value}, timeoutMs=timeoutMs)
         env_path = Path(".env")
         if not env_path.exists():
             return "Error: .env file not found"
         content = env_path.read_text(encoding="utf-8")
+        # baseHash safety check: verify current content hash matches expected
+        if baseHash:
+            import hashlib
+            current_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+            if current_hash != baseHash:
+                return (f"Error: baseHash mismatch — expected {baseHash}, got {current_hash}. "
+                        "Config may have been changed by another process.")
         lines = content.splitlines()
         found = False
         new_lines = []
@@ -134,8 +192,11 @@ async def _gateway(
                 new_lines.append(line)
         if not found:
             new_lines.append(f"{key}={value}")
+        if note:
+            new_lines.append(f"# {note}")
         env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-        return f"Config updated: {key}={value}\nRestart required to apply (use gateway restart)."
+        note_str = f" (note: {note})" if note else ""
+        return f"Config updated: {key}={value}{note_str}\nRestart required to apply."
 
     if action == "config.apply":
         if not raw:
@@ -207,4 +268,31 @@ async def _gateway(
         except Exception:
             return "Policy summary requires the registry to be accessible. Run from main process."
 
-    return f"Unknown action '{action}'. Use: status, restart, config.get, config.schema, config.set, config.apply, config.patch, update.run, policy"
+    return (
+        f"Unknown action '{action}'. Use: "
+        "status, restart, config.get, config.schema, config.set, config.apply, config.patch, update.run, policy"
+    )
+
+
+async def _remote_gateway_call(
+    gateway_url: str,
+    token: str | None,
+    action: str,
+    params: dict | None = None,
+    timeoutMs: int = 10000,
+) -> str:
+    """Delegate an action to a remote PyGate instance via HTTP (OpenClaw remote gateway parity)."""
+    try:
+        import httpx
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        url = gateway_url.rstrip("/") + "/gateway"
+        payload = {"action": action, **(params or {})}
+        async with httpx.AsyncClient(timeout=timeoutMs / 1000) as client:
+            r = await client.post(url, json=payload, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            return data.get("result", str(data))
+    except Exception as e:
+        return f"Remote gateway error ({gateway_url}): {e}"

@@ -22,29 +22,58 @@ TOOL_DEFINITION = ToolDefinition(
     description=(
         "Search the web and return results with titles, URLs, and descriptions.\n"
         "Providers: brave (ranked list), perplexity/gemini/grok/kimi (AI answer).\n\n"
-        "Filters (Brave-supported; AI providers will include in their prompt):\n"
+        "Field parity with OpenClaw web-search.ts:\n"
+        "  query       — search terms\n"
         "  count       — number of results (1-10, default 5)\n"
-        "  fresh       — recent results only\n"
-        "  time_range  — pd (past day) | pw (past week) | pm (past month) | py (past year)\n"
+        "  freshness   — time filter string: pd|pw|pm|py (also accepted as 'fresh'=bool)\n"
         "  country     — ISO 2-letter country code (e.g. 'us', 'gb', 'de')\n"
-        "  language    — language code (e.g. 'en', 'es', 'zh')\n"
-        "  safe_search — 'strict' | 'moderate' | 'off' (default 'moderate')"
+        "  search_lang — search result language code (also 'language')\n"
+        "  ui_lang     — interface language code\n"
+        "  safe_search — 'strict' | 'moderate' | 'off'\n"
+        "  time_range  — alias for freshness"
     ),
     parameters={
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query"},
-            "count": {"type": "integer", "description": "Number of results (1-10, default 5)", "default": 5},
-            "fresh": {"type": "boolean", "description": "Request recent results", "default": False},
-            "time_range": {
+            "count": {
+                "type": "integer",
+                "description": "Number of results (1-10, default 5)",
+                "default": 5,
+            },
+            # Freshness: OpenClaw uses string 'freshness'; PyGate also accepts bool 'fresh'
+            "freshness": {
                 "type": "string",
                 "description": "Time filter: pd (past day) | pw (past week) | pm (past month) | py (past year)",
             },
-            "country": {"type": "string", "description": "Country code (e.g. 'us', 'gb', 'de')"},
-            "language": {"type": "string", "description": "Language code (e.g. 'en', 'es', 'zh')"},
+            "fresh": {
+                "type": "boolean",
+                "description": "Shorthand for freshness='pd' (recent results). Alias.",
+                "default": False,
+            },
+            "time_range": {
+                "type": "string",
+                "description": "Alias for freshness: pd | pw | pm | py",
+            },
+            "country": {
+                "type": "string",
+                "description": "Country code (e.g. 'us', 'gb', 'de')",
+            },
+            "search_lang": {
+                "type": "string",
+                "description": "Search result language code (e.g. 'en', 'es', 'zh'). Also 'language'.",
+            },
+            "language": {
+                "type": "string",
+                "description": "Alias for search_lang",
+            },
+            "ui_lang": {
+                "type": "string",
+                "description": "UI/interface language code (e.g. 'en-US')",
+            },
             "safe_search": {
                 "type": "string",
-                "description": "Safe search level: strict | moderate | off",
+                "description": "Safe search: strict | moderate | off",
                 "default": "moderate",
             },
         },
@@ -58,30 +87,43 @@ async def _web_search(
     query: str,
     count: int = 5,
     fresh: bool = False,
-    time_range: str | None = None,
+    freshness: str | None = None,         # OpenClaw field name
+    time_range: str | None = None,        # alias for freshness
     country: str | None = None,
-    language: str | None = None,
+    search_lang: str | None = None,       # OpenClaw field name
+    language: str | None = None,          # alias for search_lang
+    ui_lang: str | None = None,
     safe_search: str = "moderate",
 ) -> str:
     cfg = get_config()
     count = min(max(1, count), cfg.web_search_max_results)
     provider = cfg.web_search_provider.lower()
 
+    # Resolve freshness: string > time_range alias > fresh bool
+    resolved_freshness = freshness or time_range
+    if not resolved_freshness and fresh:
+        resolved_freshness = "pd"
+
+    # Resolve language aliases
+    resolved_lang = search_lang or language
+
     # Build a filter hint for AI providers that don't have direct filter params
     filter_hints: list[str] = []
-    if time_range:
-        label = {"pd": "past day", "pw": "past week", "pm": "past month", "py": "past year"}.get(time_range, time_range)
+    if resolved_freshness:
+        label = {"pd": "past day", "pw": "past week", "pm": "past month", "py": "past year"}.get(resolved_freshness, resolved_freshness)
         filter_hints.append(f"Results from: {label}")
     if country:
         filter_hints.append(f"Country: {country.upper()}")
-    if language:
-        filter_hints.append(f"Language: {language}")
+    if resolved_lang:
+        filter_hints.append(f"Language: {resolved_lang}")
+    if ui_lang:
+        filter_hints.append(f"UI lang: {ui_lang}")
     augmented_query = query
     if filter_hints:
         augmented_query = query + " [" + "; ".join(filter_hints) + "]"
 
     providers = {
-        "brave": lambda: _brave(query, count, cfg.brave_api_key, fresh=fresh, time_range=time_range, country=country, language=language, safe_search=safe_search),
+        "brave": lambda: _brave(query, count, cfg.brave_api_key, freshness=resolved_freshness, country=country, search_lang=resolved_lang, ui_lang=ui_lang, safe_search=safe_search),
         "perplexity": lambda: _perplexity(augmented_query, cfg.perplexity_api_key),
         "gemini": lambda: _gemini(augmented_query, cfg.gemini_api_key),
         "grok": lambda: _grok(augmented_query, getattr(cfg, "grok_api_key", "")),
@@ -115,10 +157,10 @@ async def _brave(
     query: str,
     count: int,
     api_key: str,
-    fresh: bool = False,
-    time_range: str | None = None,
+    freshness: str | None = None,
     country: str | None = None,
-    language: str | None = None,
+    search_lang: str | None = None,
+    ui_lang: str | None = None,
     safe_search: str = "moderate",
 ) -> str:
     if not api_key:
@@ -126,18 +168,19 @@ async def _brave(
 
     params: dict = {"q": query, "count": count}
 
-    # Freshness / time range (time_range takes precedence over fresh flag)
-    if time_range and time_range in ("pd", "pw", "pm", "py"):
-        params["freshness"] = time_range
-    elif fresh:
-        params["freshness"] = "pd"
+    # Freshness (OpenClaw field name: freshness)
+    if freshness and freshness in ("pd", "pw", "pm", "py"):
+        params["freshness"] = freshness
 
-    # Country / language
+    # Country / language (OpenClaw field names: country, search_lang, ui_lang)
     if country:
         params["country"] = country.lower()
-    if language:
-        params["search_lang"] = language.lower()
-        params["ui_lang"] = language.lower()
+    if search_lang:
+        params["search_lang"] = search_lang.lower()
+    if ui_lang:
+        params["ui_lang"] = ui_lang.lower()
+    elif search_lang:
+        params["ui_lang"] = search_lang.lower()
 
     # Safe search
     safe_map = {"strict": "strict", "moderate": "moderate", "off": "off"}

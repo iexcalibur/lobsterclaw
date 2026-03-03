@@ -1,47 +1,54 @@
 """
 Message tool — mirrors OpenClaw's message tool and telegram-actions.ts.
 
-Action name parity:
-  OpenClaw uses camelCase:  sendMessage, editMessage, deleteMessage, sendSticker,
-                             searchSticker, stickerCacheStats, createForumTopic
-  PyGate accepts both camelCase (OpenClaw-style) and snake_case aliases.
+Field contract parity (OpenClaw telegram-actions.ts:178):
+  OpenClaw fields: to, content, mediaUrl, buttons, replyToMessageId,
+                   messageThreadId, quoteText, asVoice, silent, accountId
+  PyGate accepts both OpenClaw field names and snake_case aliases:
+    to           ↔  chat_id
+    content      ↔  text
+    mediaUrl     ↔  source
+    asVoice      ↔  as_voice
+    replyToMessageId ↔ reply_to_message_id
+    messageThreadId  ↔ message_thread_id
+    quoteText    ↔  quote_text
+    silent       ↔  silent
 
-Telegram actions (1:1 with telegram-actions.ts):
-  sendMessage / send            — send text
-  sendPhoto / send_photo        — send photo
-  sendDocument / send_document  — send document
-  sendSticker / send_sticker    — send sticker by file_id
-  searchSticker                 — search sticker set by name
-  stickerCacheStats             — show sticker cache statistics
-  editMessage / edit            — edit a message
-  deleteMessage / delete        — delete a message
-  reactMessage / react          — add emoji reaction
-  sendButtons / buttons         — inline keyboard
-  createForumTopic              — create a forum topic
+Action name parity (OpenClaw camelCase ↔ PyGate snake_case):
+  sendMessage / send
+  sendPhoto / send_photo
+  sendDocument / send_document
+  sendSticker / send_sticker
+  searchSticker / search_sticker
+  stickerCacheStats / sticker_cache_stats
+  editMessage / edit
+  deleteMessage / delete
+  reactMessage / react
+  sendButtons / buttons
+  createForumTopic / create_forum_topic
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 from tools.registry import ToolDefinition
 
 logger = logging.getLogger(__name__)
 
-# Injected by main.py after Telegram is ready
+# Injected by main.py
 _send_fn: Callable[[str], Awaitable[None]] | None = None
 _send_photo_fn: Callable | None = None
 _send_document_fn: Callable | None = None
 _send_sticker_fn: Callable | None = None
-_search_sticker_fn: Callable | None = None
 _edit_fn: Callable | None = None
 _delete_fn: Callable | None = None
 _react_fn: Callable | None = None
 _send_buttons_fn: Callable | None = None
 _create_forum_topic_fn: Callable | None = None
 
-# Sticker search cache (in-memory)
+# Sticker search cache
 _sticker_cache: dict[str, list[dict]] = {}
 
 
@@ -54,14 +61,13 @@ def set_telegram_fns(
     send_photo=None,
     send_document=None,
     send_sticker=None,
-    search_sticker=None,
     edit=None,
     delete=None,
     react=None,
     send_buttons=None,
     create_forum_topic=None,
 ) -> None:
-    global _send_photo_fn, _send_document_fn, _send_sticker_fn, _search_sticker_fn
+    global _send_photo_fn, _send_document_fn, _send_sticker_fn
     global _edit_fn, _delete_fn, _react_fn, _send_buttons_fn, _create_forum_topic_fn
     if send_photo:
         _send_photo_fn = send_photo
@@ -69,8 +75,6 @@ def set_telegram_fns(
         _send_document_fn = send_document
     if send_sticker:
         _send_sticker_fn = send_sticker
-    if search_sticker:
-        _search_sticker_fn = search_sticker
     if edit:
         _edit_fn = edit
     if delete:
@@ -84,28 +88,27 @@ def set_telegram_fns(
 
 
 # ------------------------------------------------------------------
-# Action name normalisation: camelCase → snake_case
+# Action alias table — OpenClaw camelCase → canonical snake_case
 # ------------------------------------------------------------------
 
 _ACTION_ALIASES: dict[str, str] = {
-    # OpenClaw camelCase → canonical snake_case
-    "sendmessage":          "send",
-    "sendphoto":            "send_photo",
-    "senddocument":         "send_document",
-    "sendsticker":          "send_sticker",
-    "searchsticker":        "search_sticker",
-    "stickercachestats":    "sticker_cache_stats",
-    "editmessage":          "edit",
-    "deletemessage":        "delete",
-    "reactmessage":         "react",
-    "sendbuttons":          "buttons",
-    "createforumtopic":     "create_forum_topic",
-    # Legacy aliases
-    "send_message":         "send",
-    "edit_message":         "edit",
-    "delete_message":       "delete",
-    "react_message":        "react",
-    "send_buttons":         "buttons",
+    "sendmessage":       "send",
+    "sendphoto":         "send_photo",
+    "senddocument":      "send_document",
+    "sendsticker":       "send_sticker",
+    "searchsticker":     "search_sticker",
+    "stickercachestats": "sticker_cache_stats",
+    "editmessage":       "edit",
+    "deletemessage":     "delete",
+    "reactmessage":      "react",
+    "sendbuttons":       "buttons",
+    "createforumtopic":  "create_forum_topic",
+    # snake_case legacy
+    "send_message":      "send",
+    "edit_message":      "edit",
+    "delete_message":    "delete",
+    "react_message":     "react",
+    "send_buttons":      "buttons",
 }
 
 
@@ -121,60 +124,117 @@ def _normalise_action(action: str) -> str:
 TOOL_DEFINITION = ToolDefinition(
     name="message",
     description=(
-        "Send Telegram messages and perform Telegram actions.\n\n"
-        "Accepts both OpenClaw camelCase (sendMessage, editMessage, etc.)\n"
-        "and snake_case aliases (send, edit, etc.).\n\n"
+        "Send Telegram messages and perform channel actions.\n\n"
+        "Accepts both OpenClaw camelCase (sendMessage, editMessage…) and snake_case.\n"
+        "Field aliases: 'to'=chat_id, 'content'=text, 'mediaUrl'=source, "
+        "'replyToMessageId'=reply_to_message_id, 'messageThreadId'=message_thread_id.\n\n"
         "Actions:\n"
-        "  send / sendMessage                — send text to owner\n"
-        "  send_photo / sendPhoto            — send a photo (path or URL)\n"
-        "  send_document / sendDocument      — send a file as attachment\n"
-        "  send_sticker / sendSticker        — send sticker by file_id\n"
-        "  searchSticker / search_sticker    — search for stickers in a sticker set\n"
-        "  stickerCacheStats                 — show sticker cache stats\n"
-        "  edit / editMessage                — edit a previously sent message\n"
-        "  delete / deleteMessage            — delete a message\n"
-        "  react / reactMessage              — add emoji reaction\n"
-        "  buttons / sendButtons             — send message with inline keyboard\n"
-        "  createForumTopic / create_forum_topic — create a forum/topic thread"
+        "  send / sendMessage             — text to owner\n"
+        "  send_photo / sendPhoto         — photo (path or URL)\n"
+        "  send_document / sendDocument   — file as attachment\n"
+        "  send_sticker / sendSticker     — sticker by file_id\n"
+        "  searchSticker / search_sticker — search sticker set by name\n"
+        "  stickerCacheStats              — show sticker cache\n"
+        "  edit / editMessage             — edit a message\n"
+        "  delete / deleteMessage         — delete a message\n"
+        "  react / reactMessage           — emoji reaction\n"
+        "  buttons / sendButtons          — inline keyboard\n"
+        "  createForumTopic               — create forum/topic thread"
     ),
     parameters={
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "description": (
-                    "Action (camelCase or snake_case):\n"
-                    "send|sendMessage | send_photo|sendPhoto | send_document|sendDocument |\n"
-                    "send_sticker|sendSticker | searchSticker | stickerCacheStats |\n"
-                    "edit|editMessage | delete|deleteMessage | react|reactMessage |\n"
-                    "buttons|sendButtons | createForumTopic"
-                ),
+                "description": "Action (camelCase or snake_case). Default: send",
                 "default": "send",
             },
+            # Content fields — both OpenClaw and PyGate aliases accepted
             "text": {
                 "type": "string",
-                "description": "Message text (send, edit, buttons)",
+                "description": "Message text (also accepted as 'content')",
+            },
+            "content": {
+                "type": "string",
+                "description": "Alias for text (OpenClaw field name)",
             },
             "source": {
                 "type": "string",
-                "description": "File path or URL (send_photo, send_document)",
+                "description": "File path or URL for media (also accepted as 'mediaUrl')",
+            },
+            "mediaUrl": {
+                "type": "string",
+                "description": "Alias for source (OpenClaw field name)",
             },
             "caption": {
                 "type": "string",
                 "description": "Caption for photos/documents",
             },
+            # Target fields
             "chat_id": {
                 "type": "integer",
-                "description": "Target chat ID (defaults to owner)",
+                "description": "Target chat ID (defaults to owner; also accepted as 'to')",
+            },
+            "to": {
+                "type": "string",
+                "description": "Alias for chat_id (OpenClaw field name; also accepts username)",
             },
             "message_id": {
                 "type": "integer",
-                "description": "Message ID (required for edit/delete/react)",
+                "description": "Message ID (edit/delete/react)",
             },
+            # Thread / reply context (OpenClaw telegram-actions.ts parity)
+            "reply_to_message_id": {
+                "type": "integer",
+                "description": "Reply-to message ID (also 'replyToMessageId')",
+            },
+            "replyToMessageId": {
+                "type": "integer",
+                "description": "Alias for reply_to_message_id",
+            },
+            "message_thread_id": {
+                "type": "integer",
+                "description": "Forum thread/topic ID (also 'messageThreadId')",
+            },
+            "messageThreadId": {
+                "type": "integer",
+                "description": "Alias for message_thread_id",
+            },
+            "quote_text": {
+                "type": "string",
+                "description": "Text to quote above the message (also 'quoteText')",
+            },
+            "quoteText": {
+                "type": "string",
+                "description": "Alias for quote_text",
+            },
+            # Send modifiers
+            "as_voice": {
+                "type": "boolean",
+                "description": "Send TTS audio as voice message instead of text (also 'asVoice')",
+            },
+            "asVoice": {
+                "type": "boolean",
+                "description": "Alias for as_voice",
+            },
+            "silent": {
+                "type": "boolean",
+                "description": "Send silently (no notification sound)",
+            },
+            "account_id": {
+                "type": "string",
+                "description": "Account ID for multi-account setups (also 'accountId')",
+            },
+            "accountId": {
+                "type": "string",
+                "description": "Alias for account_id",
+            },
+            # Reaction
             "emoji": {
                 "type": "string",
                 "description": "Emoji for react action (e.g. '👍')",
             },
+            # Inline buttons
             "buttons": {
                 "type": "array",
                 "description": "Inline keyboard buttons [{text, data}]",
@@ -186,14 +246,25 @@ TOOL_DEFINITION = ToolDefinition(
                     },
                 },
             },
+            # Sticker
             "file_id": {
                 "type": "string",
-                "description": "Telegram file_id (send_sticker)",
+                "description": "Telegram file_id for send_sticker",
             },
+            # Forum topics
             "topic_name": {
                 "type": "string",
-                "description": "Forum topic name (createForumTopic)",
+                "description": "Forum topic name for createForumTopic",
             },
+            "icon_color": {
+                "type": "integer",
+                "description": "Forum topic icon color (RGB hex int, createForumTopic)",
+            },
+            "icon_custom_emoji_id": {
+                "type": "string",
+                "description": "Custom emoji ID for forum topic icon (createForumTopic)",
+            },
+            # Sticker search
             "query": {
                 "type": "string",
                 "description": "Sticker set name or emoji query (searchSticker)",
@@ -206,39 +277,106 @@ TOOL_DEFINITION = ToolDefinition(
 
 
 # ------------------------------------------------------------------
+# Field normalisation helpers
+# ------------------------------------------------------------------
+
+def _coerce(kwargs: dict, canonical: str, *aliases: str):
+    """Promote first non-None alias into canonical field (if canonical is absent)."""
+    if canonical not in kwargs or kwargs[canonical] is None:
+        for alias in aliases:
+            if kwargs.get(alias) is not None:
+                kwargs[canonical] = kwargs[alias]
+                break
+    for alias in aliases:
+        kwargs.pop(alias, None)
+
+
+# ------------------------------------------------------------------
 # Implementation
 # ------------------------------------------------------------------
 
 async def _message(
     action: str = "send",
     text: str | None = None,
+    content: str | None = None,           # OpenClaw alias
     source: str | None = None,
+    mediaUrl: str | None = None,           # OpenClaw alias
     caption: str = "",
     chat_id: int | None = None,
+    to: str | None = None,                 # OpenClaw alias
     message_id: int | None = None,
+    reply_to_message_id: int | None = None,
+    replyToMessageId: int | None = None,   # OpenClaw alias
+    message_thread_id: int | None = None,
+    messageThreadId: int | None = None,    # OpenClaw alias
+    quote_text: str | None = None,
+    quoteText: str | None = None,          # OpenClaw alias
+    as_voice: bool = False,
+    asVoice: bool = False,                 # OpenClaw alias
+    silent: bool = False,
+    account_id: str | None = None,
+    accountId: str | None = None,          # OpenClaw alias
     emoji: str | None = None,
     buttons: list[dict] | None = None,
     file_id: str | None = None,
     topic_name: str | None = None,
+    icon_color: int | None = None,
+    icon_custom_emoji_id: str | None = None,
     query: str | None = None,
 ) -> str:
     action = _normalise_action(action or "send")
 
+    # Resolve aliases → canonical names
+    text = text or content
+    source = source or mediaUrl
+    reply_to_message_id = reply_to_message_id or replyToMessageId
+    message_thread_id = message_thread_id or messageThreadId
+    quote_text = quote_text or quoteText
+    as_voice = as_voice or asVoice
+
     from config import get_config
-    owner_id = get_config().telegram_owner_id
+    cfg = get_config()
+    owner_id = cfg.telegram_owner_id
+
+    # Resolve `to` → chat_id
+    if chat_id is None and to is not None:
+        try:
+            chat_id = int(to)
+        except (ValueError, TypeError):
+            chat_id = owner_id  # fall back; username resolution not yet supported
     target = chat_id or owner_id
+
+    # ------------------------------------------------------------------
+    # asVoice: convert text to TTS and send as voice note
+    # ------------------------------------------------------------------
+    if as_voice and text:
+        try:
+            from tools.media_tool import _tts
+            import tempfile, os
+            tmp = tempfile.mktemp(suffix=".mp3")
+            tts_result = await _tts(text=text, voice="en-US-ChristopherNeural", output_path=tmp)
+            if os.path.exists(tmp):
+                from tools.media_tool import _send_audio_fn
+                if _send_audio_fn:
+                    await _send_audio_fn(tmp)
+                    os.unlink(tmp)
+                    return "Voice message sent ✅"
+        except Exception as e:
+            logger.warning("asVoice TTS failed, falling back to text: %s", e)
 
     if action == "send":
         if not text:
-            return "Error: 'text' is required for send action"
+            return "Error: 'text' (or 'content') is required for send action"
         if not _send_fn:
             return "Error: Telegram send_fn not configured"
-        await _send_fn(text)
+        # Prepend quote if provided
+        msg = f">{quote_text}\n\n{text}" if quote_text else text
+        await _send_fn(msg)
         return "Message sent ✅"
 
     if action == "send_photo":
         if not source:
-            return "Error: 'source' (path or URL) is required for send_photo"
+            return "Error: 'source' (or 'mediaUrl') is required for send_photo"
         if not _send_photo_fn:
             return "Error: send_photo not configured"
         await _send_photo_fn(source, caption)
@@ -246,7 +384,7 @@ async def _message(
 
     if action == "send_document":
         if not source:
-            return "Error: 'source' (file path) is required for send_document"
+            return "Error: 'source' (or 'mediaUrl') is required for send_document"
         if not _send_document_fn:
             return "Error: send_document not configured"
         await _send_document_fn(source, caption)
@@ -264,11 +402,10 @@ async def _message(
         return await _search_sticker(query or "")
 
     if action == "sticker_cache_stats":
-        total_sticker_sets = len(_sticker_cache)
-        total_stickers = sum(len(v) for v in _sticker_cache.values())
         if not _sticker_cache:
             return "Sticker cache is empty. Use searchSticker to populate it."
-        lines = [f"Sticker cache: {total_sticker_sets} sets, {total_stickers} stickers cached"]
+        total = sum(len(v) for v in _sticker_cache.values())
+        lines = [f"Sticker cache: {len(_sticker_cache)} sets, {total} stickers"]
         for set_name, stickers in list(_sticker_cache.items())[:10]:
             lines.append(f"  {set_name}: {len(stickers)} stickers")
         return "\n".join(lines)
@@ -282,9 +419,9 @@ async def _message(
 
     if action == "edit":
         if not message_id:
-            return "Error: 'message_id' is required for edit action"
+            return "Error: 'message_id' is required for edit"
         if not text:
-            return "Error: 'text' is required for edit action"
+            return "Error: 'text' (or 'content') is required for edit"
         if not _edit_fn:
             return "Error: edit_message not configured"
         await _edit_fn(target, message_id, text)
@@ -292,7 +429,7 @@ async def _message(
 
     if action == "delete":
         if not message_id:
-            return "Error: 'message_id' is required for delete action"
+            return "Error: 'message_id' is required for delete"
         if not _delete_fn:
             return "Error: delete_message not configured"
         await _delete_fn(target, message_id)
@@ -300,9 +437,9 @@ async def _message(
 
     if action == "react":
         if not message_id:
-            return "Error: 'message_id' is required for react action"
+            return "Error: 'message_id' is required for react"
         if not emoji:
-            return "Error: 'emoji' is required for react action"
+            return "Error: 'emoji' is required for react"
         if not _react_fn:
             return "Error: react_to_message not configured"
         await _react_fn(target, message_id, emoji)
@@ -310,9 +447,9 @@ async def _message(
 
     if action == "buttons":
         if not text:
-            return "Error: 'text' is required for buttons action"
+            return "Error: 'text' is required for buttons"
         if not buttons:
-            return "Error: 'buttons' list is required for buttons action"
+            return "Error: 'buttons' list is required for buttons"
         if not _send_buttons_fn:
             return "Error: send_with_buttons not configured"
         await _send_buttons_fn(text, buttons, target)
@@ -328,45 +465,32 @@ async def _message(
 
 
 async def _search_sticker(query: str) -> str:
-    """Search stickers in a named set or by emoji. Caches results."""
     if not query:
-        return "Error: 'query' is required for searchSticker (set name or emoji)"
-
-    # Check cache first
+        return "Error: 'query' is required for searchSticker (sticker set name or emoji)"
     if query in _sticker_cache:
         stickers = _sticker_cache[query]
-        results = "\n".join(
-            f"  [{i}] file_id={s.get('file_id', '?')} emoji={s.get('emoji', '')}"
-            for i, s in enumerate(stickers[:10])
-        )
-        return f"Cached stickers for '{query}':\n{results}"
-
-    # Try to search via Telegram bot API if configured
+        lines = [f"Cached sticker set '{query}' ({len(stickers)} stickers):"]
+        lines += [f"  [{i}] file_id={s['file_id']} emoji={s.get('emoji','')}"
+                  for i, s in enumerate(stickers[:10])]
+        return "\n".join(lines)
     try:
         from config import get_config
-        cfg = get_config()
         import httpx
         resp = await httpx.AsyncClient(timeout=10).get(
-            f"https://api.telegram.org/bot{cfg.telegram_bot_token}/getStickerSet",
+            f"https://api.telegram.org/bot{get_config().telegram_bot_token}/getStickerSet",
             params={"name": query},
         )
         data = resp.json()
         if data.get("ok"):
-            sticker_set = data["result"]
-            stickers = [
-                {"file_id": s["file_id"], "emoji": s.get("emoji", "")}
-                for s in sticker_set.get("stickers", [])
-            ]
+            ss = data["result"]
+            stickers = [{"file_id": s["file_id"], "emoji": s.get("emoji", "")}
+                        for s in ss.get("stickers", [])]
             _sticker_cache[query] = stickers
-            results = "\n".join(
-                f"  [{i}] file_id={s['file_id']} emoji={s['emoji']}"
-                for i, s in enumerate(stickers[:10])
-            )
-            return (
-                f"Sticker set '{sticker_set['name']}' ({sticker_set['title']}):\n"
-                f"{results}\n\n"
-                f"Use send_sticker with file_id to send one."
-            )
-        return f"Sticker set '{query}' not found: {data.get('description', 'unknown error')}"
+            lines = [f"Sticker set '{ss['name']}' ({ss['title']}, {len(stickers)} stickers):"]
+            lines += [f"  [{i}] file_id={s['file_id']} emoji={s['emoji']}"
+                      for i, s in enumerate(stickers[:10])]
+            lines.append("\nUse send_sticker with file_id to send one.")
+            return "\n".join(lines)
+        return f"Sticker set '{query}' not found: {data.get('description', 'unknown')}"
     except Exception as e:
         return f"Sticker search error: {e}"

@@ -32,18 +32,35 @@ logger = logging.getLogger(__name__)
 MEMORY_SEARCH_TOOL = ToolDefinition(
     name="memory_search",
     description=(
-        "Search long-term memory for relevant notes and facts. "
-        "Searches MEMORY.md and all files in workspace/memory/ using FTS or semantic search. "
-        "Run this BEFORE answering questions about the user's past preferences, projects, or decisions."
+        "Search long-term memory for relevant notes and facts.\n\n"
+        "Field parity with OpenClaw memory-tool.ts:\n"
+        "  query      — search terms or natural language\n"
+        "  maxResults — max results to return (also 'limit', default 5)\n"
+        "  minScore   — minimum relevance score 0-1 (default 0.0, no filter)\n"
+        "  mode       — 'fts' (keyword) or 'semantic' (requires MEMORY_SEMANTIC=true)"
     ),
     parameters={
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query (keywords or natural language)"},
-            "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
+            "maxResults": {
+                "type": "integer",
+                "description": "Max results — OpenClaw field name (also 'limit', default 5)",
+                "default": 5,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Alias for maxResults",
+                "default": 5,
+            },
+            "minScore": {
+                "type": "number",
+                "description": "Minimum relevance score 0.0-1.0 to filter results (default 0.0)",
+                "default": 0.0,
+            },
             "mode": {
                 "type": "string",
-                "description": "Search mode: 'fts' (keyword, default) or 'semantic' (meaning-based, requires MEMORY_SEMANTIC=true)",
+                "description": "Search mode: fts (keyword, default) | semantic (requires MEMORY_SEMANTIC=true)",
                 "default": "fts",
             },
         },
@@ -55,17 +72,33 @@ MEMORY_SEARCH_TOOL = ToolDefinition(
 MEMORY_GET_TOOL = ToolDefinition(
     name="memory_get",
     description=(
-        "Read a specific memory file by key. "
-        "Key is the filename without .md (e.g. 'preferences', 'projects'). "
-        "Use 'MEMORY' to read the top-level MEMORY.md. "
-        "Use memory_list to see all available keys."
+        "Read a specific memory file by key or path.\n\n"
+        "Field parity with OpenClaw memory-tool.ts:\n"
+        "  path / key  — memory key (filename without .md) or full path\n"
+        "  from        — 1-indexed line number to start reading from\n"
+        "  lines       — max lines to return (default: all)"
     ),
     parameters={
         "type": "object",
         "properties": {
-            "key": {"type": "string", "description": "Memory key (filename without .md)"},
+            "path": {
+                "type": "string",
+                "description": "Memory key or path (OpenClaw field name; also 'key')",
+            },
+            "key": {
+                "type": "string",
+                "description": "Alias for path (e.g. 'preferences', 'MEMORY')",
+            },
+            "from": {
+                "type": "integer",
+                "description": "1-indexed start line (OpenClaw field name; for reading sections)",
+            },
+            "lines": {
+                "type": "integer",
+                "description": "Max lines to return from 'from' offset (default: all)",
+            },
         },
-        "required": ["key"],
+        "required": [],
     },
     fn=lambda **kw: _memory_get(**kw),
 )
@@ -139,10 +172,18 @@ def _get_memory_md_path() -> Path:
 # Implementations
 # ------------------------------------------------------------------
 
-async def _memory_search(query: str, limit: int = 5, mode: str = "fts") -> str:
+async def _memory_search(
+    query: str,
+    maxResults: int = 5,       # OpenClaw field name
+    limit: int = 5,             # alias
+    minScore: float = 0.0,      # OpenClaw field name
+    mode: str = "fts",
+) -> str:
     cfg = get_config()
     if not cfg.memory_enabled:
         return "Memory is disabled (MEMORY_ENABLED=false)"
+
+    effective_limit = maxResults if maxResults != 5 else limit
 
     try:
         from agent.memory_index import MemoryIndex
@@ -151,22 +192,27 @@ async def _memory_search(query: str, limit: int = 5, mode: str = "fts") -> str:
         memory_md = _get_memory_md_path()
         idx = MemoryIndex(memory_dir=memory_dir, memory_md=memory_md)
 
-        # Use semantic mode if requested and available
         use_semantic = (
             mode == "semantic"
             and getattr(cfg, "memory_semantic", False)
             and cfg.openai_api_key
         )
 
-        results = idx.search(query, limit=limit, semantic=use_semantic, api_key=cfg.openai_api_key)
+        results = idx.search(query, limit=effective_limit, semantic=use_semantic, api_key=cfg.openai_api_key)
 
         if not results:
             return f"No memory entries matched '{query}'."
 
-        mode_label = f" (mode: {results[0].source})" if results else ""
+        # Apply minScore filter if specified
+        if minScore > 0.0:
+            results = [r for r in results if getattr(r, "score", 1.0) >= minScore]
+            if not results:
+                return f"No memory entries above minScore={minScore} for '{query}'."
+
         formatted = []
         for r in results:
-            formatted.append(f"### [{r.key}]{mode_label}\n{r.snippet}")
+            score_str = f" (score={r.score:.2f})" if hasattr(r, "score") and r.score < 1.0 else ""
+            formatted.append(f"### [{r.key}]{score_str}\n{r.snippet}")
         return "\n\n---\n\n".join(formatted)
 
     except Exception as e:
@@ -174,25 +220,43 @@ async def _memory_search(query: str, limit: int = 5, mode: str = "fts") -> str:
         return f"Error searching memory: {e}"
 
 
-
-async def _memory_get(key: str) -> str:
+async def _memory_get(
+    path: str | None = None,   # OpenClaw field name
+    key: str | None = None,    # alias
+    **kwargs,                   # absorb 'from' keyword (reserved word)
+) -> str:
     cfg = get_config()
     if not cfg.memory_enabled:
         return "Memory is disabled (MEMORY_ENABLED=false)"
 
-    if key.upper() == "MEMORY":
-        path = _get_memory_md_path()
-    else:
-        path = _get_memory_dir() / f"{key}.md"
+    effective_key = path or key
+    # 'from' is a Python reserved word so it comes through kwargs
+    from_line: int | None = kwargs.get("from")
+    lines: int | None = kwargs.get("lines")
 
-    if not path.exists():
+    if not effective_key:
+        return "Error: 'path' (or 'key') is required for memory_get"
+
+    if effective_key.upper() == "MEMORY":
+        file_path = _get_memory_md_path()
+    else:
+        file_path = _get_memory_dir() / f"{effective_key}.md"
+
+    if not file_path.exists():
         available = _list_keys()
-        return f"No memory file found for key '{key}'.\nAvailable keys: {available}"
+        return f"No memory file found for key '{effective_key}'.\nAvailable keys: {available}"
 
     try:
-        return path.read_text(encoding="utf-8").strip()
+        content_lines = file_path.read_text(encoding="utf-8").splitlines()
+        start = max(0, (from_line - 1) if from_line else 0)
+        end = (start + lines) if lines else len(content_lines)
+        selected = content_lines[start:end]
+        result = "\n".join(selected).strip()
+        if from_line or lines:
+            result = f"[Lines {start+1}–{start+len(selected)} of {len(content_lines)}]\n\n{result}"
+        return result
     except Exception as e:
-        return f"Error reading memory '{key}': {e}"
+        return f"Error reading memory '{effective_key}': {e}"
 
 
 async def _memory_write(key: str, content: str, append: bool = False) -> str:

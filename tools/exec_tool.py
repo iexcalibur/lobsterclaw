@@ -1,15 +1,23 @@
 """
 Shell execution tools — mirrors OpenClaw's exec and process tools.
 
-exec    — foreground shell command with output capture
-process — background processes with full lifecycle management
-          Actions: start, list, poll, log, kill, status, write, send_keys, remove
+exec field parity with OpenClaw bash-tools.exec-runtime.ts:
+  command     — exact
+  workdir     — OpenClaw field name; also 'cwd' (alias)
+  timeout     — exact
+  yieldMs     — OpenClaw field name; also 'yield_ms' (alias)
+  env         — extra environment variables dict
+  background  — run in background without yieldMs (returns pid immediately)
+  pty         — allocate a pseudo-tty (stub: noted but not implemented on asyncio subprocess)
+  elevated    — run with elevated privileges via sudo (stub, requires EXEC_ELEVATED_ENABLED)
+  node        — target node name for remote exec (delegates to nodes_tool ssh exec)
 
-Key additions vs OpenClaw:
-  - yieldMs: background exec that fires after N ms (partial parity for yieldMs pattern)
-  - write / send_keys: send stdin to a background process
-  - log: get buffered output lines without clearing buffer
-  - remove: remove a terminated process from the registry
+process action parity with OpenClaw bash-tools.process.ts:
+  Actions: start, list, poll, log, write, send-keys/send_keys, submit, paste, kill, clear, remove
+  sessionId   — OpenClaw field; also 'pid' (alias)
+  data        — OpenClaw field name for write; also 'text' (alias)
+  keys/hex/literal/bracketed/eof — send-keys sub-params
+  offset/limit  — for log action (OpenClaw pagination)
 """
 
 from __future__ import annotations
@@ -44,30 +52,75 @@ _bg_processes: dict[int, BgProcess] = {}
 TOOL_DEFINITION = ToolDefinition(
     name="exec",
     description=(
-        "Run a shell command and return its output. "
-        "Set yield_ms>0 to run in background and get the PID back after yield_ms milliseconds "
-        "(partial output returned, process continues). "
+        "Run a shell command and return its output.\n\n"
+        "Field parity with OpenClaw bash-tools.exec-runtime.ts:\n"
+        "  command    — shell command to run\n"
+        "  workdir    — working directory (also 'cwd')\n"
+        "  timeout    — max seconds to wait (default 30)\n"
+        "  yieldMs    — background mode: yield partial output after N ms (also 'yield_ms')\n"
+        "  env        — extra environment variables dict\n"
+        "  background — run in background without yieldMs (returns PID immediately)\n"
+        "  pty        — allocate pseudo-tty (schema-present; asyncio subprocess limitation applies)\n"
+        "  elevated   — run with sudo elevation (requires EXEC_ELEVATED_ENABLED=true)\n"
+        "  node       — target node name for remote SSH exec (delegates to nodes tool)\n\n"
         "Requires EXEC_ENABLED=true in .env."
     ),
     parameters={
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "Shell command to run"},
-            "cwd": {"type": "string", "description": "Working directory (optional, default ~)"},
-            "timeout": {"type": "integer", "description": "Max seconds to wait (default 30)"},
+            "workdir": {
+                "type": "string",
+                "description": "Working directory — OpenClaw field name (also 'cwd')",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Alias for workdir",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Max seconds to wait (default 30)",
+                "default": 30,
+            },
+            "yieldMs": {
+                "type": "integer",
+                "description": "Background mode: return partial output after N ms — OpenClaw field (also 'yield_ms')",
+                "default": 0,
+            },
             "yield_ms": {
                 "type": "integer",
-                "description": (
-                    "If set, run in background. Return partial output after this many milliseconds "
-                    "and the PID. Use process poll/log to get more output later. (default 0 = foreground)"
-                ),
+                "description": "Alias for yieldMs",
                 "default": 0,
+            },
+            "env": {
+                "type": "object",
+                "description": "Extra environment variables to set for this command",
+                "additionalProperties": {"type": "string"},
+            },
+            "background": {
+                "type": "boolean",
+                "description": "Run in background and return PID immediately (no wait)",
+                "default": False,
+            },
+            "pty": {
+                "type": "boolean",
+                "description": "Allocate pseudo-TTY (schema-present; best-effort on asyncio subprocess)",
+                "default": False,
+            },
+            "elevated": {
+                "type": "boolean",
+                "description": "Run with sudo elevation (requires EXEC_ELEVATED_ENABLED=true in .env)",
+                "default": False,
+            },
+            "node": {
+                "type": "string",
+                "description": "Target node name for remote SSH exec (delegates to nodes tool)",
             },
         },
         "required": ["command"],
     },
     fn=lambda **kw: _exec(**kw),
-    owner_only=True,  # Shell execution is owner-only (blocked in sub-agents by default)
+    owner_only=True,
 )
 
 # ------------------------------------------------------------------
@@ -77,35 +130,91 @@ TOOL_DEFINITION = ToolDefinition(
 PROCESS_TOOL_DEFINITION = ToolDefinition(
     name="process",
     description=(
-        "Manage background shell processes.\n"
-        "Actions:\n"
-        "  start     — start a background process, returns pid\n"
-        "  list      — list all background processes and their status\n"
-        "  poll      — read and clear recent output lines from a process\n"
-        "  log       — read recent output without clearing (last N lines)\n"
-        "  kill      — send SIGKILL to a process by pid\n"
-        "  status    — show status of a specific process by pid\n"
-        "  write     — write text to a process's stdin\n"
-        "  send_keys — send keystrokes to a process (e.g. '\\n' for Enter)\n"
-        "  remove    — remove a terminated process from the registry"
+        "Manage background shell processes.\n\n"
+        "Field parity with OpenClaw bash-tools.process.ts:\n"
+        "  sessionId  — process identifier (also 'pid')\n"
+        "  data       — text to write to stdin (also 'text')\n"
+        "  keys       — keys string for send-keys (e.g. 'q', '\\n', 'C-c')\n"
+        "  hex        — hex-encoded bytes for send-keys\n"
+        "  literal    — send keys without interpretation\n"
+        "  bracketed  — use bracketed paste mode\n"
+        "  eof        — send EOF (Ctrl-D) to process\n"
+        "  offset     — line offset for log pagination\n"
+        "  limit      — line count for log (also 'lines')\n"
+        "  timeout    — timeout for submit action\n\n"
+        "Actions: start | list | poll | log | write | send-keys/send_keys |\n"
+        "         submit | paste | kill | clear | remove | status"
     ),
     parameters={
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "description": "Action: start | list | poll | log | kill | status | write | send_keys | remove",
+                "description": "Action: start|list|poll|log|write|send-keys|submit|paste|kill|clear|remove|status",
             },
-            "command": {"type": "string", "description": "Command to run (required for start)"},
-            "pid": {"type": "integer", "description": "Process PID (required for poll/log/kill/status/write/send_keys/remove)"},
-            "cwd": {"type": "string", "description": "Working directory (optional, for start)"},
-            "text": {"type": "string", "description": "Text to write to stdin (for write/send_keys)"},
-            "lines": {"type": "integer", "description": "Number of lines to return for log action (default 50)"},
+            "command": {"type": "string", "description": "Command to run (start action)"},
+            "sessionId": {
+                "type": "integer",
+                "description": "Process ID — OpenClaw field name (also 'pid')",
+            },
+            "pid": {
+                "type": "integer",
+                "description": "Alias for sessionId",
+            },
+            "workdir": {"type": "string", "description": "Working directory (start action; also 'cwd')"},
+            "cwd": {"type": "string", "description": "Alias for workdir"},
+            "data": {
+                "type": "string",
+                "description": "Text to write to stdin — OpenClaw field name (also 'text')",
+            },
+            "text": {"type": "string", "description": "Alias for data"},
+            # send-keys sub-params
+            "keys": {
+                "type": "string",
+                "description": "Key sequence to send (e.g. 'q', 'Enter', 'C-c')",
+            },
+            "hex": {
+                "type": "string",
+                "description": "Hex-encoded bytes to send (e.g. '0a' for newline)",
+            },
+            "literal": {
+                "type": "boolean",
+                "description": "Send keys without tmux interpretation",
+            },
+            "bracketed": {
+                "type": "boolean",
+                "description": "Use bracketed paste mode",
+            },
+            "eof": {
+                "type": "boolean",
+                "description": "Send EOF (Ctrl-D) to stdin",
+            },
+            # log pagination
+            "offset": {
+                "type": "integer",
+                "description": "Line offset for log pagination (default 0)",
+                "default": 0,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max lines to return for log (also 'lines', default 50)",
+                "default": 50,
+            },
+            "lines": {
+                "type": "integer",
+                "description": "Alias for limit",
+                "default": 50,
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout for submit action (seconds, default 10)",
+                "default": 10,
+            },
         },
         "required": ["action"],
     },
     fn=lambda **kw: _process(**kw),
-    owner_only=True,  # Process management is owner-only (blocked in sub-agents by default)
+    owner_only=True,
 )
 
 
@@ -115,16 +224,42 @@ PROCESS_TOOL_DEFINITION = ToolDefinition(
 
 async def _exec(
     command: str,
-    cwd: str | None = None,
+    workdir: str | None = None,      # OpenClaw field name
+    cwd: str | None = None,           # alias
     timeout: int = 30,
-    yield_ms: int = 0,
+    yieldMs: int = 0,                 # OpenClaw field name
+    yield_ms: int = 0,                # alias
+    env: dict | None = None,
+    background: bool = False,
+    pty: bool = False,
+    elevated: bool = False,
+    node: str | None = None,
 ) -> str:
     cfg = get_config()
     if not cfg.exec_enabled:
         return "Error: exec is disabled (set EXEC_ENABLED=true in .env)"
 
-    work_dir = os.path.expanduser(cwd or cfg.exec_working_dir or "~")
+    # Resolve aliases
+    effective_cwd = workdir or cwd or cfg.exec_working_dir or "~"
+    effective_yield_ms = yieldMs if yieldMs > 0 else yield_ms
+    work_dir = os.path.expanduser(effective_cwd)
     effective_timeout = min(timeout, cfg.exec_timeout_seconds)
+
+    # Remote node delegation
+    if node:
+        from tools.nodes_tool import _nodes
+        return await _nodes(action="exec", node=node, command=command, timeout=effective_timeout)
+
+    # Sudo elevation
+    if elevated:
+        if not getattr(cfg, "exec_elevated_enabled", False):
+            return "Error: elevated exec requires EXEC_ELEVATED_ENABLED=true in .env"
+        command = f"sudo {command}"
+
+    # Build subprocess env
+    proc_env = {**os.environ}
+    if env:
+        proc_env.update(env)
 
     proc = await asyncio.create_subprocess_shell(
         command,
@@ -132,27 +267,32 @@ async def _exec(
         stderr=asyncio.subprocess.STDOUT,
         stdin=asyncio.subprocess.PIPE,
         cwd=work_dir,
+        env=proc_env,
     )
 
-    if yield_ms > 0:
-        # Background mode: return partial output after yield_ms, register process
+    # Background (immediate): no wait at all
+    if background:
         bgp = BgProcess(pid=proc.pid, command=command, proc=proc, cwd=work_dir)
         _bg_processes[proc.pid] = bgp
         asyncio.create_task(_read_output(bgp))
+        return f"Background process started. PID: {proc.pid}"
 
-        await asyncio.sleep(yield_ms / 1000)
-
-        # Grab whatever was captured so far
+    # yieldMs: wait N ms then return partial
+    if effective_yield_ms > 0:
+        bgp = BgProcess(pid=proc.pid, command=command, proc=proc, cwd=work_dir)
+        _bg_processes[proc.pid] = bgp
+        asyncio.create_task(_read_output(bgp))
+        await asyncio.sleep(effective_yield_ms / 1000)
         partial = "\n".join(bgp.output_lines[-100:])
         bgp.output_lines.clear()
         status = "running" if proc.returncode is None else f"exited({proc.returncode})"
         return (
             f"Background process started (PID: {proc.pid}, status: {status})\n"
-            f"Partial output ({yield_ms}ms):\n{partial if partial else '(no output yet)'}\n\n"
+            f"Partial output ({effective_yield_ms}ms):\n{partial if partial else '(no output yet)'}\n\n"
             f"Use process poll/log pid={proc.pid} for more output."
         )
 
-    # Foreground mode
+    # Foreground
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout)
     except asyncio.TimeoutError:
@@ -170,13 +310,31 @@ async def _exec(
 async def _process(
     action: str,
     command: str | None = None,
-    pid: int | None = None,
-    cwd: str | None = None,
-    text: str | None = None,
+    sessionId: int | None = None,    # OpenClaw field name
+    pid: int | None = None,           # alias
+    workdir: str | None = None,       # OpenClaw field name
+    cwd: str | None = None,           # alias
+    data: str | None = None,          # OpenClaw field name
+    text: str | None = None,          # alias
+    keys: str | None = None,
+    hex: str | None = None,
+    literal: bool = False,
+    bracketed: bool = False,
+    eof: bool = False,
+    offset: int = 0,
+    limit: int = 50,
     lines: int = 50,
+    timeout: int = 10,
 ) -> str:
     cfg = get_config()
-    action = action.lower().strip()
+    # Normalise action name (OpenClaw uses send-keys with hyphen)
+    action = action.lower().strip().replace("-", "_")
+
+    # Resolve aliases
+    effective_pid = sessionId or pid
+    effective_cwd = workdir or cwd
+    effective_text = data or text
+    effective_lines = limit if limit != 50 else lines
 
     if action == "list":
         if not _bg_processes:
@@ -193,7 +351,7 @@ async def _process(
             return "Error: exec is disabled (set EXEC_ENABLED=true in .env)"
         if not command:
             return "Error: 'command' required for start"
-        work_dir = os.path.expanduser(cwd or cfg.exec_working_dir or "~")
+        work_dir = os.path.expanduser(effective_cwd or cfg.exec_working_dir or "~")
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
@@ -207,106 +365,174 @@ async def _process(
         return f"Background process started. PID: {proc.pid}"
 
     if action == "poll":
-        if pid is None:
-            return "Error: 'pid' required for poll"
-        bgp = _bg_processes.get(pid)
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for poll"
+        bgp = _bg_processes.get(effective_pid)
         if not bgp:
-            return f"No background process with PID {pid}"
+            return f"No process with PID {effective_pid}"
         output = "\n".join(bgp.output_lines[-200:])
         bgp.output_lines.clear()
         returncode = bgp.proc.returncode
         status = "running" if returncode is None else f"exited({returncode})"
-        return f"[PID {pid} — {status}]\n{output}" if output else f"[PID {pid} — {status}]\n(no new output)"
+        return f"[PID {effective_pid} — {status}]\n{output}" if output else f"[PID {effective_pid} — {status}]\n(no new output)"
 
     if action == "log":
-        if pid is None:
-            return "Error: 'pid' required for log"
-        bgp = _bg_processes.get(pid)
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for log"
+        bgp = _bg_processes.get(effective_pid)
         if not bgp:
-            return f"No background process with PID {pid}"
-        tail = bgp.output_lines[-lines:]
+            return f"No process with PID {effective_pid}"
+        all_lines = bgp.output_lines
+        page = all_lines[offset:offset + effective_lines]
         returncode = bgp.proc.returncode
         status = "running" if returncode is None else f"exited({returncode})"
-        output = "\n".join(tail)
-        return f"[PID {pid} — {status}] last {len(tail)} lines:\n{output}" if output else f"[PID {pid}] No output yet."
+        output = "\n".join(page)
+        total = len(all_lines)
+        return (
+            f"[PID {effective_pid} — {status}] lines {offset}–{offset+len(page)} of {total}:\n"
+            f"{output if output else '(no output yet)'}"
+        )
 
     if action == "kill":
         if not cfg.exec_enabled:
             return "Error: exec is disabled"
-        if pid is None:
-            return "Error: 'pid' required for kill"
-        bgp = _bg_processes.get(pid)
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for kill"
+        bgp = _bg_processes.get(effective_pid)
         if not bgp:
-            return f"No background process with PID {pid}"
+            return f"No process with PID {effective_pid}"
         try:
             bgp.proc.kill()
-            return f"Process PID {pid} killed ✅"
+            return f"Process PID {effective_pid} killed ✅"
         except Exception as e:
-            return f"Error killing PID {pid}: {e}"
+            return f"Error killing PID {effective_pid}: {e}"
 
     if action == "status":
-        if pid is None:
-            return "Error: 'pid' required for status"
-        bgp = _bg_processes.get(pid)
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for status"
+        bgp = _bg_processes.get(effective_pid)
         if not bgp:
-            return f"No background process with PID {pid}"
+            return f"No process with PID {effective_pid}"
         returncode = bgp.proc.returncode
         status = "running" if returncode is None else f"exited({returncode})"
         return (
-            f"PID {pid} [{status}]\n"
+            f"PID {effective_pid} [{status}]\n"
             f"Command: {bgp.command}\n"
             f"CWD: {bgp.cwd}\n"
-            f"Buffered output lines: {len(bgp.output_lines)}"
+            f"Buffered lines: {len(bgp.output_lines)}"
         )
 
     if action == "write":
-        if pid is None:
-            return "Error: 'pid' required for write"
-        if text is None:
-            return "Error: 'text' required for write"
-        bgp = _bg_processes.get(pid)
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for write"
+        if effective_text is None:
+            return "Error: 'data' (or 'text') required for write"
+        bgp = _bg_processes.get(effective_pid)
         if not bgp:
-            return f"No background process with PID {pid}"
+            return f"No process with PID {effective_pid}"
         if bgp.proc.stdin is None or bgp.proc.returncode is not None:
-            return f"Process PID {pid} is not running or has no stdin"
+            return f"Process PID {effective_pid} is not running or has no stdin"
         try:
-            bgp.proc.stdin.write(text.encode())
+            bgp.proc.stdin.write(effective_text.encode())
             await bgp.proc.stdin.drain()
-            return f"Wrote {len(text)} bytes to PID {pid} stdin"
+            return f"Wrote {len(effective_text)} bytes to PID {effective_pid} stdin"
         except Exception as e:
             return f"Write error: {e}"
 
     if action == "send_keys":
-        if pid is None:
-            return "Error: 'pid' required for send_keys"
-        if text is None:
-            return "Error: 'text' required for send_keys (e.g. '\\n' for Enter, 'q' to quit)"
-        bgp = _bg_processes.get(pid)
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for send_keys"
+        bgp = _bg_processes.get(effective_pid)
         if not bgp:
-            return f"No background process with PID {pid}"
+            return f"No process with PID {effective_pid}"
         if bgp.proc.stdin is None or bgp.proc.returncode is not None:
-            return f"Process PID {pid} is not running or has no stdin"
+            return f"Process PID {effective_pid} is not running or has no stdin"
         try:
-            # Expand common escape sequences
-            text_decoded = text.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
-            bgp.proc.stdin.write(text_decoded.encode())
+            # Resolve key source: hex > keys > data/text
+            if hex:
+                import binascii
+                payload = binascii.unhexlify(hex)
+            elif eof:
+                payload = b"\x04"  # Ctrl-D
+            else:
+                raw = keys or effective_text or ""
+                if not literal:
+                    raw = (raw.replace("\\n", "\n").replace("\\r", "\r")
+                              .replace("\\t", "\t").replace("C-c", "\x03")
+                              .replace("Enter", "\n"))
+                payload = raw.encode()
+            bgp.proc.stdin.write(payload)
             await bgp.proc.stdin.drain()
-            return f"Sent keys to PID {pid} ✅"
+            return f"Sent keys to PID {effective_pid} ✅ ({len(payload)} bytes)"
         except Exception as e:
             return f"send_keys error: {e}"
 
-    if action == "remove":
-        if pid is None:
-            return "Error: 'pid' required for remove"
-        bgp = _bg_processes.get(pid)
+    if action == "submit":
+        # submit = write text + newline + wait for output
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for submit"
+        if effective_text is None:
+            return "Error: 'data' (or 'text') required for submit"
+        bgp = _bg_processes.get(effective_pid)
         if not bgp:
-            return f"No background process with PID {pid}"
-        if bgp.proc.returncode is None:
-            return f"Process PID {pid} is still running. Kill it first."
-        _bg_processes.pop(pid, None)
-        return f"Process PID {pid} removed from registry ✅"
+            return f"No process with PID {effective_pid}"
+        if bgp.proc.stdin is None or bgp.proc.returncode is not None:
+            return f"Process PID {effective_pid} is not running"
+        try:
+            bgp.proc.stdin.write((effective_text + "\n").encode())
+            await bgp.proc.stdin.drain()
+            await asyncio.sleep(min(timeout, 5))
+            output = "\n".join(bgp.output_lines[-50:])
+            bgp.output_lines.clear()
+            return f"Submitted to PID {effective_pid}. Response:\n{output if output else '(no output yet)'}"
+        except Exception as e:
+            return f"submit error: {e}"
 
-    return f"Unknown action '{action}'. Use: start, list, poll, log, kill, status, write, send_keys, remove"
+    if action == "paste":
+        # paste = bracketed paste mode write
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for paste"
+        if effective_text is None:
+            return "Error: 'data' (or 'text') required for paste"
+        bgp = _bg_processes.get(effective_pid)
+        if not bgp:
+            return f"No process with PID {effective_pid}"
+        if bgp.proc.stdin is None or bgp.proc.returncode is not None:
+            return f"Process PID {effective_pid} is not running"
+        try:
+            # Bracketed paste: ESC[200~ text ESC[201~
+            payload = b"\x1b[200~" + effective_text.encode() + b"\x1b[201~"
+            bgp.proc.stdin.write(payload)
+            await bgp.proc.stdin.drain()
+            return f"Pasted {len(effective_text)} chars to PID {effective_pid} ✅"
+        except Exception as e:
+            return f"paste error: {e}"
+
+    if action == "clear":
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for clear"
+        bgp = _bg_processes.get(effective_pid)
+        if not bgp:
+            return f"No process with PID {effective_pid}"
+        cleared = len(bgp.output_lines)
+        bgp.output_lines.clear()
+        return f"Cleared {cleared} buffered lines from PID {effective_pid} ✅"
+
+    if action == "remove":
+        if effective_pid is None:
+            return "Error: 'sessionId' (or 'pid') required for remove"
+        bgp = _bg_processes.get(effective_pid)
+        if not bgp:
+            return f"No process with PID {effective_pid}"
+        if bgp.proc.returncode is None:
+            return f"Process PID {effective_pid} is still running. Kill it first."
+        _bg_processes.pop(effective_pid, None)
+        return f"Process PID {effective_pid} removed ✅"
+
+    return (
+        f"Unknown action '{action}'. Use: "
+        "start, list, poll, log, write, send-keys, submit, paste, kill, clear, remove, status"
+    )
 
 
 async def _read_output(bgp: BgProcess) -> None:

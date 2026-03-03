@@ -27,29 +27,44 @@ TOOL_DEFINITION = ToolDefinition(
     name="web_fetch",
     description=(
         "Fetch a URL and return its text content, cleaned of navigation/ads.\n\n"
-        "Options:\n"
-        "  render_js — render JavaScript before reading (requires BROWSER_ENABLED=true)\n"
-        "  selector  — CSS selector to extract specific element text\n"
-        "  headers   — extra HTTP headers as key/value object\n"
-        "  timeout   — request timeout in seconds (default 20)\n"
-        "  max_chars — max characters to return (default 50000)"
+        "Field parity with OpenClaw web-fetch.ts:\n"
+        "  url         — required\n"
+        "  extractMode — 'auto' (default) | 'readability' | 'selector' | 'raw' | 'js'\n"
+        "                'js' enables Playwright rendering (also: render_js=true)\n"
+        "  maxChars    — max characters to return (also 'max_chars', default 50000)\n"
+        "  selector    — CSS selector (used when extractMode='selector')\n"
+        "  headers     — extra HTTP headers\n"
+        "  timeout     — request timeout in seconds (default 20)\n"
+        "  render_js   — alias for extractMode='js'"
     ),
     parameters={
         "type": "object",
         "properties": {
             "url": {"type": "string", "description": "URL to fetch"},
+            "extractMode": {
+                "type": "string",
+                "description": (
+                    "Extraction mode (OpenClaw field name):\n"
+                    "  auto        — readability first, raw fallback (default)\n"
+                    "  readability — article text extraction\n"
+                    "  selector    — CSS selector extraction (requires 'selector' param)\n"
+                    "  raw         — raw HTML/text, no processing\n"
+                    "  js          — render JavaScript first (requires BROWSER_ENABLED=true)"
+                ),
+                "default": "auto",
+            },
             "render_js": {
                 "type": "boolean",
-                "description": "Render JavaScript before reading page (requires BROWSER_ENABLED=true)",
+                "description": "Alias for extractMode='js': render JavaScript before reading",
                 "default": False,
             },
             "selector": {
                 "type": "string",
-                "description": "CSS selector to extract a specific element (optional)",
+                "description": "CSS selector to extract a specific element",
             },
             "headers": {
                 "type": "object",
-                "description": "Extra HTTP headers to send (e.g. Authorization, User-Agent)",
+                "description": "Extra HTTP headers (e.g. Authorization, User-Agent)",
                 "additionalProperties": {"type": "string"},
             },
             "timeout": {
@@ -57,9 +72,14 @@ TOOL_DEFINITION = ToolDefinition(
                 "description": "Request timeout in seconds (default 20)",
                 "default": 20,
             },
+            "maxChars": {
+                "type": "integer",
+                "description": "Max characters to return — OpenClaw field name (also 'max_chars', default 50000)",
+                "default": 50000,
+            },
             "max_chars": {
                 "type": "integer",
-                "description": "Max characters to return (default 50000)",
+                "description": "Alias for maxChars",
                 "default": 50000,
             },
         },
@@ -71,20 +91,35 @@ TOOL_DEFINITION = ToolDefinition(
 
 async def _web_fetch(
     url: str,
-    render_js: bool = False,
+    extractMode: str = "auto",      # OpenClaw field name
+    render_js: bool = False,         # alias for extractMode="js"
     selector: str | None = None,
     headers: dict | None = None,
     timeout: int = 20,
-    max_chars: int = 50000,
+    maxChars: int = 50000,           # OpenClaw field name
+    max_chars: int = 50000,          # alias
 ) -> str:
+    # Resolve aliases
+    effective_max_chars = maxChars if maxChars != 50000 else max_chars
+    # extractMode="js" or render_js=true both mean JS rendering
+    if render_js and extractMode == "auto":
+        extractMode = "js"
+    # selector mode: if selector provided and extractMode is still auto, use selector mode
+    if selector and extractMode == "auto":
+        extractMode = "selector"
+    # Map extractMode to internal flags
+    render_js = (extractMode == "js")
     cfg = get_config()
+
+    if extractMode == "raw":
+        return await _fetch_raw(url, headers=headers, timeout=timeout, max_chars=effective_max_chars)
 
     if render_js:
         if not cfg.browser_enabled:
-            return "Error: render_js=true requires BROWSER_ENABLED=true in .env"
-        return await _fetch_rendered(url, selector=selector, timeout=timeout, max_chars=max_chars)
+            return "Error: extractMode='js' requires BROWSER_ENABLED=true in .env"
+        return await _fetch_rendered(url, selector=selector, timeout=timeout, max_chars=effective_max_chars)
 
-    return await _fetch_static(url, selector=selector, headers=headers, timeout=timeout, max_chars=max_chars)
+    return await _fetch_static(url, selector=selector, headers=headers, timeout=timeout, max_chars=effective_max_chars)
 
 
 async def _fetch_static(
@@ -215,3 +250,20 @@ def _extract_text(
         return text[:max_chars]
     except Exception as e:
         return f"Error extracting text: {e}"
+
+
+async def _fetch_raw(
+    url: str,
+    headers: dict | None = None,
+    timeout: int = 20,
+    max_chars: int = 50000,
+) -> str:
+    """Fetch raw HTML/text without any processing (extractMode='raw')."""
+    extra_headers = {"User-Agent": "Mozilla/5.0", **(headers or {})}
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=extra_headers) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.text[:max_chars]
+    except Exception as e:
+        return f"Error fetching {url}: {e}"

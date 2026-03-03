@@ -26,29 +26,37 @@ from tools.registry import ToolDefinition
 
 READ_TOOL = ToolDefinition(
     name="read",
-    description="Read the contents of a file with optional line offset and limit.",
+    description=(
+        "Read file contents with optional line offset and limit.\n"
+        "Field parity: 'path' and 'file_path' are both accepted."
+    ),
     parameters={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Absolute or ~ path to the file"},
+            "file_path": {"type": "string", "description": "Alias for path (OpenClaw field name)"},
             "offset": {"type": "integer", "description": "1-indexed line to start from (optional)"},
             "limit": {"type": "integer", "description": "Max lines to read (optional)"},
         },
-        "required": ["path"],
+        "required": [],
     },
     fn=lambda **kw: _read(**kw),
 )
 
 WRITE_TOOL = ToolDefinition(
     name="write",
-    description="Create or overwrite a file with the given content.",
+    description=(
+        "Create or overwrite a file with the given content.\n"
+        "Field parity: 'path'/'file_path' both accepted."
+    ),
     parameters={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Absolute or ~ path to the file"},
+            "file_path": {"type": "string", "description": "Alias for path"},
             "content": {"type": "string", "description": "File content to write"},
         },
-        "required": ["path", "content"],
+        "required": ["content"],
     },
     fn=lambda **kw: _write(**kw),
 )
@@ -56,17 +64,24 @@ WRITE_TOOL = ToolDefinition(
 EDIT_TOOL = ToolDefinition(
     name="edit",
     description=(
-        "Replace an exact string in a file with new text. "
-        "The old_string must appear exactly once — make it unique enough."
+        "Replace an exact string in a file with new text.\n"
+        "The old_string must appear exactly once.\n\n"
+        "Field parity:\n"
+        "  path / file_path\n"
+        "  old_string / oldText  (OpenClaw alias)\n"
+        "  new_string / newText  (OpenClaw alias)"
     ),
     parameters={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Absolute or ~ path to the file"},
+            "file_path": {"type": "string", "description": "Alias for path"},
             "old_string": {"type": "string", "description": "Exact text to find and replace"},
+            "oldText": {"type": "string", "description": "Alias for old_string (OpenClaw field name)"},
             "new_string": {"type": "string", "description": "Replacement text"},
+            "newText": {"type": "string", "description": "Alias for new_string (OpenClaw field name)"},
         },
-        "required": ["path", "old_string", "new_string"],
+        "required": [],
     },
     fn=lambda **kw: _edit(**kw),
 )
@@ -74,8 +89,8 @@ EDIT_TOOL = ToolDefinition(
 APPLY_PATCH_TOOL = ToolDefinition(
     name="apply_patch",
     description=(
-        "Apply a patch to files. Two formats are supported:\n\n"
-        "1. OpenAI patch format (preferred — no external tools needed):\n"
+        "Apply a patch to files. Two formats supported:\n\n"
+        "1. OpenAI patch format (preferred, no external tools) — OpenClaw 'input' field:\n"
         "   *** Begin Patch\n"
         "   *** Update File: path/to/file.py\n"
         "   @@ -old_line_context\n"
@@ -87,17 +102,21 @@ APPLY_PATCH_TOOL = ToolDefinition(
         "   --- a/path/to/file\n"
         "   +++ b/path/to/file\n"
         "   @@ ... @@\n\n"
-        "Auto-detects format from content."
+        "Field parity: 'input' (OpenClaw field name) and 'patch' are both accepted."
     ),
     parameters={
         "type": "object",
         "properties": {
+            "input": {
+                "type": "string",
+                "description": "Patch content — OpenClaw field name (also 'patch')",
+            },
             "patch": {
                 "type": "string",
-                "description": "Patch content in OpenAI format (*** Begin Patch) or unified diff format",
+                "description": "Alias for input",
             },
         },
-        "required": ["patch"],
+        "required": [],
     },
     fn=lambda **kw: _apply_patch(**kw),
 )
@@ -162,12 +181,20 @@ MOVE_TOOL = ToolDefinition(
 # Implementations
 # ------------------------------------------------------------------
 
-async def _read(path: str, offset: int | None = None, limit: int | None = None) -> str:
-    p = Path(path).expanduser()
+async def _read(
+    path: str | None = None,
+    file_path: str | None = None,     # OpenClaw alias
+    offset: int | None = None,
+    limit: int | None = None,
+) -> str:
+    effective_path = path or file_path
+    if not effective_path:
+        return "Error: 'path' (or 'file_path') is required"
+    p = Path(effective_path).expanduser()
     if not p.exists():
-        return f"Error: file not found: {path}"
+        return f"Error: file not found: {effective_path}"
     if p.is_dir():
-        return f"Error: {path} is a directory — use list_dir instead"
+        return f"Error: {effective_path} is a directory — use list_dir instead"
     try:
         lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
         start = max(0, (offset - 1) if offset else 0)
@@ -179,37 +206,66 @@ async def _read(path: str, offset: int | None = None, limit: int | None = None) 
         return f"Error reading file: {e}"
 
 
-async def _write(path: str, content: str) -> str:
-    p = Path(path).expanduser()
+async def _write(
+    path: str | None = None,
+    content: str = "",
+    file_path: str | None = None,     # OpenClaw alias (positional compatibility preserved)
+) -> str:
+    effective_path = path or file_path
+    if not effective_path:
+        return "Error: 'path' (or 'file_path') is required"
+    p = Path(effective_path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
-    return f"Written {len(content)} bytes to {path}"
+    return f"Written {len(content)} bytes to {effective_path}"
 
 
-async def _edit(path: str, old_string: str, new_string: str) -> str:
-    p = Path(path).expanduser()
+async def _edit(
+    path: str | None = None,
+    old_string: str | None = None,
+    new_string: str | None = None,
+    file_path: str | None = None,     # OpenClaw alias (positional compat: path,old,new preserved)
+    oldText: str | None = None,       # OpenClaw alias
+    newText: str | None = None,       # OpenClaw alias
+) -> str:
+    effective_path = path or file_path
+    effective_old = old_string or oldText
+    effective_new = new_string or newText
+    if not effective_path:
+        return "Error: 'path' (or 'file_path') is required"
+    if effective_old is None:
+        return "Error: 'old_string' (or 'oldText') is required"
+    if effective_new is None:
+        return "Error: 'new_string' (or 'newText') is required"
+    p = Path(effective_path).expanduser()
     if not p.exists():
-        return f"Error: file not found: {path}"
+        return f"Error: file not found: {effective_path}"
     text = p.read_text(encoding="utf-8")
-    if old_string not in text:
-        return f"Error: old_string not found in {path}"
-    count = text.count(old_string)
+    if effective_old not in text:
+        return f"Error: old_string not found in {effective_path}"
+    count = text.count(effective_old)
     if count > 1:
-        return f"Error: old_string appears {count} times — make it more specific to uniquely identify the location"
-    p.write_text(text.replace(old_string, new_string, 1), encoding="utf-8")
-    return f"Edited {path} successfully"
+        return f"Error: old_string appears {count} times — make it more specific"
+    p.write_text(text.replace(effective_old, effective_new, 1), encoding="utf-8")
+    return f"Edited {effective_path} successfully"
 
 
-async def _apply_patch(patch: str) -> str:
+async def _apply_patch(
+    input: str | None = None,    # OpenClaw field name (apply-patch.ts uses 'input')
+    patch: str | None = None,    # alias
+) -> str:
     """
     Apply a patch. Auto-detects format:
       - OpenAI patch format: starts with '*** Begin Patch'
       - Unified diff: contains '--- ' / '+++ ' headers
     """
-    patch = patch.strip()
-    if patch.startswith("*** Begin Patch"):
-        return _apply_openai_patch(patch)
-    return await _apply_unified_patch(patch)
+    effective_patch = input or patch
+    if not effective_patch:
+        return "Error: 'input' (or 'patch') is required"
+    effective_patch = effective_patch.strip()
+    if effective_patch.startswith("*** Begin Patch"):
+        return _apply_openai_patch(effective_patch)
+    return await _apply_unified_patch(effective_patch)
 
 
 def _apply_openai_patch(patch: str) -> str:
