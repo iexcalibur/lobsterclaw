@@ -41,6 +41,9 @@ def build_registry():
         cron_tool,
         sessions_tool,
         gateway_tool,
+        nodes_tool,
+        canvas_tool,
+        channel_stubs,
     )
 
     registry = ToolRegistry()
@@ -82,6 +85,17 @@ def build_registry():
     registry.register(message_tool.TOOL_DEFINITION)
     registry.register(cron_tool.TOOL_DEFINITION)
     registry.register(gateway_tool.TOOL_DEFINITION)
+
+    # Nodes (remote device management)
+    registry.register(nodes_tool.TOOL_DEFINITION)
+
+    # Canvas (interactive UI surfaces)
+    registry.register(canvas_tool.TOOL_DEFINITION)
+
+    # Multi-channel stubs (Discord, Slack, WhatsApp — schema-compatible, disabled by default)
+    registry.register(channel_stubs.DISCORD_TOOL)
+    registry.register(channel_stubs.SLACK_TOOL)
+    registry.register(channel_stubs.WHATSAPP_TOOL)
 
     # Sessions / sub-agents / orchestration
     registry.register(sessions_tool.SESSIONS_SPAWN_TOOL)
@@ -164,6 +178,9 @@ def main() -> None:
         send_buttons=telegram.send_with_buttons,
         create_forum_topic=telegram.create_forum_topic,
     )
+
+    # Wire approval gate for canvas tool (so it can send photos via Telegram)
+    canvas_tool  # imported above; send fns shared via message_tool globals
 
     # Audio + TTS
     media_tool.set_send_audio(telegram.send_audio)

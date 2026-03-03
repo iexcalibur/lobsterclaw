@@ -284,7 +284,7 @@ class CronManager:
             except Exception:
                 pass
             next_run = ""
-            if sched_job and sched_job.next_run_time:
+            if sched_job and getattr(sched_job, "next_run_time", None):
                 next_run = f"\n   Next run: {str(sched_job.next_run_time)[:19]}"
             target_str = ""
             if session_target != "main" or delivery != "agent":

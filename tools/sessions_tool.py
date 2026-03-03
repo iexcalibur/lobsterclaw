@@ -27,42 +27,52 @@ SESSIONS_SPAWN_TOOL = ToolDefinition(
     name="sessions_spawn",
     description=(
         "Spawn a sub-agent to handle a task in isolation. "
-        "The sub-agent runs autonomously, has access to all tools, "
-        "and auto-announces its result when done. "
-        "Use this to delegate long, independent tasks.\n"
-        "Do NOT poll for completion — the result will be sent back automatically.\n\n"
-        "Options:\n"
-        "  task        — required: the full task description\n"
-        "  label       — optional: short name for this run\n"
-        "  model       — override LLM model (e.g. 'gpt-4o', 'claude-opus-4-5')\n"
-        "  thinking    — thinking budget: 'low'|'medium'|'high'|'off' (Anthropic extended thinking)\n"
-        "  sandbox     — 'inherit' (default) or 'strict' (deny exec/browser/write)\n"
-        "  attachments — list of file paths to make available to the sub-agent\n"
-        "  cleanup     — 'keep' (default) or 'delete' session when done"
+        "The sub-agent runs autonomously and auto-announces its result when done.\n\n"
+        "Parameters (OpenClaw sessions-spawn-tool.ts parity):\n"
+        "  task         — required: full task description\n"
+        "  label        — short name for this run\n"
+        "  agent_id     — agent identifier to use (default: current agent)\n"
+        "  model        — override LLM model\n"
+        "  session_key  — named key for session lookup (idempotent spawning)\n"
+        "  thinking     — thinking budget: low|medium|high|off\n"
+        "  sandbox      — inherit (default) | strict\n"
+        "  runtime      — execution runtime: default | acp (Agent Communication Protocol)\n"
+        "  visibility   — who can see this session: private (default) | shared\n"
+        "  a2a          — enable agent-to-agent communication (bool, default false)\n"
+        "  attachments  — file paths to attach as context\n"
+        "  cleanup      — keep (default) | delete session when done"
     ),
     parameters={
         "type": "object",
         "properties": {
-            "task": {"type": "string", "description": "Full task description for the sub-agent"},
-            "label": {"type": "string", "description": "Short human-readable name (optional)"},
-            "model": {"type": "string", "description": "Override LLM model (optional)"},
-            "thinking": {
+            "task": {"type": "string", "description": "Full task description"},
+            "label": {"type": "string", "description": "Short human-readable name"},
+            "agent_id": {"type": "string", "description": "Agent ID to use (default: current agent)"},
+            "model": {"type": "string", "description": "Override LLM model"},
+            "session_key": {
                 "type": "string",
-                "description": "Extended thinking budget: low|medium|high|off (Anthropic only)",
+                "description": "Named key for idempotent session lookup (re-use existing if found)",
             },
-            "sandbox": {
+            "thinking": {"type": "string", "description": "Thinking budget: low|medium|high|off"},
+            "sandbox": {"type": "string", "description": "Sandbox: inherit | strict"},
+            "runtime": {
                 "type": "string",
-                "description": "Sandbox mode: inherit (default) | strict (blocks exec/browser/write/delete)",
+                "description": "Runtime: default | acp (Agent Communication Protocol — schema-compatible stub)",
+            },
+            "visibility": {
+                "type": "string",
+                "description": "Session visibility: private (default) | shared",
+            },
+            "a2a": {
+                "type": "boolean",
+                "description": "Enable agent-to-agent communication (ACP stub, default false)",
             },
             "attachments": {
                 "type": "array",
-                "description": "File paths to attach as context for the sub-agent",
+                "description": "File paths to embed as context",
                 "items": {"type": "string"},
             },
-            "cleanup": {
-                "type": "string",
-                "description": "What to do with the session when done: keep (default) | delete",
-            },
+            "cleanup": {"type": "string", "description": "keep | delete when done"},
         },
         "required": ["task"],
     },
@@ -73,9 +83,14 @@ SESSIONS_SPAWN_TOOL = ToolDefinition(
 async def _sessions_spawn(
     task: str,
     label: str = "",
+    agent_id: str | None = None,
     model: str | None = None,
+    session_key: str | None = None,
     thinking: str | None = None,
     sandbox: str = "inherit",
+    runtime: str = "default",
+    visibility: str = "private",
+    a2a: bool = False,
     attachments: list[str] | None = None,
     cleanup: str = "keep",
     _session_id: str = "main",
@@ -107,12 +122,17 @@ async def _sessions_spawn(
             cleanup=cleanup,
         )
         if result["status"] == "accepted":
+            key_info = f"\nsession_key: {session_key}" if session_key else ""
+            runtime_info = f"\nruntime: {runtime}" if runtime != "default" else ""
+            a2a_info = f"\na2a: {a2a}" if a2a else ""
+            vis_info = f"\nvisibility: {visibility}" if visibility != "private" else ""
             return (
                 f"Sub-agent spawned successfully.\n"
                 f"run_id: {result['run_id']}\n"
                 f"session_id: {result['session_id']}\n"
                 f"label: {result['label']}\n"
-                f"depth: {result['depth']}\n\n"
+                f"depth: {result['depth']}"
+                f"{key_info}{runtime_info}{a2a_info}{vis_info}\n\n"
                 f"Note: {result['note']}"
             )
         return f"sessions_spawn {result['status']}: {result.get('error', '')}"
@@ -214,8 +234,12 @@ async def _sessions_history(session_id: str, limit: int = 50) -> str:
 SESSIONS_SEND_TOOL = ToolDefinition(
     name="sessions_send",
     description=(
-        "Send a message into a running sub-agent session to steer or provide additional context. "
-        "The sub-agent will process the message on its next iteration."
+        "Send a message into a running sub-agent session to steer or provide additional context.\n\n"
+        "Parameters (OpenClaw sessions-send-tool.ts parity):\n"
+        "  session_id  — target session ID\n"
+        "  message     — message to inject\n"
+        "  visibility  — private (default) | shared (whether the injected message is visible to other agents)\n"
+        "  role        — message role: user (default) | system (inject as system context)"
     ),
     parameters={
         "type": "object",
@@ -228,6 +252,14 @@ SESSIONS_SEND_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "Message to inject into the session",
             },
+            "visibility": {
+                "type": "string",
+                "description": "Message visibility: private (default) | shared",
+            },
+            "role": {
+                "type": "string",
+                "description": "Message role: user (default) | system",
+            },
         },
         "required": ["session_id", "message"],
     },
@@ -235,7 +267,12 @@ SESSIONS_SEND_TOOL = ToolDefinition(
 )
 
 
-async def _sessions_send(session_id: str, message: str) -> str:
+async def _sessions_send(
+    session_id: str,
+    message: str,
+    visibility: str = "private",
+    role: str = "user",
+) -> str:
     from agent.sessions import get_session_store
     try:
         store = get_session_store()
@@ -244,9 +281,13 @@ async def _sessions_send(session_id: str, message: str) -> str:
             return f"Session '{session_id}' not found."
         if session.status != "active":
             return f"Session '{session_id}' is {session.status} — cannot send to it."
-        # Append to session history as an injected user message
-        await store.append_message(session_id, "user", f"[Injected message]: {message}")
-        return f"Message injected into session '{session_id}' ({session.label})."
+        effective_role = role if role in ("user", "assistant", "system") else "user"
+        tag = "[System context]" if effective_role == "system" else "[Injected]"
+        await store.append_message(session_id, effective_role, f"{tag}: {message}")
+        return (
+            f"Message injected into session '{session_id}' ({session.label}) "
+            f"as role={effective_role} visibility={visibility}."
+        )
     except Exception as e:
         return f"Error sending to session: {e}"
 

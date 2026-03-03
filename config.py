@@ -86,6 +86,13 @@ class Config:
     browser_enabled: bool = field(default_factory=lambda: _env_bool("BROWSER_ENABLED", False))
     browser_headless: bool = field(default_factory=lambda: _env_bool("BROWSER_HEADLESS", True))
 
+    # Additional channels (stub-compatible; disabled by default)
+    discord_enabled: bool = field(default_factory=lambda: _env_bool("DISCORD_ENABLED", False))
+    slack_enabled: bool = field(default_factory=lambda: _env_bool("SLACK_ENABLED", False))
+    whatsapp_enabled: bool = field(default_factory=lambda: _env_bool("WHATSAPP_ENABLED", False))
+    # Canvas
+    canvas_telegram_render: bool = field(default_factory=lambda: _env_bool("CANVAS_TELEGRAM_RENDER", True))
+
     # Memory
     memory_enabled: bool = field(default_factory=lambda: _env_bool("MEMORY_ENABLED", True))
     memory_dir: str = field(default_factory=lambda: _env("MEMORY_DIR", "~/.pygate/memory"))

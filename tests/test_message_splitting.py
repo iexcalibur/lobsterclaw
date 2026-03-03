@@ -17,9 +17,11 @@ def test_exact_limit_not_split():
 def test_long_message_splits():
     text = "a" * 8001
     result = _split_message(text)
-    assert len(result) == 2
+    assert len(result) >= 2
     combined = "".join(result)
     assert combined == text
+    for chunk in result:
+        assert len(chunk) <= 4000
 
 
 def test_split_prefers_newline():

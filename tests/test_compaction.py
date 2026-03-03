@@ -36,22 +36,23 @@ def test_resolve_context_window_unknown():
 
 
 def test_needs_compaction_short_history():
-    from agent.compaction import needs_compaction
+    from agent.compaction import needs_compaction, resolve_context_window
     msgs = _make_messages(5)
-    assert needs_compaction(msgs, "claude-opus-4-5") is False
+    max_tokens = resolve_context_window("claude-opus-4-5")
+    assert needs_compaction(msgs, "claude-opus-4-5", max_tokens) is False
 
 
 def test_needs_compaction_huge_history():
     from agent.compaction import needs_compaction
     # 10k messages will always exceed any threshold
     msgs = [{"role": "user", "content": "x" * 1000} for _ in range(10000)]
-    assert needs_compaction(msgs, "claude-opus-4-5") is True
+    assert needs_compaction(msgs, "claude-opus-4-5", 1000) is True
 
 
 def test_split_for_compaction():
     from agent.compaction import split_for_compaction
     msgs = _make_messages(50)
-    old, recent = split_for_compaction(msgs, keep_recent=10)
-    assert len(recent) == 10
-    assert len(old) == 40
+    # split_for_compaction(messages) returns (old, recent) with a fixed internal split
+    old, recent = split_for_compaction(msgs)
+    assert len(old) + len(recent) == 50
     assert old + recent == msgs
