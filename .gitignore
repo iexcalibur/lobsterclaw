@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.py[cod]
+*.pyc
+.DS_Store
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+*.mp3
+*.wav
+~/.pygate/
