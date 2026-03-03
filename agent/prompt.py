@@ -2,19 +2,24 @@
 System prompt builder — mirrors OpenClaw's buildAgentSystemPrompt.
 
 Sections (in order, same as OpenClaw's full-mode prompt):
-  ## Tooling           — tool names + one-line summaries, ordered by importance
-  ## Tool Call Style   — when to narrate, when to just call the tool
-  ## Safety            — AI safety constraints
-  ## Skills            — loaded from workspace/skills/
-  ## Memory            — memory search guidance + citations mode
-  ## Self-Update       — gateway restart/update guidance (if gateway tool present)
-  ## Workspace         — working directory, workspace notes
-  ## Project Context   — workspace MD files (SOUL, USER, MEMORY, IDENTITY, TOOLS, …)
-  ## Silent Replies    — NO_REPLY token
-  ## Heartbeats        — HEARTBEAT_OK ack contract
-  ## Messaging         — Telegram routing / message tool guidance
-  ## Reactions         — reaction guidance (minimal/extensive)
-  ## Runtime           — OS/Python/model/channel/agent_id metadata
+  ## Tooling              — tool names + one-line summaries, ordered by importance
+  ## Tool Call Style      — when to narrate, when to just call the tool
+  ## Safety               — AI safety constraints
+  ## Skills               — loaded from workspace/skills/
+  ## Memory               — memory search guidance + citations mode
+  ## Self-Update          — gateway restart/update guidance (if gateway tool present)
+  ## Workspace            — working directory, workspace notes
+  ## Project Context      — workspace MD files (SOUL, USER, MEMORY, IDENTITY, TOOLS, …)
+  ## Silent Replies       — NO_REPLY token
+  ## Heartbeats           — HEARTBEAT_OK ack contract
+  ## Reply Tags           — [[reply_to_current]] / [[reply_to:<id>]] threading hints
+  ## Reasoning Format     — <think>…</think>/<final>…</final> (reasoning models only)
+  ## Voice (TTS)          — how to request a TTS reply (if tts in tools)
+  ## Model Aliases        — short name → full model id table (for sessions_spawn)
+  ## Authorized Senders   — owner identity + multi-user note
+  ## Messaging            — Telegram routing / message tool guidance
+  ## Reactions            — reaction guidance (minimal/extensive)
+  ## Runtime              — OS/Python/model/channel/agent_id metadata
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import hashlib
 import logging
 import os
 import platform
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +38,14 @@ if TYPE_CHECKING:
     from config import Config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------
+# Reasoning-model name patterns (trigger ## Reasoning Format)
+# ---------------------------------------------------------------
+_REASONING_MODEL_RE = re.compile(
+    r"(?i)(deepseek[-_]r\d|o1|o3|o4|gemini[-_].*thinking|claude.*3-7|"
+    r"qwq|skywork-o|step[-_]r)"
+)
 
 # ---------------------------------------------------------------
 # Tool summaries — matches OpenClaw's coreToolSummaries dict
@@ -132,13 +146,25 @@ def build_system_prompt(
     agent_id = rt.get("agent_id") or getattr(cfg, "agent_id", "")
     repo_root = rt.get("repo_root", "")
 
-    # Tool sections
-    tool_lines = _build_tool_lines(tool_names or [])
-    has_gateway = bool(tool_names and "gateway" in [t.lower() for t in tool_names])
-    has_sessions_spawn = bool(tool_names and "sessions_spawn" in [t.lower() for t in tool_names])
-    has_memory_tools = bool(tool_names and any(
-        t.lower().startswith("memory") for t in tool_names
-    ))
+    # Tool feature flags
+    tool_names_lower = [t.lower() for t in (tool_names or [])]
+    has_gateway = "gateway" in tool_names_lower
+    has_sessions_spawn = "sessions_spawn" in tool_names_lower
+    has_memory_tools = any(t.startswith("memory") for t in tool_names_lower)
+    has_tts = "tts" in tool_names_lower
+
+    # Reasoning mode
+    reasoning_mode = getattr(cfg, "reasoning_mode", "auto")
+    effective_model = cfg.llm_model
+    if reasoning_mode == "auto":
+        include_reasoning = bool(_REASONING_MODEL_RE.search(effective_model))
+    elif reasoning_mode == "on":
+        include_reasoning = True
+    else:
+        include_reasoning = False
+
+    # Model aliases
+    model_aliases: dict[str, str] = getattr(cfg, "model_aliases", {})
 
     # Workspace MD files
     workspace_context = load_workspace_context(
@@ -152,7 +178,7 @@ def build_system_prompt(
     # Timestamps
     now = datetime.now()
     now_str = now.strftime("%A, %B %d, %Y %I:%M %p")
-    tz = _get_tz()
+    tz = _get_tz(cfg)
 
     # Owner identity (hashed for display)
     owner_line = _build_owner_line(cfg)
@@ -167,6 +193,7 @@ def build_system_prompt(
     # ----------------------------------------------------------------
     # ## Tooling
     # ----------------------------------------------------------------
+    tool_lines = _build_tool_lines(tool_names or [])
     if tool_lines:
         lines += [
             "## Tooling",
@@ -192,10 +219,12 @@ def build_system_prompt(
     lines += [
         "## Tool Call Style",
         "Default: do not narrate routine, low-risk tool calls (just call the tool).",
-        "Narrate only when it helps: multi-step work, complex problems, sensitive actions (e.g., deletions), or when the user explicitly asks.",
+        "Narrate only when it helps: multi-step work, complex problems, sensitive actions "
+        "(e.g., deletions), or when the user explicitly asks.",
         "Keep narration brief and value-dense; avoid repeating obvious steps.",
         "Use plain human language for narration unless in a technical context.",
-        "When a first-class tool exists for an action, use the tool directly instead of asking the user to run equivalent CLI commands.",
+        "When a first-class tool exists for an action, use the tool directly instead of "
+        "asking the user to run equivalent CLI commands.",
         "",
     ]
 
@@ -204,9 +233,13 @@ def build_system_prompt(
     # ----------------------------------------------------------------
     lines += [
         "## Safety",
-        "You have no independent goals: do not pursue self-preservation, replication, resource acquisition, or power-seeking; avoid long-term plans beyond the user's request.",
-        "Prioritize safety and human oversight over completion; if instructions conflict, pause and ask; comply with stop/pause/audit requests and never bypass safeguards.",
-        "Do not manipulate or persuade anyone to expand access or disable safeguards. Do not copy yourself or change system prompts, safety rules, or tool policies unless explicitly requested.",
+        "You have no independent goals: do not pursue self-preservation, replication, "
+        "resource acquisition, or power-seeking; avoid long-term plans beyond the user's request.",
+        "Prioritize safety and human oversight over completion; if instructions conflict, "
+        "pause and ask; comply with stop/pause/audit requests and never bypass safeguards.",
+        "Do not manipulate or persuade anyone to expand access or disable safeguards. "
+        "Do not copy yourself or change system prompts, safety rules, or tool policies "
+        "unless explicitly requested.",
         "",
     ]
 
@@ -216,6 +249,8 @@ def build_system_prompt(
     if skills_text and not is_minimal:
         lines += [
             "## Skills",
+            "Available skills are listed below. "
+            "Scan their descriptions to decide when to apply one before answering.",
             skills_text,
             "",
         ]
@@ -226,15 +261,17 @@ def build_system_prompt(
     if has_memory_tools:
         memory_lines = [
             "## Memory",
-            "Before answering questions about the user's preferences, past decisions, ongoing projects, or personal details: run memory_search first.",
+            "Before answering questions about the user's preferences, past decisions, "
+            "ongoing projects, or personal details: run memory_search first.",
             "Use memory_get to read specific entries. Use memory_list to see all keys.",
-            "To store durable facts: use memory_write with file memory/YYYY-MM-DD.md (APPEND, do not overwrite).",
+            "To store durable facts: use memory_write with file memory/YYYY-MM-DD.md "
+            "(APPEND, do not overwrite).",
             "If unsure after searching, say so — don't guess.",
         ]
         if memory_citations != "off":
             memory_lines.append(
                 "When recalling a fact from memory, cite the source inline: "
-                '(from memory/filename.md) or [MEMORY: filename].'
+                "(from memory/filename.md) or [MEMORY: filename]."
             )
         lines += memory_lines + [""]
 
@@ -260,7 +297,8 @@ def build_system_prompt(
     lines += [
         "## Workspace",
         f"Your working directory is: {workspace_dir_display}",
-        "Treat this directory as the single global workspace for file operations unless explicitly instructed otherwise.",
+        "Treat this directory as the single global workspace for file operations "
+        "unless explicitly instructed otherwise.",
         "",
     ]
 
@@ -273,7 +311,8 @@ def build_system_prompt(
         if soul_loaded:
             lines.append(
                 "If SOUL.md is present, embody its persona and tone. "
-                "Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it."
+                "Avoid stiff, generic replies; follow its guidance unless "
+                "higher-priority instructions override it."
             )
         lines += ["The following workspace context files have been loaded:", "", workspace_context, ""]
 
@@ -300,33 +339,103 @@ def build_system_prompt(
     # ## Heartbeats
     # ----------------------------------------------------------------
     if not is_minimal:
-        heartbeat_prompt = getattr(cfg, "heartbeat_schedule", "0 * * * *")
+        heartbeat_schedule = getattr(cfg, "heartbeat_schedule", "0 * * * *")
         lines += [
             "## Heartbeats",
-            f"Heartbeat schedule: {heartbeat_prompt}",
+            f"Heartbeat schedule: {heartbeat_schedule}",
             "If you receive a heartbeat poll and there is nothing that needs attention, reply exactly:",
             heartbeat_ok,
             f'PyGate treats a leading/trailing "{heartbeat_ok}" as a heartbeat ack (and discards it).',
-            f"If something needs attention, do NOT include \"{heartbeat_ok}\"; reply with the alert text instead.",
+            f"If something needs attention, do NOT include \"{heartbeat_ok}\"; "
+            "reply with the alert text instead.",
             "",
         ]
 
     # ----------------------------------------------------------------
-    # ## User Identity
+    # ## Reply Tags  (mirrors OpenClaw's replyTags section)
     # ----------------------------------------------------------------
-    if owner_line:
+    if channel == "telegram" and not is_minimal:
         lines += [
-            "## User Identity",
-            owner_line,
+            "## Reply Tags",
+            "To thread a reply to a specific message in the conversation, prefix your reply text with:",
+            "  [[reply_to_current]]        — reply to the message that triggered this turn",
+            "  [[reply_to:<message_id>]]   — reply to a specific Telegram message ID",
+            "",
+            "Rules:",
+            "- The tag must appear at the very start of the reply text.",
+            "- Omit the tag for standalone messages (no threading).",
+            '- Example: [[reply_to_current]] Here is the answer you asked for.',
+            '- Example: [[reply_to:12345]] Done — see the attached file.',
             "",
         ]
+
+    # ----------------------------------------------------------------
+    # ## Reasoning Format  (for reasoning-capable models)
+    # ----------------------------------------------------------------
+    if include_reasoning and not is_minimal:
+        lines += [
+            "## Reasoning Format",
+            "This model supports extended reasoning. When solving complex problems:",
+            "- Wrap internal reasoning in <think>…</think> tags.",
+            "- Place the final answer in <final>…</final> tags (or just return it directly).",
+            "- The reasoning block is shown to the user only when SHOW_THINKING is enabled; "
+            "the final answer is always delivered.",
+            "- Keep reasoning blocks focused; avoid restating the problem verbatim.",
+            "",
+        ]
+
+    # ----------------------------------------------------------------
+    # ## Voice (TTS)
+    # ----------------------------------------------------------------
+    if has_tts and getattr(cfg, "tts_hint_in_prompt", True) and not is_minimal:
+        lines += [
+            "## Voice (TTS)",
+            "You can send a voice message instead of (or in addition to) text by calling the "
+            "`tts` tool with your reply text.",
+            "Use TTS when the user asks to 'say', 'read aloud', 'voice', or prefers audio output.",
+            f"Default voice: {getattr(cfg, 'tts_voice', 'en-US-GuyNeural')}.",
+            "",
+        ]
+
+    # ----------------------------------------------------------------
+    # ## Model Aliases  (for sessions_spawn model= parameter)
+    # ----------------------------------------------------------------
+    if model_aliases and has_sessions_spawn and not is_minimal:
+        alias_lines = [f"  {alias} → {model_id}" for alias, model_id in sorted(model_aliases.items())]
+        lines += (
+            ["## Model Aliases",
+             "Short names accepted in sessions_spawn model= parameter:"]
+            + alias_lines
+            + [""]
+        )
+
+    # ----------------------------------------------------------------
+    # ## Authorized Senders  (replaces "User Identity")
+    # ----------------------------------------------------------------
+    if owner_line:
+        owner_display = getattr(cfg, "owner_display_name", "") or ""
+        lines += ["## Authorized Senders"]
+        if owner_display:
+            lines.append(f"Owner: {owner_display} ({owner_line})")
+        else:
+            lines.append(owner_line)
+        # Multi-user note
+        allow_from: list = getattr(cfg, "telegram_allow_from", [])
+        dm_policy: str = getattr(cfg, "telegram_dm_policy", "owner")
+        if allow_from or dm_policy in ("open", "allowlist"):
+            lines.append(
+                "Other users may also message you. "
+                "Do not assume every sender is the owner; "
+                "adapt your response to who is actually writing."
+            )
+        lines += [""]
 
     # ----------------------------------------------------------------
     # ## Messaging (Telegram-specific)
     # ----------------------------------------------------------------
     if channel == "telegram" and not is_minimal:
         inline_buttons = "inline_buttons" in [str(c).lower() for c in capabilities]
-        lines += _build_telegram_messaging_section(inline_buttons)
+        lines += _build_telegram_messaging_section(inline_buttons, silent_token)
 
     # ----------------------------------------------------------------
     # ## Reactions
@@ -335,14 +444,15 @@ def build_system_prompt(
         lines += _build_reaction_section(reaction_level, channel)
 
     # ----------------------------------------------------------------
-    # ## Tool confirmation
+    # ## Tool Confirmation
     # ----------------------------------------------------------------
     if getattr(cfg, "tools_require_confirmation", []):
         tools_str = ", ".join(cfg.tools_require_confirmation)
         lines += [
             "## Tool Confirmation",
             f"The following tools require explicit user approval before running: {tools_str}.",
-            "You will be paused and the user will be shown an Approve/Deny button. Wait for their decision.",
+            "You will be paused and the user will be shown an Approve/Deny button. "
+            "Wait for their decision.",
             "",
         ]
 
@@ -405,7 +515,7 @@ def _build_owner_line(cfg: "Config") -> str:
         if not owner_id:
             return ""
         h = hashlib.sha256(str(owner_id).encode()).hexdigest()[:8]
-        return f"Owner: user#{h} (Telegram ID hidden for privacy)"
+        return f"user#{h} (Telegram owner ID hidden for privacy)"
     except Exception:
         return ""
 
@@ -427,6 +537,15 @@ def _build_runtime_line(
         pass
     parts.append(f"os={platform.system().lower()} ({platform.machine()})")
     parts.append(f"python={sys.version_info.major}.{sys.version_info.minor}")
+
+    # Shell detection: config > env $SHELL > "unknown"
+    shell_name = getattr(cfg, "shell", "") or ""
+    if not shell_name:
+        env_shell = os.environ.get("SHELL", "")
+        shell_name = Path(env_shell).name if env_shell else ""
+    if shell_name:
+        parts.append(f"shell={shell_name}")
+
     if repo_root:
         parts.append(f"repo={repo_root}")
     parts.append(f"model={cfg.llm_model}")
@@ -436,13 +555,19 @@ def _build_runtime_line(
     return "Runtime: " + " ".join(p for p in parts if p)
 
 
-def _build_telegram_messaging_section(inline_buttons: bool) -> list[str]:
+def _build_telegram_messaging_section(
+    inline_buttons: bool,
+    silent_token: str = "NO_REPLY",
+) -> list[str]:
     lines = [
         "## Messaging",
         "Channel: Telegram.",
         "For normal replies, just return text — it is auto-delivered to the conversation.",
-        "Use `message` action=send to send a separate message (e.g., after tool use).",
-        "Target routing: send without 'to' → owner's DM. Set 'to' to target a different chat_id.",
+        f"To stay silent (no reply), respond with exactly: {silent_token}",
+        "Use `message` action=send to send a separate, unprompted message "
+        "(e.g., completing a background task, sending to another chat).",
+        "Target routing: send without 'to' → owner's DM. "
+        "Set 'to' to target a different chat_id.",
         "For @username or t.me/ links, pass them as 'to' — they are resolved automatically.",
         "Media: action=send_photo (path/URL), send_document (file), send_audio (MP3/OGG).",
         "Stickers: action=sticker (file_id) or sticker_search (query).",
@@ -452,7 +577,8 @@ def _build_telegram_messaging_section(inline_buttons: bool) -> list[str]:
     ]
     if inline_buttons:
         lines += [
-            "Inline buttons: pass buttons=[[{text, data}]] to message action=send (2D array of rows).",
+            "Inline buttons: pass buttons=[[{text, data}]] to message action=send "
+            "(2D array of rows).",
             "Each row is an array of button objects {text: string, data: string}.",
         ]
     lines += [
@@ -485,8 +611,12 @@ def _build_reaction_section(level: str, channel: str) -> list[str]:
     return ["## Reactions", guidance, ""]
 
 
-def _get_tz() -> str:
-    """Return local timezone abbreviation (best-effort)."""
+def _get_tz(cfg: "Config | None" = None) -> str:
+    """Return timezone abbreviation: config USER_TIMEZONE → local strftime → ''."""
+    if cfg is not None:
+        tz_name = getattr(cfg, "user_timezone", "")
+        if tz_name:
+            return tz_name
     try:
         return datetime.now().astimezone().strftime("%Z")
     except Exception:

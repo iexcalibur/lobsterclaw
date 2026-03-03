@@ -160,6 +160,31 @@ async def _sessions_spawn(
         if extra_info:
             full_task += "\n\n[Context: " + "; ".join(extra_info) + "]"
 
+        # ACP harness: when runtime="acp", wrap the spawn with ACP metadata
+        # so the sub-agent runs inside an ACP execution context.
+        # This is a stub — the ACP wire protocol is routed through the session
+        # inbox once the ACP harness is fully implemented.
+        acp_metadata: dict | None = None
+        if runtime == "acp":
+            acp_metadata = {
+                "runtime": "acp",
+                "agentId": effective_agent_id or "default",
+                "visibility": visibility,
+                "a2a": a2a,
+                "sessionKey": effective_session_key,
+            }
+            # Prepend ACP context note to the task
+            full_task = (
+                "[ACP runtime: agent-to-agent protocol harness]\n"
+                + (f"[agentId: {effective_agent_id}]\n" if effective_agent_id else "")
+                + full_task
+            )
+            logger.info(
+                "sessions_spawn: ACP harness mode for task=%r agent=%s",
+                task[:80],
+                effective_agent_id,
+            )
+
         result = await mgr.spawn(
             task=full_task,
             label=label,
@@ -181,6 +206,9 @@ async def _sessions_spawn(
                 lines.append(f"session_key: {effective_session_key}")
             if runtime != "default":
                 lines.append(f"runtime: {runtime}")
+            if acp_metadata:
+                lines.append("acp_harness: active (stub)")
+                lines.append(f"acp_agent: {acp_metadata['agentId']}")
             if a2a:
                 lines.append(f"a2a: {a2a}")
             if visibility != "private":

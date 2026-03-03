@@ -271,11 +271,77 @@ class Config:
         default_factory=lambda: _env("MEMORY_CITATIONS_MODE", "off")
     )
 
+    # Memory index persistence: keep a SQLite index file that is updated incrementally
+    # instead of rebuilding from scratch on every search (mtime-based invalidation).
+    memory_index_persist: bool = field(
+        default_factory=lambda: _env_bool("MEMORY_INDEX_PERSIST", True)
+    )
+    # Embedding provider for semantic memory search: "openai" | "gemini" | "none"
+    memory_embedding_provider: str = field(
+        default_factory=lambda: _env("MEMORY_EMBEDDING_PROVIDER", "none")
+    )
+
+    # Model aliases: JSON dict mapping short names → full model IDs.
+    # e.g. {"sonnet": "claude-sonnet-4-5", "haiku": "claude-haiku-4-5", "gpt4o": "gpt-4o"}
+    model_aliases_json: str = field(
+        default_factory=lambda: _env("MODEL_ALIASES", "{}")
+    )
+
+    # Reasoning format mode — controls ## Reasoning Format section in the prompt.
+    # "auto" = detect from model name (e.g., deepseek-r1, o1, o3)
+    # "on"   = always include the section
+    # "off"  = never include it
+    reasoning_mode: str = field(default_factory=lambda: _env("REASONING_MODE", "auto"))
+
+    # User timezone name shown in the prompt (e.g., "America/New_York").
+    # Empty = use local system timezone via strftime.
+    user_timezone: str = field(default_factory=lambda: _env("USER_TIMEZONE", ""))
+
+    # Shell name shown in the ## Runtime line (e.g., "zsh", "bash", "fish").
+    # Empty = auto-detect from $SHELL.
+    shell: str = field(default_factory=lambda: _env("SHELL_NAME", ""))
+
+    # Owner display name used in the ## Authorized Senders section (e.g., "Peter").
+    # Empty = omit name, show hashed ID only.
+    owner_display_name: str = field(
+        default_factory=lambda: _env("OWNER_DISPLAY_NAME", "")
+    )
+
+    # Transcript repair: strip orphaned tool_use / tool_result blocks before
+    # sending conversation history to the LLM API.
+    transcript_repair_enabled: bool = field(
+        default_factory=lambda: _env_bool("TRANSCRIPT_REPAIR_ENABLED", True)
+    )
+
+    # Pre/post tool hooks: fire registered async callbacks before/after every tool execution.
+    hooks_enabled: bool = field(
+        default_factory=lambda: _env_bool("HOOKS_ENABLED", True)
+    )
+
+    # Show TTS hint in the system prompt (how to invoke TTS for voice replies).
+    tts_hint_in_prompt: bool = field(
+        default_factory=lambda: _env_bool("TTS_HINT_IN_PROMPT", True)
+    )
+
     # General
     data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "~/.pygate"))
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
     max_history_messages: int = field(default_factory=lambda: _env_int("MAX_HISTORY_MESSAGES", 100))
     max_tool_iterations: int = field(default_factory=lambda: _env_int("MAX_TOOL_ITERATIONS", 10))
+
+    @property
+    def model_aliases(self) -> dict[str, str]:
+        """Short name → full model ID map from MODEL_ALIASES JSON."""
+        import json
+        try:
+            raw = self.model_aliases_json
+            return json.loads(raw) if raw and raw.strip() not in ("", "{}") else {}
+        except Exception:
+            return {}
+
+    def resolve_model(self, name: str) -> str:
+        """Resolve an alias or model name to its canonical ID."""
+        return self.model_aliases.get(name, name)
 
     @property
     def telegram_chat_policies(self) -> dict[str, str]:

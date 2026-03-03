@@ -2,8 +2,10 @@
 Core agent loop — sends messages to the LLM, handles tool calls, loops until done.
 
 Integrates:
+  - Transcript repair — removes orphaned tool_use/tool_result blocks before API calls
   - Tool loop detection (agent/loop_detection.py)
   - Context window compaction (agent/compaction.py)
+  - Pre-compaction memory flush (agent/compaction.py)
   - Tool result truncation (tools/registry.py)
   - API retry on transient errors (rate-limit, overload, 5xx)
   - Extended thinking budget (Anthropic)
@@ -11,6 +13,8 @@ Integrates:
   - Error sanitization (no raw tracebacks to user)
   - Streaming: stream_callback receives accumulated text per chunk;
                on_tool_start fires when the first tool_use block begins
+  - Reasoning lane split: <think>…</think>/<final>…</final> tags extracted
+  - Session token tracking: usage reported to SessionStore after each turn
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 import anthropic
@@ -37,6 +42,10 @@ if TYPE_CHECKING:
     from tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# Regex patterns for reasoning lane split (<think>…</think> / <final>…</final>)
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+_FINAL_RE = re.compile(r"<final>(.*?)</final>", re.DOTALL | re.IGNORECASE)
 
 # Errors that are transient and safe to retry
 _ANTHROPIC_RETRY_TYPES = (
@@ -81,6 +90,121 @@ def _sanitize_error(e: Exception) -> str:
     return f"[{name}] {msg}"
 
 
+def repair_transcript(messages: list[dict]) -> list[dict]:
+    """
+    Sanitize conversation history before sending to the LLM API.
+
+    Mirrors OpenClaw's transcript repair / sanitization logic:
+      1. Remove assistant messages that contain tool_use blocks where the tool_result
+         is missing (orphaned tool_use).
+      2. Remove user messages that contain tool_result blocks where no preceding
+         tool_use exists (orphaned tool_result).
+      3. Remove empty assistant/user messages.
+      4. Ensure the conversation does not start with an assistant message.
+
+    Returns a cleaned copy. The original list is not mutated.
+    """
+    if not messages:
+        return messages
+
+    working = list(messages)
+
+    # Pass 1: collect all tool_use ids present in assistant messages
+    issued_ids: set[str] = set()
+    for msg in working:
+        if msg.get("role") == "assistant":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        bid = block.get("id") or block.get("tool_use_id")
+                        if bid:
+                            issued_ids.add(bid)
+
+    # Pass 2: collect all tool_result ids present in user messages
+    answered_ids: set[str] = set()
+    for msg in working:
+        if msg.get("role") == "user":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        bid = block.get("tool_use_id")
+                        if bid:
+                            answered_ids.add(bid)
+
+    cleaned: list[dict] = []
+    for msg in working:
+        role = msg.get("role", "")
+        content = msg.get("content")
+
+        # Skip empty messages
+        if not content or content == [] or content == "":
+            continue
+
+        if role == "assistant" and isinstance(content, list):
+            # Remove tool_use blocks that were never answered
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    bid = block.get("id") or block.get("tool_use_id")
+                    if bid and bid not in answered_ids:
+                        logger.debug("repair_transcript: dropping orphaned tool_use id=%s", bid)
+                        continue
+                new_blocks.append(block)
+            if not new_blocks:
+                continue
+            cleaned.append({**msg, "content": new_blocks})
+
+        elif role == "user" and isinstance(content, list):
+            # Remove tool_result blocks that reference unknown tool_use ids
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    bid = block.get("tool_use_id")
+                    if bid and bid not in issued_ids:
+                        logger.debug("repair_transcript: dropping orphaned tool_result id=%s", bid)
+                        continue
+                new_blocks.append(block)
+            if not new_blocks:
+                continue
+            cleaned.append({**msg, "content": new_blocks})
+
+        else:
+            cleaned.append(msg)
+
+    # Ensure conversation doesn't start with assistant
+    while cleaned and cleaned[0].get("role") == "assistant":
+        logger.debug("repair_transcript: removing leading assistant message")
+        cleaned.pop(0)
+
+    return cleaned
+
+
+def _extract_reasoning_split(text: str, show_thinking: bool) -> str:
+    """
+    Extract <think>…</think> reasoning blocks and <final>…</final> from text.
+
+    - If show_thinking: wrap reasoning in a collapsible block; return reasoning + final.
+    - If not show_thinking: strip reasoning blocks; return only final (or plain text).
+    """
+    think_blocks = _THINK_RE.findall(text)
+    final_blocks = _FINAL_RE.findall(text)
+
+    # Remove both tag families from the main text
+    stripped = _THINK_RE.sub("", text)
+    stripped = _FINAL_RE.sub("", stripped).strip()
+
+    # Use <final> content if present, otherwise use stripped remainder
+    final_text = "\n\n".join(b.strip() for b in final_blocks if b.strip()) or stripped
+
+    if show_thinking and think_blocks:
+        thinking_combined = "\n\n".join(b.strip() for b in think_blocks if b.strip())
+        return f"<blockquote expandable>{thinking_combined}</blockquote>\n\n{final_text}"
+
+    return final_text or text  # fallback to original if nothing parsed
+
+
 class AgentLoop:
     """Core agent loop — sends messages to the LLM, handles tool calls, loops until done."""
 
@@ -91,12 +215,29 @@ class AgentLoop:
         # Reset after each successful compaction.
         self._memory_flush_done: bool = False
 
+        # Cumulative token usage for this loop instance (updated after each API call).
+        # Keys: "input_tokens", "output_tokens", "total_tokens"
+        self._token_usage: dict[str, int] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+
         if self.cfg.llm_provider == "anthropic":
             self._anthropic = anthropic.AsyncAnthropic(api_key=self.cfg.anthropic_api_key)
             self._openai = None
         else:
             self._anthropic = None
             self._openai = openai.AsyncOpenAI(api_key=self.cfg.openai_api_key)
+
+    def get_token_usage(self) -> dict[str, int]:
+        """Return cumulative token usage for this loop (input + output + total)."""
+        return dict(self._token_usage)
+
+    def _record_usage(self, input_tokens: int, output_tokens: int) -> None:
+        self._token_usage["input_tokens"] += input_tokens
+        self._token_usage["output_tokens"] += output_tokens
+        self._token_usage["total_tokens"] += input_tokens + output_tokens
 
     async def run(
         self,
@@ -121,11 +262,19 @@ class AgentLoop:
             on_tool_start:   called once when the first tool_use block begins
         """
         effective_model = model_override or self.cfg.llm_model
+
+        # Resolve model aliases (e.g., "sonnet" → "claude-sonnet-4-5")
+        effective_model = self.cfg.resolve_model(effective_model)
+
         api_key = (
             self.cfg.anthropic_api_key
             if self.cfg.llm_provider == "anthropic"
             else self.cfg.openai_api_key
         )
+
+        # Transcript repair: strip orphaned tool_use/tool_result blocks before sending.
+        if getattr(self.cfg, "transcript_repair_enabled", True):
+            messages = repair_transcript(messages)
 
         # Pre-compaction memory flush: ask the agent to write durable memories before
         # the history gets compacted and older turns are lost.
@@ -155,7 +304,7 @@ class AgentLoop:
             self._memory_flush_done = False  # reset for the next compaction cycle
 
         if self.cfg.llm_provider == "anthropic":
-            return await self._run_anthropic(
+            result = await self._run_anthropic(
                 messages, system_prompt,
                 session_id=session_id,
                 model=effective_model,
@@ -163,13 +312,29 @@ class AgentLoop:
                 stream_callback=stream_callback,
                 on_tool_start=on_tool_start,
             )
-        return await self._run_openai(
-            messages, system_prompt,
-            session_id=session_id,
-            model=effective_model,
-            stream_callback=stream_callback,
-            on_tool_start=on_tool_start,
-        )
+        else:
+            result = await self._run_openai(
+                messages, system_prompt,
+                session_id=session_id,
+                model=effective_model,
+                stream_callback=stream_callback,
+                on_tool_start=on_tool_start,
+            )
+
+        # Persist token usage to SessionStore if available
+        if session_id:
+            try:
+                from agent.sessions import get_session_store
+                store = get_session_store()
+                await store.add_token_usage(
+                    session_id,
+                    self._token_usage["input_tokens"],
+                    self._token_usage["output_tokens"],
+                )
+            except Exception:
+                pass  # SessionStore may not be initialized in tests
+
+        return result
 
     # ------------------------------------------------------------------
     # Anthropic
@@ -237,16 +402,30 @@ class AgentLoop:
 
             if response.stop_reason == "end_turn":
                 show_thinking = getattr(self.cfg, "llm_show_thinking", False)
-                parts = []
+                # Record token usage from Anthropic usage object
+                if hasattr(response, "usage") and response.usage:
+                    self._record_usage(
+                        getattr(response.usage, "input_tokens", 0),
+                        getattr(response.usage, "output_tokens", 0),
+                    )
+                parts: list[str] = []
                 for block in response.content:
+                    # Anthropic extended thinking blocks
                     if hasattr(block, "thinking") and block.type == "thinking":
                         if show_thinking:
                             parts.append(f"<blockquote expandable>{block.thinking}</blockquote>")
                     elif hasattr(block, "text"):
-                        parts.append(block.text)
+                        # Reasoning lane split: handle <think>/<final> tags from reasoning models
+                        parts.append(_extract_reasoning_split(block.text, show_thinking))
                 return "\n".join(p for p in parts if p)
 
             if response.stop_reason == "tool_use":
+                # Record usage for intermediate tool turns
+                if hasattr(response, "usage") and response.usage:
+                    self._record_usage(
+                        getattr(response.usage, "input_tokens", 0),
+                        getattr(response.usage, "output_tokens", 0),
+                    )
                 working.append({"role": "assistant", "content": [b.model_dump() for b in response.content]})
 
                 tool_results = []
@@ -473,7 +652,8 @@ class AgentLoop:
                     return f"Sorry, I couldn't reach the AI service: {_sanitize_error(e)}"
 
                 if finish_reason == "stop":
-                    return content_text
+                    show_thinking = getattr(self.cfg, "llm_show_thinking", False)
+                    return _extract_reasoning_split(content_text, show_thinking)
 
                 if finish_reason == "tool_calls":
                     # Reconstruct a message dict with assembled tool calls
@@ -548,9 +728,21 @@ class AgentLoop:
                 choice = response.choices[0]
 
                 if choice.finish_reason == "stop":
-                    return choice.message.content or ""
+                    if hasattr(response, "usage") and response.usage:
+                        self._record_usage(
+                            getattr(response.usage, "prompt_tokens", 0),
+                            getattr(response.usage, "completion_tokens", 0),
+                        )
+                    raw_text = choice.message.content or ""
+                    show_thinking = getattr(self.cfg, "llm_show_thinking", False)
+                    return _extract_reasoning_split(raw_text, show_thinking)
 
                 if choice.finish_reason == "tool_calls":
+                    if hasattr(response, "usage") and response.usage:
+                        self._record_usage(
+                            getattr(response.usage, "prompt_tokens", 0),
+                            getattr(response.usage, "completion_tokens", 0),
+                        )
                     working.append(choice.message.model_dump(exclude_unset=True))
 
                     for tool_call in choice.message.tool_calls:

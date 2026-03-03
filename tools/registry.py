@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -46,6 +47,12 @@ def _redact_error_string(s: str) -> str:
     return s
 
 ToolFn = Callable[..., Awaitable[Any]]
+
+# Hook function types — fired before / after every tool execution.
+# pre_hook(name, args)               — called before execution; may raise to abort
+# post_hook(name, args, result, ms)  — called after execution with result and duration
+PreHookFn = Callable[[str, dict], Awaitable[None]]
+PostHookFn = Callable[[str, dict, str, float], Awaitable[None]]
 
 # Hard cap on tool result size sent back to LLM.
 DEFAULT_TOOL_RESULT_MAX_CHARS = 50_000
@@ -91,9 +98,20 @@ class ToolRegistry:
         )
         # Current execution depth (0 = main session, >0 = sub-agent)
         self._session_depth: int = 0
+        # Pre/post execution hooks (fired for every tool call if hooks_enabled)
+        self._pre_hooks: list[PreHookFn] = []
+        self._post_hooks: list[PostHookFn] = []
 
     def set_approval_gate(self, gate: Any) -> None:
         self._approval_gate = gate
+
+    def add_pre_hook(self, fn: PreHookFn) -> None:
+        """Register a hook called before every tool execution."""
+        self._pre_hooks.append(fn)
+
+    def add_post_hook(self, fn: PostHookFn) -> None:
+        """Register a hook called after every tool execution (name, args, result, duration_ms)."""
+        self._post_hooks.append(fn)
 
     def set_session_depth(self, depth: int) -> None:
         """Set the current session depth — used to enforce owner_only and depth_limit."""
@@ -233,6 +251,18 @@ class ToolRegistry:
             if not approved:
                 return f"User denied execution of '{name}'"
 
+        hooks_enabled = getattr(self.cfg, "hooks_enabled", True)
+
+        # Pre-execution hooks
+        if hooks_enabled:
+            for hook in self._pre_hooks:
+                try:
+                    await hook(name, args)
+                except Exception as hook_exc:
+                    logger.warning("pre_hook error for tool %s: %s", name, hook_exc)
+
+        t_start = time.monotonic()
+        result_str: str
         try:
             # Pass context keys (_session_id etc.) only to tools that accept them
             import inspect
@@ -245,10 +275,22 @@ class ToolRegistry:
             }
             result = await tool.fn(**clean_args)
             raw = str(result) if not isinstance(result, str) else result
-            return truncate_tool_result(raw, self._result_max_chars)
+            result_str = truncate_tool_result(raw, self._result_max_chars)
         except TypeError as e:
             logger.warning("Tool %s argument error: %s", name, e)
-            return f"Error calling {name}: {_redact_error_string(str(e))}"
+            result_str = f"Error calling {name}: {_redact_error_string(str(e))}"
         except Exception as e:
             logger.exception("Tool %s failed", name)
-            return f"Error: {_redact_error_string(str(e))}"
+            result_str = f"Error: {_redact_error_string(str(e))}"
+
+        elapsed_ms = (time.monotonic() - t_start) * 1000.0
+
+        # Post-execution hooks
+        if hooks_enabled:
+            for hook in self._post_hooks:
+                try:
+                    await hook(name, args, result_str, elapsed_ms)
+                except Exception as hook_exc:
+                    logger.warning("post_hook error for tool %s: %s", name, hook_exc)
+
+        return result_str

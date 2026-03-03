@@ -41,7 +41,9 @@ class SessionRecord:
     created_at: str
     updated_at: str
     depth: int
-    token_usage: int = 0
+    token_usage: int = 0      # legacy total (input + output)
+    input_tokens: int = 0
+    output_tokens: int = 0
     error: str | None = None
 
 
@@ -72,16 +74,18 @@ class SessionStore:
         conn = self._connect()
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
-                id          TEXT PRIMARY KEY,
-                label       TEXT NOT NULL,
-                parent_id   TEXT,
-                status      TEXT NOT NULL DEFAULT 'active',
-                model       TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL,
-                depth       INTEGER NOT NULL DEFAULT 0,
-                token_usage INTEGER NOT NULL DEFAULT 0,
-                error       TEXT
+                id            TEXT PRIMARY KEY,
+                label         TEXT NOT NULL,
+                parent_id     TEXT,
+                status        TEXT NOT NULL DEFAULT 'active',
+                model         TEXT NOT NULL DEFAULT '',
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                depth         INTEGER NOT NULL DEFAULT 0,
+                token_usage   INTEGER NOT NULL DEFAULT 0,
+                input_tokens  INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                error         TEXT
             );
             CREATE TABLE IF NOT EXISTS session_messages (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +97,13 @@ class SessionStore:
             );
             CREATE INDEX IF NOT EXISTS idx_messages_session ON session_messages(session_id);
         """)
+        # Schema migration: add input_tokens/output_tokens columns to existing databases
+        for col in ("input_tokens", "output_tokens"):
+            try:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+                conn.commit()
+            except Exception:
+                pass  # column already exists
         conn.commit()
         conn.close()
 
@@ -272,6 +283,49 @@ class SessionStore:
             lines.append(f"[{role}]: {content}")
         return "\n\n".join(lines) if lines else "No user/assistant messages found."
 
+    async def add_token_usage(
+        self,
+        session_id: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """
+        Increment token counters for a session.
+        Mirrors OpenClaw's session token tracking (totalTokens after each turn).
+        """
+        async with self._lock:
+            conn = self._connect()
+            total = input_tokens + output_tokens
+            conn.execute(
+                """
+                UPDATE sessions
+                SET input_tokens  = input_tokens  + ?,
+                    output_tokens = output_tokens + ?,
+                    token_usage   = token_usage   + ?,
+                    updated_at    = ?
+                WHERE id = ?
+                """,
+                (input_tokens, output_tokens, total, _now(), session_id),
+            )
+            conn.commit()
+            conn.close()
+
+    async def get_token_usage(self, session_id: str) -> dict[str, int]:
+        """Return {input_tokens, output_tokens, total_tokens} for a session."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT input_tokens, output_tokens, token_usage FROM sessions WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        return {
+            "input_tokens": row["input_tokens"],
+            "output_tokens": row["output_tokens"],
+            "total_tokens": row["token_usage"],
+        }
+
     async def delete_session(self, session_id: str) -> None:
         """Delete a session and all its messages."""
         async with self._lock:
@@ -287,6 +341,7 @@ def _now() -> str:
 
 
 def _row_to_session(row: sqlite3.Row) -> SessionRecord:
+    keys = row.keys()
     return SessionRecord(
         id=row["id"],
         label=row["label"],
@@ -297,6 +352,8 @@ def _row_to_session(row: sqlite3.Row) -> SessionRecord:
         updated_at=row["updated_at"],
         depth=row["depth"],
         token_usage=row["token_usage"],
+        input_tokens=row["input_tokens"] if "input_tokens" in keys else 0,
+        output_tokens=row["output_tokens"] if "output_tokens" in keys else 0,
         error=row["error"],
     )
 
