@@ -279,6 +279,11 @@ class TelegramChannel:
         chat_id = update.effective_chat.id
         user_id = str(update.effective_user.id)
 
+        # Expose inbound message_id as fallback for react tool
+        if update.effective_message:
+            from tools.message_tool import set_current_message_id
+            set_current_message_id(update.effective_message.message_id)
+
         # Add to history
         self.history.add(user_id, "user", user_text)
 
@@ -372,114 +377,243 @@ class TelegramChannel:
         """Send a text message to the owner. Called by message_tool."""
         await self._send_chunked(self.cfg.telegram_owner_id, text)
 
+    async def send_to(
+        self,
+        chat_id: int | str,
+        text: str,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+        silent: bool = False,
+    ) -> int | None:
+        """
+        Send to an explicit target chat (not just owner).
+        Returns message_id on success. Raises on failure (caller decides how to handle).
+        """
+        kwargs: dict = {}
+        if reply_to_message_id:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        if message_thread_id:
+            kwargs["message_thread_id"] = message_thread_id
+        if silent:
+            kwargs["disable_notification"] = True
+        chunks = _split_message(text)
+        last_msg = None
+        for chunk in chunks:
+            last_msg = await self._safe_send(int(chat_id), chunk, **kwargs)
+        return last_msg.message_id if last_msg else None
+
     async def send_audio(self, audio_path: str) -> None:
         """Send an audio file as a voice message. Called by tts tool."""
-        try:
-            with open(audio_path, "rb") as f:
-                await self._bot.send_voice(
-                    chat_id=self.cfg.telegram_owner_id,
-                    voice=f,
-                )
-        except Exception as e:
-            logger.error("Failed to send audio: %s", e)
-
-    async def send_photo(self, photo_path_or_url: str, caption: str = "") -> None:
-        """Send a photo to the owner."""
-        try:
-            if photo_path_or_url.startswith("http"):
-                await self._bot.send_photo(
-                    chat_id=self.cfg.telegram_owner_id,
-                    photo=photo_path_or_url,
-                    caption=caption or None,
-                )
-            else:
-                with open(photo_path_or_url, "rb") as f:
-                    await self._bot.send_photo(
-                        chat_id=self.cfg.telegram_owner_id,
-                        photo=f,
-                        caption=caption or None,
-                    )
-        except Exception as e:
-            logger.error("Failed to send photo: %s", e)
-
-    async def send_document(self, file_path: str, caption: str = "") -> None:
-        """Send a document/file to the owner."""
-        try:
-            with open(file_path, "rb") as f:
-                await self._bot.send_document(
-                    chat_id=self.cfg.telegram_owner_id,
-                    document=f,
-                    caption=caption or None,
-                    filename=Path(file_path).name,
-                )
-        except Exception as e:
-            logger.error("Failed to send document: %s", e)
-
-    async def edit_message(self, chat_id: int, message_id: int, text: str) -> None:
-        """Edit an existing message."""
-        try:
-            await self._bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text[:4096],
+        with open(audio_path, "rb") as f:
+            await self._bot.send_voice(
+                chat_id=self.cfg.telegram_owner_id,
+                voice=f,
             )
-        except Exception as e:
-            logger.error("Failed to edit message: %s", e)
+
+    async def send_photo(
+        self,
+        photo_path_or_url: str,
+        caption: str = "",
+        *,
+        chat_id: int | str | None = None,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+        silent: bool = False,
+    ) -> int | None:
+        """
+        Send a photo to chat_id (defaults to owner).
+        Raises on failure so message_tool can return a structured error.
+        Returns message_id.
+        """
+        target = int(chat_id) if chat_id else self.cfg.telegram_owner_id
+        kwargs: dict = {}
+        if reply_to_message_id:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        if message_thread_id:
+            kwargs["message_thread_id"] = message_thread_id
+        if silent:
+            kwargs["disable_notification"] = True
+        if photo_path_or_url.startswith("http"):
+            msg = await self._bot.send_photo(
+                chat_id=target,
+                photo=photo_path_or_url,
+                caption=caption or None,
+                **kwargs,
+            )
+        else:
+            with open(photo_path_or_url, "rb") as f:
+                msg = await self._bot.send_photo(
+                    chat_id=target,
+                    photo=f,
+                    caption=caption or None,
+                    **kwargs,
+                )
+        return msg.message_id if msg else None
+
+    async def send_document(
+        self,
+        file_path: str,
+        caption: str = "",
+        *,
+        chat_id: int | str | None = None,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+        silent: bool = False,
+    ) -> int | None:
+        """
+        Send a document to chat_id (defaults to owner).
+        Raises on failure. Returns message_id.
+        """
+        target = int(chat_id) if chat_id else self.cfg.telegram_owner_id
+        kwargs: dict = {}
+        if reply_to_message_id:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        if message_thread_id:
+            kwargs["message_thread_id"] = message_thread_id
+        if silent:
+            kwargs["disable_notification"] = True
+        with open(file_path, "rb") as f:
+            msg = await self._bot.send_document(
+                chat_id=target,
+                document=f,
+                caption=caption or None,
+                filename=Path(file_path).name,
+                **kwargs,
+            )
+        return msg.message_id if msg else None
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        buttons: list[list[dict]] | None = None,
+    ) -> int | None:
+        """
+        Edit an existing message. Raises on failure. Returns message_id.
+        Accepts 2D buttons for inline keyboard update.
+        """
+        markup = _build_inline_keyboard(buttons) if buttons else None
+        kwargs: dict = {}
+        if markup:
+            kwargs["reply_markup"] = markup
+        result = await self._bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text[:4096],
+            **kwargs,
+        )
+        return result.message_id if isinstance(result, Message) else message_id
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
-        """Delete a message."""
-        try:
-            await self._bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception as e:
-            logger.error("Failed to delete message: %s", e)
+        """Delete a message. Raises on failure."""
+        await self._bot.delete_message(chat_id=chat_id, message_id=message_id)
 
-    async def react_to_message(self, chat_id: int, message_id: int, emoji: str) -> None:
-        """Set a reaction on a message (requires Bot API 7.0+)."""
-        try:
-            from telegram import ReactionTypeEmoji
+    async def react_to_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        emoji: str | None,
+        *,
+        remove: bool = False,
+    ) -> None:
+        """
+        Set or remove a reaction (requires Bot API 7.0+).
+        remove=True clears all reactions. Raises on failure so caller gets error info.
+        """
+        from telegram import ReactionTypeEmoji
+        if remove or not emoji:
+            await self._bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[],
+            )
+        else:
             await self._bot.set_message_reaction(
                 chat_id=chat_id,
                 message_id=message_id,
                 reaction=[ReactionTypeEmoji(emoji=emoji)],
             )
-        except Exception as e:
-            logger.error("Failed to react to message: %s", e)
 
     async def send_with_buttons(
         self,
         text: str,
-        buttons: list[dict],
-        chat_id: int | None = None,
-    ) -> None:
+        buttons: list[list[dict]],
+        chat_id: int | str | None = None,
+        *,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+        silent: bool = False,
+    ) -> int | None:
         """
-        Send a message with agent-defined inline buttons.
-        buttons = [{"text": "...", "data": "..."}]
+        Send message with inline keyboard.
+        buttons must be 2D: [[{text, callback_data, ?style}]].
+        Raises on failure. Returns message_id.
         """
-        target = chat_id or self.cfg.telegram_owner_id
-        keyboard_rows = []
-        for btn in buttons:
-            label = btn.get("text", "")
-            data = btn.get("data", label)
-            keyboard_rows.append([
-                InlineKeyboardButton(label, callback_data=f"btn:{data}"[:64])
-            ])
-        markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
-        await self._safe_send(target, text, reply_markup=markup)
+        target = int(chat_id) if chat_id else self.cfg.telegram_owner_id
+        markup = _build_inline_keyboard(buttons)
+        kwargs: dict = {"reply_markup": markup} if markup else {}
+        if reply_to_message_id:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        if message_thread_id:
+            kwargs["message_thread_id"] = message_thread_id
+        if silent:
+            kwargs["disable_notification"] = True
+        msg = await self._safe_send(target, text, **kwargs)
+        return msg.message_id if msg else None
 
-    async def send_sticker(self, chat_id: int, file_id: str) -> None:
-        """Send a sticker by file_id."""
-        try:
-            await self._bot.send_sticker(chat_id=chat_id, sticker=file_id)
-        except Exception as e:
-            logger.error("Failed to send sticker: %s", e)
+    async def send_sticker(
+        self,
+        chat_id: int | str,
+        file_id: str,
+        *,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+    ) -> int | None:
+        """
+        Send a sticker by file_id. Raises on failure. Returns message_id.
+        Accepts replyToMessageId / messageThreadId for full OpenClaw parity.
+        """
+        kwargs: dict = {}
+        if reply_to_message_id:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        if message_thread_id:
+            kwargs["message_thread_id"] = message_thread_id
+        msg = await self._bot.send_sticker(
+            chat_id=int(chat_id),
+            sticker=file_id,
+            **kwargs,
+        )
+        return msg.message_id if msg else None
 
-    async def create_forum_topic(self, chat_id: int, name: str) -> str:
-        """Create a forum topic in a group/supergroup."""
-        try:
-            topic = await self._bot.create_forum_topic(chat_id=chat_id, name=name)
-            return f"Forum topic '{name}' created (id: {topic.message_thread_id})"
-        except Exception as e:
-            return f"Failed to create forum topic: {e}"
+    async def create_forum_topic(
+        self,
+        chat_id: int | str,
+        name: str,
+        *,
+        icon_color: int | None = None,
+        icon_custom_emoji_id: str | None = None,
+    ) -> dict:
+        """
+        Create a forum topic. Returns dict {topicId, name, chatId}.
+        Raises on failure. Passes iconColor/iconCustomEmojiId (OpenClaw parity).
+        """
+        kwargs: dict = {}
+        if icon_color is not None:
+            kwargs["icon_color"] = icon_color
+        if icon_custom_emoji_id:
+            kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+        topic = await self._bot.create_forum_topic(
+            chat_id=int(chat_id),
+            name=name,
+            **kwargs,
+        )
+        return {
+            "topicId": topic.message_thread_id,
+            "name": name,
+            "chatId": int(chat_id),
+        }
 
     # ------------------------------------------------------------------
     # Safe send with ParseMode fallback + chunking
@@ -548,6 +682,27 @@ class TelegramChannel:
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _build_inline_keyboard(buttons_2d: list[list[dict]] | None) -> InlineKeyboardMarkup | None:
+    """
+    Build Telegram InlineKeyboardMarkup from 2D button array.
+    Each button must have {text, callback_data}. Optional style is stored in data prefix
+    only if the callback_data doesn't already contain it.
+    """
+    if not buttons_2d:
+        return None
+    rows = []
+    for row in buttons_2d:
+        kb_row = []
+        for btn in row:
+            text = btn.get("text", "")
+            cb = btn.get("callback_data") or btn.get("data") or text
+            cb = str(cb)[:64]
+            kb_row.append(InlineKeyboardButton(text, callback_data=cb))
+        if kb_row:
+            rows.append(kb_row)
+    return InlineKeyboardMarkup(rows) if rows else None
+
 
 def _split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> list[str]:
     """Split text at word/line boundaries."""
