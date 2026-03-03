@@ -942,7 +942,15 @@ class TelegramChannel:
             self.history.add(context_key, "user", user_text)
 
         tool_names = self.agent.registry.get_names()
-        system = self.build_prompt(self.cfg, tool_names)
+        # Pass Telegram channel metadata into the prompt builder for the ## Runtime section
+        _runtime_info = {
+            "channel": "telegram",
+            "capabilities": ["reactions", "inline_buttons", "voice", "stickers"],
+            "agent_id": getattr(self.cfg, "agent_id", ""),
+        }
+        system = self.build_prompt(
+            self.cfg, tool_names, runtime_info=_runtime_info
+        )
         messages = self.history.get_for_llm(context_key)
 
         # Reaction: thinking phase
@@ -990,6 +998,36 @@ class TelegramChannel:
                 await typing_task
             except asyncio.CancelledError:
                 pass
+
+        # Check for special reply tokens before delivering
+        silent_token = getattr(self.cfg, "silent_reply_token", "NO_REPLY")
+        heartbeat_ok = getattr(self.cfg, "heartbeat_ok_token", "HEARTBEAT_OK")
+
+        if reply and reply.strip() == silent_token:
+            # Agent has nothing to say — suppress delivery, cancel any streaming preview
+            logger.debug("[%s] Silent reply (NO_REPLY) — not sending", self._label)
+            self.history.add(context_key, "assistant", reply)
+            if stream_state.preview_msg_id:
+                try:
+                    await self._bot.delete_message(
+                        chat_id=chat_id, message_id=stream_state.preview_msg_id
+                    )
+                except Exception:
+                    pass
+            return
+
+        if reply and reply.strip().startswith(heartbeat_ok):
+            # Heartbeat acknowledged — suppress user-visible message
+            logger.debug("[%s] Heartbeat ack — not sending to Telegram", self._label)
+            self.history.add(context_key, "assistant", reply)
+            if stream_state.preview_msg_id:
+                try:
+                    await self._bot.delete_message(
+                        chat_id=chat_id, message_id=stream_state.preview_msg_id
+                    )
+                except Exception:
+                    pass
+            return
 
         if reply:
             self.history.add(context_key, "assistant", reply)

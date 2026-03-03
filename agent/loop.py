@@ -23,7 +23,13 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 import anthropic
 import openai
 
-from agent.compaction import compact_messages, needs_compaction
+from agent.compaction import (
+    MEMORY_FLUSH_PROMPT,
+    MEMORY_FLUSH_SYSTEM_PROMPT,
+    compact_messages,
+    needs_compaction,
+    needs_memory_flush,
+)
 from agent.loop_detection import LoopDetectionState
 from config import get_config
 
@@ -81,6 +87,9 @@ class AgentLoop:
     def __init__(self, registry: "ToolRegistry") -> None:
         self.cfg = get_config()
         self.registry = registry
+        # Track whether we've already run a memory flush for the current compaction cycle.
+        # Reset after each successful compaction.
+        self._memory_flush_done: bool = False
 
         if self.cfg.llm_provider == "anthropic":
             self._anthropic = anthropic.AsyncAnthropic(api_key=self.cfg.anthropic_api_key)
@@ -112,15 +121,38 @@ class AgentLoop:
             on_tool_start:   called once when the first tool_use block begins
         """
         effective_model = model_override or self.cfg.llm_model
+        api_key = (
+            self.cfg.anthropic_api_key
+            if self.cfg.llm_provider == "anthropic"
+            else self.cfg.openai_api_key
+        )
+
+        # Pre-compaction memory flush: ask the agent to write durable memories before
+        # the history gets compacted and older turns are lost.
+        flush_enabled = getattr(self.cfg, "memory_flush_enabled", True)
+        flush_soft = getattr(self.cfg, "memory_flush_soft_tokens", 4000)
+        if (
+            flush_enabled
+            and not self._memory_flush_done
+            and needs_memory_flush(messages, effective_model, self.cfg.llm_max_tokens, flush_soft)
+        ):
+            logger.info("Pre-compaction memory flush: running flush turn")
+            today = __import__("datetime").date.today().isoformat()
+            flush_prompt = MEMORY_FLUSH_PROMPT.replace("YYYY-MM-DD", today)
+            try:
+                await self._run_flush_turn(messages, system_prompt, flush_prompt)
+                self._memory_flush_done = True
+            except Exception as exc:
+                logger.warning("Memory flush turn failed (continuing): %s", exc)
+
         if needs_compaction(messages, effective_model, self.cfg.llm_max_tokens):
             messages = await compact_messages(
                 messages=messages,
                 model=effective_model,
-                api_key=self.cfg.anthropic_api_key
-                if self.cfg.llm_provider == "anthropic"
-                else self.cfg.openai_api_key,
+                api_key=api_key,
                 provider=self.cfg.llm_provider,
             )
+            self._memory_flush_done = False  # reset for the next compaction cycle
 
         if self.cfg.llm_provider == "anthropic":
             return await self._run_anthropic(
@@ -261,6 +293,82 @@ class AgentLoop:
 
         logger.warning("Max tool iterations (%d) reached", self.cfg.max_tool_iterations)
         return "I've reached the tool call limit for this turn. Here's what I accomplished so far."
+
+    async def _run_flush_turn(
+        self,
+        messages: list[dict],
+        main_system_prompt: str,
+        flush_prompt: str,
+    ) -> None:
+        """
+        Run a single pre-compaction memory flush turn.
+        Injects a special user message asking the agent to write memories to disk,
+        then runs one tool-calling loop with only memory_write accessible.
+        The result is discarded (flush turn is invisible to the user).
+        """
+        silent_token = getattr(self.cfg, "silent_reply_token", "NO_REPLY")
+        flush_messages = list(messages) + [{"role": "user", "content": flush_prompt}]
+
+        if self.cfg.llm_provider == "anthropic":
+            # Use memory tools if available, else run without tools (agent writes via text)
+            memory_tools = [
+                t for t in self.registry.get_anthropic_tools()
+                if t.get("name", "").startswith("memory")
+            ]
+            kwargs: dict = {
+                "model": self.cfg.llm_model,
+                "max_tokens": 2048,
+                "system": MEMORY_FLUSH_SYSTEM_PROMPT,
+                "messages": flush_messages,
+            }
+            if memory_tools:
+                kwargs["tools"] = memory_tools
+
+            response = await _retry_api(
+                lambda: self._anthropic.messages.create(**kwargs),
+                max_retries=2,
+                label="memory-flush-anthropic",
+            )
+            # Execute any memory_write tool calls in the flush response
+            for block in response.content:
+                if getattr(block, "type", None) == "tool_use" and block.name.startswith("memory"):
+                    try:
+                        await self.registry.execute(block.name, dict(block.input))
+                        logger.debug("Memory flush tool: %s", block.name)
+                    except Exception as e:
+                        logger.debug("Memory flush tool error (%s): %s", block.name, e)
+        else:
+            memory_tools = [
+                t for t in self.registry.get_openai_tools()
+                if t.get("function", {}).get("name", "").startswith("memory")
+            ]
+            kwargs = {
+                "model": self.cfg.llm_model,
+                "max_tokens": 2048,
+                "messages": [
+                    {"role": "system", "content": MEMORY_FLUSH_SYSTEM_PROMPT},
+                    *flush_messages,
+                ],
+            }
+            if memory_tools:
+                kwargs["tools"] = memory_tools
+
+            response = await _retry_api(
+                lambda: self._openai.chat.completions.create(**kwargs),
+                max_retries=2,
+                label="memory-flush-openai",
+            )
+            choice = response.choices[0]
+            if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+                for tc in choice.message.tool_calls:
+                    if tc.function.name.startswith("memory"):
+                        try:
+                            import json as _json
+                            args = _json.loads(tc.function.arguments)
+                            await self.registry.execute(tc.function.name, args)
+                            logger.debug("Memory flush tool: %s", tc.function.name)
+                        except Exception as e:
+                            logger.debug("Memory flush tool error (%s): %s", tc.function.name, e)
 
     async def _anthropic_stream_turn(
         self,

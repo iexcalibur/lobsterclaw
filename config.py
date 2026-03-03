@@ -238,6 +238,39 @@ class Config:
     # How long wait_event polls for a user interaction (seconds)
     canvas_event_timeout: int = field(default_factory=lambda: _env_int("CANVAS_EVENT_TIMEOUT", 60))
 
+    # Agent identity
+    # Human-readable agent identifier shown in the ## Runtime prompt line.
+    agent_id: str = field(default_factory=lambda: _env("AGENT_ID", ""))
+    # "full" (default), "minimal" (sub-agents), or "none" (raw identity only)
+    prompt_mode: str = field(default_factory=lambda: _env("PROMPT_MODE", "full"))
+
+    # Reply tokens — must match the values injected into the prompt
+    # Agent uses NO_REPLY when it has nothing to say; Telegram channel suppresses it.
+    silent_reply_token: str = field(default_factory=lambda: _env("SILENT_REPLY_TOKEN", "NO_REPLY"))
+    # Agent uses HEARTBEAT_OK to acknowledge heartbeat polls with no action needed.
+    heartbeat_ok_token: str = field(default_factory=lambda: _env("HEARTBEAT_OK_TOKEN", "HEARTBEAT_OK"))
+
+    # Pre-compaction memory flush (mirrors OpenClaw's memoryFlush feature)
+    # Before compacting history, inject a special agent turn to write memories to disk.
+    memory_flush_enabled: bool = field(
+        default_factory=lambda: _env_bool("MEMORY_FLUSH_ENABLED", True)
+    )
+    # How close to the compaction threshold (in tokens) before triggering a flush
+    memory_flush_soft_tokens: int = field(
+        default_factory=lambda: _env_int("MEMORY_FLUSH_SOFT_TOKENS", 4000)
+    )
+
+    # Reaction guidance for the agent in the prompt
+    # "off" (default) | "minimal" | "extensive"
+    reaction_guidance_level: str = field(
+        default_factory=lambda: _env("REACTION_GUIDANCE_LEVEL", "off")
+    )
+
+    # Memory citations mode in the prompt: "off" | "inline" | "footnote"
+    memory_citations_mode: str = field(
+        default_factory=lambda: _env("MEMORY_CITATIONS_MODE", "off")
+    )
+
     # General
     data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "~/.pygate"))
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))

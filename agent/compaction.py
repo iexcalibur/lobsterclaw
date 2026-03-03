@@ -1,5 +1,5 @@
 """
-Context window compaction — mirrors OpenClaw's compaction.ts
+Context window compaction — mirrors OpenClaw's compaction.ts + memoryFlush
 
 When conversation history approaches the LLM's context window limit, this module
 summarizes older turns and replaces them with a compact summary, keeping only
@@ -69,6 +69,22 @@ def resolve_context_window(model: str) -> int:
     return 100_000  # conservative default
 
 
+# Pre-compaction memory flush — mirrors OpenClaw's memoryFlush feature.
+# Before compacting, the agent is asked to write durable memories to disk.
+MEMORY_FLUSH_PROMPT = (
+    "Pre-compaction memory flush. "
+    "Store durable memories now (use memory/YYYY-MM-DD.md; create memory/ if needed). "
+    "IMPORTANT: If the file already exists, APPEND new content only — do not overwrite existing entries. "
+    "If nothing to store, reply with NO_REPLY."
+)
+
+MEMORY_FLUSH_SYSTEM_PROMPT = (
+    "Pre-compaction memory flush turn. "
+    "The session is near auto-compaction; capture durable memories to disk now. "
+    "You may reply, but usually NO_REPLY is correct."
+)
+
+
 def needs_compaction(messages: list[dict], model: str, max_tokens: int) -> bool:
     """Return True if history is large enough to warrant compaction."""
     context_window = resolve_context_window(model)
@@ -79,6 +95,31 @@ def needs_compaction(messages: list[dict], model: str, max_tokens: int) -> bool:
     used = estimate_messages_tokens(messages)
     trigger = int(available * COMPACTION_TRIGGER_RATIO)
     return used > trigger
+
+
+def needs_memory_flush(
+    messages: list[dict],
+    model: str,
+    max_tokens: int,
+    soft_threshold_tokens: int = 4000,
+) -> bool:
+    """
+    Return True if history is close enough to the compaction threshold to
+    warrant a pre-compaction memory flush.
+
+    The flush fires when we are within `soft_threshold_tokens` of the compaction trigger,
+    i.e.: used > trigger - soft_threshold_tokens.
+
+    This mirrors OpenClaw's shouldRunMemoryFlush soft-threshold logic.
+    """
+    context_window = resolve_context_window(model)
+    available = context_window - max_tokens - SYSTEM_PROMPT_TOKEN_BUDGET
+    if available <= 0:
+        return False
+    used = estimate_messages_tokens(messages)
+    trigger = int(available * COMPACTION_TRIGGER_RATIO)
+    soft_trigger = max(0, trigger - soft_threshold_tokens)
+    return used > soft_trigger
 
 
 def split_for_compaction(messages: list[dict]) -> tuple[list[dict], list[dict]]:
