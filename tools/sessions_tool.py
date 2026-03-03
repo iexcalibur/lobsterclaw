@@ -29,23 +29,39 @@ SESSIONS_SPAWN_TOOL = ToolDefinition(
         "Spawn a sub-agent to handle a task in isolation. "
         "The sub-agent runs autonomously, has access to all tools, "
         "and auto-announces its result when done. "
-        "Use this to delegate long, independent tasks. "
-        "Do NOT poll for completion — the result will be sent back automatically."
+        "Use this to delegate long, independent tasks.\n"
+        "Do NOT poll for completion — the result will be sent back automatically.\n\n"
+        "Options:\n"
+        "  task        — required: the full task description\n"
+        "  label       — optional: short name for this run\n"
+        "  model       — override LLM model (e.g. 'gpt-4o', 'claude-opus-4-5')\n"
+        "  thinking    — thinking budget: 'low'|'medium'|'high'|'off' (Anthropic extended thinking)\n"
+        "  sandbox     — 'inherit' (default) or 'strict' (deny exec/browser/write)\n"
+        "  attachments — list of file paths to make available to the sub-agent\n"
+        "  cleanup     — 'keep' (default) or 'delete' session when done"
     ),
     parameters={
         "type": "object",
         "properties": {
-            "task": {
+            "task": {"type": "string", "description": "Full task description for the sub-agent"},
+            "label": {"type": "string", "description": "Short human-readable name (optional)"},
+            "model": {"type": "string", "description": "Override LLM model (optional)"},
+            "thinking": {
                 "type": "string",
-                "description": "The full task description for the sub-agent",
+                "description": "Extended thinking budget: low|medium|high|off (Anthropic only)",
             },
-            "label": {
+            "sandbox": {
                 "type": "string",
-                "description": "Short human-readable name for this sub-agent run (optional)",
+                "description": "Sandbox mode: inherit (default) | strict (blocks exec/browser/write/delete)",
             },
-            "model": {
+            "attachments": {
+                "type": "array",
+                "description": "File paths to attach as context for the sub-agent",
+                "items": {"type": "string"},
+            },
+            "cleanup": {
                 "type": "string",
-                "description": "Override the LLM model for this sub-agent (optional, defaults to current model)",
+                "description": "What to do with the session when done: keep (default) | delete",
             },
         },
         "required": ["task"],
@@ -58,16 +74,37 @@ async def _sessions_spawn(
     task: str,
     label: str = "",
     model: str | None = None,
-    _session_id: str = "main",  # injected by AgentLoop if available
+    thinking: str | None = None,
+    sandbox: str = "inherit",
+    attachments: list[str] | None = None,
+    cleanup: str = "keep",
+    _session_id: str = "main",
 ) -> str:
     from agent.subagent import get_subagent_manager
     try:
         mgr = get_subagent_manager()
+
+        # Build task with attachments embedded
+        full_task = task
+        if attachments:
+            from pathlib import Path
+            attached_texts = []
+            for fp in attachments:
+                try:
+                    content = Path(fp).expanduser().read_text(encoding="utf-8", errors="replace")
+                    attached_texts.append(f"--- Attachment: {fp} ---\n{content[:5000]}")
+                except Exception as e:
+                    attached_texts.append(f"--- Attachment: {fp} (failed to read: {e}) ---")
+            full_task = task + "\n\n" + "\n\n".join(attached_texts)
+
         result = await mgr.spawn(
-            task=task,
+            task=full_task,
             label=label,
             parent_session_id=_session_id,
             model=model or None,
+            thinking=thinking,
+            sandbox=sandbox,
+            cleanup=cleanup,
         )
         if result["status"] == "accepted":
             return (

@@ -17,8 +17,6 @@ Tools:
 from __future__ import annotations
 
 import logging
-import re
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -35,14 +33,19 @@ MEMORY_SEARCH_TOOL = ToolDefinition(
     name="memory_search",
     description=(
         "Search long-term memory for relevant notes and facts. "
-        "Searches MEMORY.md and all files in workspace/memory/. "
+        "Searches MEMORY.md and all files in workspace/memory/ using FTS or semantic search. "
         "Run this BEFORE answering questions about the user's past preferences, projects, or decisions."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Keywords to search for"},
+            "query": {"type": "string", "description": "Search query (keywords or natural language)"},
             "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
+            "mode": {
+                "type": "string",
+                "description": "Search mode: 'fts' (keyword, default) or 'semantic' (meaning-based, requires MEMORY_SEMANTIC=true)",
+                "default": "fts",
+            },
         },
         "required": ["query"],
     },
@@ -133,113 +136,43 @@ def _get_memory_md_path() -> Path:
 
 
 # ------------------------------------------------------------------
-# FTS index — rebuilt in-memory each query (always fresh)
-# ------------------------------------------------------------------
-
-def _build_fts_index() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        """
-        CREATE VIRTUAL TABLE memories USING fts5(
-            key UNINDEXED,
-            filepath UNINDEXED,
-            content,
-            tokenize='porter ascii'
-        )
-        """
-    )
-    entries: list[tuple[str, str, str]] = []
-
-    # Top-level MEMORY.md
-    memory_md = _get_memory_md_path()
-    if memory_md.exists():
-        content = memory_md.read_text(encoding="utf-8").strip()
-        if content:
-            entries.append(("MEMORY", str(memory_md), content))
-
-    # workspace/memory/*.md
-    memory_dir = _get_memory_dir()
-    for md_file in sorted(memory_dir.glob("*.md")):
-        if md_file.name == "README.md":
-            continue
-        content = md_file.read_text(encoding="utf-8").strip()
-        if content:
-            entries.append((md_file.stem, str(md_file), content))
-
-    if entries:
-        conn.executemany(
-            "INSERT INTO memories(key, filepath, content) VALUES (?, ?, ?)", entries
-        )
-        conn.commit()
-    return conn
-
-
-def _sanitize_fts_query(query: str) -> str:
-    """Make FTS5 query safe by escaping special chars."""
-    # Remove FTS5 special syntax characters that cause parse errors
-    sanitized = re.sub(r'[^a-zA-Z0-9\s\-_\']', ' ', query)
-    return sanitized.strip() or query[:50]
-
-
-# ------------------------------------------------------------------
 # Implementations
 # ------------------------------------------------------------------
 
-async def _memory_search(query: str, limit: int = 5) -> str:
+async def _memory_search(query: str, limit: int = 5, mode: str = "fts") -> str:
     cfg = get_config()
     if not cfg.memory_enabled:
         return "Memory is disabled (MEMORY_ENABLED=false)"
 
     try:
-        conn = _build_fts_index()
-        safe_query = _sanitize_fts_query(query)
-        rows = conn.execute(
-            "SELECT key, content FROM memories WHERE memories MATCH ? ORDER BY rank LIMIT ?",
-            (safe_query, limit),
-        ).fetchall()
-        conn.close()
+        from agent.memory_index import MemoryIndex
 
-        if not rows:
+        memory_dir = _get_memory_dir()
+        memory_md = _get_memory_md_path()
+        idx = MemoryIndex(memory_dir=memory_dir, memory_md=memory_md)
+
+        # Use semantic mode if requested and available
+        use_semantic = (
+            mode == "semantic"
+            and getattr(cfg, "memory_semantic", False)
+            and cfg.openai_api_key
+        )
+
+        results = idx.search(query, limit=limit, semantic=use_semantic, api_key=cfg.openai_api_key)
+
+        if not results:
             return f"No memory entries matched '{query}'."
 
-        results = []
-        for key, content in rows:
-            preview = content[:800] + ("…" if len(content) > 800 else "")
-            results.append(f"### [{key}]\n{preview}")
-        return "\n\n---\n\n".join(results)
-    except sqlite3.OperationalError as e:
-        # FTS query syntax error — fall back to substring search
-        logger.warning("FTS query failed (%s), falling back to substring search", e)
-        return await _memory_search_fallback(query, limit)
+        mode_label = f" (mode: {results[0].source})" if results else ""
+        formatted = []
+        for r in results:
+            formatted.append(f"### [{r.key}]{mode_label}\n{r.snippet}")
+        return "\n\n---\n\n".join(formatted)
+
     except Exception as e:
         logger.exception("memory_search failed")
         return f"Error searching memory: {e}"
 
-
-async def _memory_search_fallback(query: str, limit: int) -> str:
-    """Simple case-insensitive substring search as FTS fallback."""
-    query_lower = query.lower()
-    results = []
-
-    memory_md = _get_memory_md_path()
-    if memory_md.exists():
-        content = memory_md.read_text(encoding="utf-8")
-        if query_lower in content.lower():
-            results.append(("MEMORY", content[:800]))
-
-    memory_dir = _get_memory_dir()
-    for md_file in sorted(memory_dir.glob("*.md")):
-        if md_file.name == "README.md":
-            continue
-        content = md_file.read_text(encoding="utf-8")
-        if query_lower in content.lower():
-            results.append((md_file.stem, content[:800]))
-        if len(results) >= limit:
-            break
-
-    if not results:
-        return f"No memory entries matched '{query}'."
-    return "\n\n---\n\n".join(f"### [{k}]\n{v}" for k, v in results)
 
 
 async def _memory_get(key: str) -> str:

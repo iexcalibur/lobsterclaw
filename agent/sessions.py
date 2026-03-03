@@ -258,6 +258,16 @@ class SessionStore:
 # Helpers
 # ------------------------------------------------------------------
 
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a session and all its messages."""
+        async with self._lock:
+            conn = self._connect()
+            conn.execute("DELETE FROM session_messages WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            conn.commit()
+            conn.close()
+
+
 def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 

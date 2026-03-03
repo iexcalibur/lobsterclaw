@@ -1,21 +1,24 @@
 """
 Browser tool — Playwright-powered web browser automation.
-Mirrors OpenClaw's browser tool core actions.
+Full parity with OpenClaw's browser-tool.ts action surface.
 
-Actions:
-  navigate   — load a URL
-  click      — click an element
-  fill       — fill an input field
-  type       — type text character-by-character
-  press      — press a keyboard key
-  hover      — hover over an element
-  select     — select a dropdown option
-  screenshot — capture screenshot and send as Telegram photo
-  snapshot   — return page text structure (for reading content)
-  eval       — run JavaScript and return the result
-  scroll     — scroll the page
-  close      — close the browser
-  status     — check if browser is running
+Actions (matching OpenClaw):
+  status     — check if browser is running, show open tabs
+  start      — start the browser (explicit; auto-start also works)
+  stop       — close browser and all pages
+  profiles   — list chromium user-data profiles
+  tabs       — list open tabs (id, url, title)
+  open       — open a new tab (optionally with URL)
+  focus      — bring a tab into focus by tab_id
+  close      — close a specific tab or the whole browser
+  navigate   — navigate current/specified tab to a URL
+  snapshot   — structured readable content (headings, links, buttons, inputs)
+  screenshot — take screenshot and send as Telegram photo
+  console    — run JS and return the console log output
+  pdf        — save page as PDF and send as Telegram document
+  upload     — upload a local file via a file input selector
+  dialog     — handle/dismiss a browser dialog (alert/confirm/prompt)
+  act        — compound actions: click/type/press/hover/drag/select/fill/resize/wait/evaluate/scroll
 """
 
 from __future__ import annotations
@@ -24,19 +27,32 @@ import base64
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
+from typing import Any
 
 from config import get_config
 from tools.registry import ToolDefinition
 
 logger = logging.getLogger(__name__)
 
-# Module-level browser state (single global instance)
+# ------------------------------------------------------------------
+# Global browser state — single instance, multi-tab via pages dict
+# ------------------------------------------------------------------
+
+@dataclass
+class TabInfo:
+    tab_id: int
+    page: Any  # playwright Page
+
+
 _playwright_instance = None
 _browser_instance = None
-_page = None
+_tabs: dict[int, TabInfo] = {}
+_active_tab_id: int | None = None
+_tab_counter = 0
 
-# Injected by main.py to send screenshots as photos
 _send_photo_fn = None
+_send_document_fn = None
 
 
 def set_send_photo_fn(fn) -> None:
@@ -44,43 +60,55 @@ def set_send_photo_fn(fn) -> None:
     _send_photo_fn = fn
 
 
+def set_send_document_fn(fn) -> None:
+    global _send_document_fn
+    _send_document_fn = fn
+
+
+# ------------------------------------------------------------------
+# Tool definition
+# ------------------------------------------------------------------
+
 TOOL_DEFINITION = ToolDefinition(
     name="browser",
     description=(
-        "Control a web browser (Playwright/Chromium). "
-        "Requires BROWSER_ENABLED=true in .env.\n"
+        "Control a web browser (Playwright/Chromium). Requires BROWSER_ENABLED=true.\n\n"
         "Actions:\n"
-        "  navigate   — go to a URL\n"
-        "  click      — click an element (use CSS selector)\n"
-        "  fill       — clear and fill an input\n"
-        "  type       — type text into focused element\n"
-        "  press      — press a key (e.g. 'Enter', 'Tab')\n"
-        "  hover      — hover over an element\n"
-        "  select     — choose a dropdown option by value\n"
-        "  screenshot — take a screenshot and send as Telegram photo\n"
-        "  snapshot   — get readable page text/structure\n"
-        "  eval       — run JavaScript, return result\n"
-        "  scroll     — scroll up/down\n"
-        "  close      — close the browser\n"
-        "  status     — check if browser is open"
+        "  status     — check browser status and list tabs\n"
+        "  start      — start the browser\n"
+        "  stop       — close the browser\n"
+        "  profiles   — list available browser profiles\n"
+        "  tabs       — list all open tabs\n"
+        "  open       — open a new tab (optionally navigate to url)\n"
+        "  focus      — focus a tab by tab_id\n"
+        "  close      — close a tab (tab_id) or browser (no tab_id)\n"
+        "  navigate   — go to a URL in current tab\n"
+        "  snapshot   — get structured page content (headings/links/inputs/buttons)\n"
+        "  screenshot — capture screenshot and send as Telegram photo\n"
+        "  console    — evaluate JS and capture console output\n"
+        "  pdf        — render page as PDF and send as Telegram document\n"
+        "  upload     — upload a local file to a file input\n"
+        "  dialog     — handle a browser dialog (alert/confirm/prompt)\n"
+        "  act        — sub-actions: click|type|press|hover|select|fill|scroll|wait|evaluate|drag"
     ),
     parameters={
         "type": "object",
         "properties": {
-            "action": {"type": "string", "description": "Browser action to perform"},
-            "url": {"type": "string", "description": "URL to navigate to"},
+            "action": {"type": "string", "description": "Browser action"},
+            "url": {"type": "string", "description": "URL (for navigate, open)"},
+            "tab_id": {"type": "integer", "description": "Tab ID (for focus, close, or target-specific actions)"},
             "selector": {"type": "string", "description": "CSS selector for target element"},
             "value": {"type": "string", "description": "Value to fill/type/select"},
-            "key": {"type": "string", "description": "Keyboard key to press (e.g. Enter)"},
+            "key": {"type": "string", "description": "Keyboard key (for press; e.g. Enter, Tab, Escape)"},
             "script": {"type": "string", "description": "JavaScript to evaluate"},
-            "direction": {
-                "type": "string",
-                "description": "Scroll direction: up or down (default: down)",
-            },
-            "amount": {
-                "type": "integer",
-                "description": "Pixels to scroll (default 500)",
-            },
+            "file_path": {"type": "string", "description": "Local file path (for upload)"},
+            "direction": {"type": "string", "description": "Scroll direction: up|down|left|right (default: down)"},
+            "amount": {"type": "integer", "description": "Scroll pixels (default 500)"},
+            "sub_action": {"type": "string", "description": "act sub-action: click|type|press|hover|select|fill|scroll|wait|evaluate|drag"},
+            "dialog_action": {"type": "string", "description": "Dialog action: accept|dismiss (default: accept)"},
+            "prompt_text": {"type": "string", "description": "Text to enter in a prompt dialog"},
+            "wait_ms": {"type": "integer", "description": "Milliseconds to wait (for sub_action=wait)"},
+            "timeout": {"type": "integer", "description": "Action timeout in milliseconds (default 10000)"},
         },
         "required": ["action"],
     },
@@ -88,17 +116,28 @@ TOOL_DEFINITION = ToolDefinition(
 )
 
 
+# ------------------------------------------------------------------
+# Main dispatcher
+# ------------------------------------------------------------------
+
 async def _browser(
     action: str,
     url: str | None = None,
+    tab_id: int | None = None,
     selector: str | None = None,
     value: str | None = None,
     key: str | None = None,
     script: str | None = None,
+    file_path: str | None = None,
     direction: str = "down",
     amount: int = 500,
+    sub_action: str | None = None,
+    dialog_action: str = "accept",
+    prompt_text: str | None = None,
+    wait_ms: int = 1000,
+    timeout: int = 10_000,
 ) -> str:
-    global _playwright_instance, _browser_instance, _page
+    global _playwright_instance, _browser_instance, _tabs, _active_tab_id
 
     cfg = get_config()
     if not cfg.browser_enabled:
@@ -106,106 +145,160 @@ async def _browser(
 
     action = action.lower().strip()
 
-    if action == "status":
-        if _page and _browser_instance and _browser_instance.is_connected():
-            try:
-                current_url = _page.url
-                return f"Browser open ✅ — current URL: {current_url}"
-            except Exception:
-                return "Browser open ✅"
-        return "Browser not running. Use action=navigate to start."
+    # ------------------------------------------------------------------
+    # Actions that don't require the browser to be open
+    # ------------------------------------------------------------------
 
-    # Auto-start browser if needed (except for close/status)
-    if action not in ("close", "status"):
-        if _page is None or _browser_instance is None or not _browser_instance.is_connected():
+    if action == "status":
+        if not _browser_instance or not _browser_instance.is_connected():
+            return "Browser not running. Use action=start or action=navigate to open it."
+        tab_list = _format_tab_list()
+        return f"Browser running ✅\n{tab_list}"
+
+    if action == "profiles":
+        import shutil
+        from pathlib import Path
+        chromium_data = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+        if not chromium_data.exists():
+            return "No Chrome user data found at default path."
+        profiles = [d.name for d in chromium_data.iterdir() if d.is_dir() and d.name.startswith("Profile")]
+        default = ["Default"] if (chromium_data / "Default").exists() else []
+        all_profiles = default + profiles
+        return "Profiles:\n" + "\n".join(f"  {p}" for p in all_profiles) if all_profiles else "No profiles found."
+
+    # ------------------------------------------------------------------
+    # Start / stop
+    # ------------------------------------------------------------------
+
+    if action == "start":
+        if _browser_instance and _browser_instance.is_connected():
+            return "Browser is already running."
+        try:
+            await _start_browser(cfg.browser_headless)
+            return "Browser started ✅"
+        except Exception as e:
+            return f"Error starting browser: {e}"
+
+    if action == "stop":
+        await _close_all()
+        return "Browser stopped ✅"
+
+    # ------------------------------------------------------------------
+    # Auto-start for most actions
+    # ------------------------------------------------------------------
+
+    if not _browser_instance or not _browser_instance.is_connected():
+        try:
+            await _start_browser(cfg.browser_headless)
+        except Exception as e:
+            return f"Error starting browser: {e}"
+
+    # ------------------------------------------------------------------
+    # Tab management
+    # ------------------------------------------------------------------
+
+    if action == "tabs":
+        return _format_tab_list() or "No tabs open."
+
+    if action == "open":
+        tab = await _new_tab()
+        if url:
             try:
-                await _start_browser(cfg.browser_headless)
+                await tab.page.goto(url, timeout=30_000, wait_until="domcontentloaded")
             except Exception as e:
-                return f"Error starting browser: {e}"
+                return f"Tab {tab.tab_id} opened but navigation failed: {e}"
+        return f"Tab {tab.tab_id} opened ✅" + (f" — {url}" if url else "")
+
+    if action == "focus":
+        if tab_id is None:
+            return "Error: 'tab_id' is required for focus action"
+        t = _tabs.get(tab_id)
+        if not t:
+            return f"No tab with id {tab_id}"
+        await t.page.bring_to_front()
+        _active_tab_id = tab_id
+        return f"Tab {tab_id} focused ✅"
+
+    if action == "close":
+        if tab_id is not None:
+            t = _tabs.pop(tab_id, None)
+            if not t:
+                return f"No tab with id {tab_id}"
+            try:
+                await t.page.close()
+            except Exception:
+                pass
+            if _active_tab_id == tab_id:
+                _active_tab_id = next(iter(_tabs), None)
+            return f"Tab {tab_id} closed ✅"
+        else:
+            await _close_all()
+            return "Browser closed ✅"
+
+    # ------------------------------------------------------------------
+    # Get active page (auto-create if needed)
+    # ------------------------------------------------------------------
+
+    page = await _get_page(tab_id)
+    if page is None:
+        return "Error: no active tab. Use action=open first."
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
 
     if action == "navigate":
         if not url:
             return "Error: 'url' is required for navigate action"
         try:
-            await _page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-            title = await _page.title()
-            return f"Navigated to: {url}\nPage title: {title}"
+            await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+            title = await page.title()
+            return f"Navigated to: {url}\nTitle: {title}"
         except Exception as e:
             return f"Navigation error: {e}"
 
-    if action == "click":
-        if not selector:
-            return "Error: 'selector' is required for click action"
-        try:
-            await _page.click(selector, timeout=10_000)
-            return f"Clicked: {selector}"
-        except Exception as e:
-            return f"Click error on '{selector}': {e}"
+    # ------------------------------------------------------------------
+    # Content reading
+    # ------------------------------------------------------------------
 
-    if action == "fill":
-        if not selector:
-            return "Error: 'selector' is required for fill action"
-        if value is None:
-            return "Error: 'value' is required for fill action"
+    if action == "snapshot":
         try:
-            await _page.fill(selector, value, timeout=10_000)
-            return f"Filled '{selector}' with value"
+            content = await page.evaluate("""() => {
+                const els = document.querySelectorAll('h1,h2,h3,h4,p,a,li,td,th,label,button,input,select,textarea,[role="button"],[role="link"]');
+                return Array.from(els).map(el => {
+                    const tag = el.tagName.toLowerCase();
+                    const text = (el.innerText || el.placeholder || el.value || el.getAttribute('aria-label') || '').trim();
+                    if (!text) return null;
+                    const href = el.href || '';
+                    const type = el.type || '';
+                    const name = el.name || el.id || '';
+                    let desc = `[${tag}`;
+                    if (name) desc += `#${name}`;
+                    if (type) desc += ` type=${type}`;
+                    desc += `] ${text.slice(0, 200)}`;
+                    if (href && !href.startsWith('javascript')) desc += ` (${href})`;
+                    return desc;
+                }).filter(Boolean).join('\\n');
+            }""")
+            tab_url = page.url
+            title = await page.title()
+            header = f"Page: {title}\nURL: {tab_url}\n\n"
+            body = content[:8000] if content else "(no readable content found)"
+            return header + body
         except Exception as e:
-            return f"Fill error on '{selector}': {e}"
-
-    if action == "type":
-        if value is None:
-            return "Error: 'value' is required for type action"
-        try:
-            await _page.keyboard.type(value)
-            return f"Typed text"
-        except Exception as e:
-            return f"Type error: {e}"
-
-    if action == "press":
-        if not key:
-            return "Error: 'key' is required for press action"
-        try:
-            await _page.keyboard.press(key)
-            return f"Pressed key: {key}"
-        except Exception as e:
-            return f"Press error: {e}"
-
-    if action == "hover":
-        if not selector:
-            return "Error: 'selector' is required for hover action"
-        try:
-            await _page.hover(selector, timeout=10_000)
-            return f"Hovered over: {selector}"
-        except Exception as e:
-            return f"Hover error on '{selector}': {e}"
-
-    if action == "select":
-        if not selector:
-            return "Error: 'selector' is required for select action"
-        if value is None:
-            return "Error: 'value' is required for select action"
-        try:
-            await _page.select_option(selector, value, timeout=10_000)
-            return f"Selected '{value}' in '{selector}'"
-        except Exception as e:
-            return f"Select error on '{selector}': {e}"
+            return f"Snapshot error: {e}"
 
     if action == "screenshot":
         tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(suffix=".png")
             os.close(fd)
-            await _page.screenshot(path=tmp_path, full_page=False)
-            # Send as Telegram photo if send_photo_fn is wired
+            await page.screenshot(path=tmp_path, full_page=False)
             if _send_photo_fn:
-                await _send_photo_fn(tmp_path, caption="Screenshot")
-                return "Screenshot taken and sent as photo ✅"
-            else:
-                # Return a description instead of useless base64
-                title = await _page.title()
-                current_url = _page.url
-                return f"Screenshot taken (Telegram photo send not configured).\nPage: {title} — {current_url}"
+                title = await page.title()
+                await _send_photo_fn(tmp_path, caption=f"Screenshot: {title}")
+                return f"Screenshot sent ✅ (page: {title})"
+            return f"Screenshot saved to {tmp_path} (send_photo not configured)"
         except Exception as e:
             return f"Screenshot error: {e}"
         finally:
@@ -215,68 +308,264 @@ async def _browser(
                 except OSError:
                     pass
 
-    if action == "snapshot":
+    if action == "pdf":
+        tmp_path = None
         try:
-            # Get structured text content (headings, links, paragraphs)
-            content = await _page.evaluate("""() => {
-                const elements = document.querySelectorAll('h1,h2,h3,p,a,li,td,th,label,button,input[placeholder]');
-                return Array.from(elements).map(el => {
-                    const tag = el.tagName.toLowerCase();
-                    const text = el.innerText || el.placeholder || el.value || '';
-                    if (!text.trim()) return null;
-                    const href = el.href || '';
-                    return href ? `[${tag}] ${text.trim()} (${href})` : `[${tag}] ${text.trim()}`;
-                }).filter(Boolean).join('\\n');
-            }""")
-            url_now = _page.url
-            title = await _page.title()
-            header = f"Page: {title}\nURL: {url_now}\n\n"
-            return header + (content[:6000] if content else "(no readable content found)")
+            fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            await page.pdf(path=tmp_path)
+            if _send_document_fn:
+                title = await page.title()
+                await _send_document_fn(tmp_path, caption=f"PDF: {title}")
+                return f"PDF sent ✅"
+            return f"PDF saved to {tmp_path} (send_document not configured)"
         except Exception as e:
-            return f"Snapshot error: {e}"
+            return f"PDF error: {e}"
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
-    if action == "eval":
+    if action == "console":
         if not script:
-            return "Error: 'script' is required for eval action"
-        try:
-            result = await _page.evaluate(script)
-            return f"Result: {result}"
-        except Exception as e:
-            return f"Eval error: {e}"
+            return "Error: 'script' is required for console action"
+        logs: list[str] = []
 
-    if action == "scroll":
-        try:
-            px = amount if direction != "up" else -amount
-            await _page.evaluate(f"window.scrollBy(0, {px})")
-            return f"Scrolled {'down' if px > 0 else 'up'} {abs(px)}px"
-        except Exception as e:
-            return f"Scroll error: {e}"
+        def _on_console(msg):
+            logs.append(f"[{msg.type}] {msg.text}")
 
-    if action == "close":
-        await _close_browser()
-        return "Browser closed ✅"
+        page.on("console", _on_console)
+        try:
+            result = await page.evaluate(script)
+            return f"Result: {result}\nConsole:\n" + "\n".join(logs[-20:]) if logs else f"Result: {result}"
+        except Exception as e:
+            return f"Console eval error: {e}\nConsole:\n" + "\n".join(logs[-20:])
+        finally:
+            page.remove_listener("console", _on_console)
+
+    # ------------------------------------------------------------------
+    # Interactions
+    # ------------------------------------------------------------------
+
+    if action == "upload":
+        if not selector:
+            return "Error: 'selector' is required for upload action"
+        if not file_path:
+            return "Error: 'file_path' is required for upload action"
+        from pathlib import Path
+        fp = Path(file_path).expanduser()
+        if not fp.exists():
+            return f"Error: file not found: {file_path}"
+        try:
+            await page.set_input_files(selector, str(fp), timeout=timeout)
+            return f"File uploaded to '{selector}' ✅"
+        except Exception as e:
+            return f"Upload error: {e}"
+
+    if action == "dialog":
+        # Pre-register the dialog handler before the triggering action
+        import asyncio as _asyncio
+
+        async def _handle_dialog(dialog):
+            if dialog_action == "dismiss":
+                await dialog.dismiss()
+            else:
+                if prompt_text:
+                    await dialog.accept(prompt_text)
+                else:
+                    await dialog.accept()
+
+        page.on("dialog", _handle_dialog)
+        return f"Dialog handler registered (action={dialog_action}). Trigger the action that opens the dialog."
+
+    # ------------------------------------------------------------------
+    # act sub-actions
+    # ------------------------------------------------------------------
+
+    if action == "act":
+        if not sub_action:
+            return "Error: 'sub_action' is required for act action"
+        return await _act(page, sub_action, selector, value, key, script, direction, amount, wait_ms, timeout)
+
+    # Convenience aliases (direct action names map to act sub-actions)
+    if action in ("click", "fill", "type", "press", "hover", "select", "scroll", "wait", "evaluate", "drag"):
+        return await _act(page, action, selector, value, key, script, direction, amount, wait_ms, timeout)
 
     return (
         f"Unknown browser action '{action}'. "
-        "Use: navigate, click, fill, type, press, hover, select, screenshot, snapshot, eval, scroll, close, status"
+        "Use: status, start, stop, profiles, tabs, open, focus, close, navigate, snapshot, screenshot, console, pdf, upload, dialog, act"
     )
 
 
+# ------------------------------------------------------------------
+# Act sub-dispatcher
+# ------------------------------------------------------------------
+
+async def _act(
+    page, sub_action: str,
+    selector: str | None, value: str | None, key: str | None,
+    script: str | None, direction: str, amount: int, wait_ms: int, timeout: int,
+) -> str:
+    sub_action = sub_action.lower().strip()
+
+    if sub_action == "click":
+        if not selector:
+            return "Error: 'selector' required for click"
+        try:
+            await page.click(selector, timeout=timeout)
+            return f"Clicked: {selector}"
+        except Exception as e:
+            return f"Click error on '{selector}': {e}"
+
+    if sub_action == "fill":
+        if not selector:
+            return "Error: 'selector' required for fill"
+        if value is None:
+            return "Error: 'value' required for fill"
+        try:
+            await page.fill(selector, value, timeout=timeout)
+            return f"Filled '{selector}'"
+        except Exception as e:
+            return f"Fill error: {e}"
+
+    if sub_action == "type":
+        if value is None:
+            return "Error: 'value' required for type"
+        try:
+            await page.keyboard.type(value, delay=20)
+            return "Typed text"
+        except Exception as e:
+            return f"Type error: {e}"
+
+    if sub_action == "press":
+        if not key:
+            return "Error: 'key' required for press"
+        try:
+            await page.keyboard.press(key)
+            return f"Pressed: {key}"
+        except Exception as e:
+            return f"Press error: {e}"
+
+    if sub_action == "hover":
+        if not selector:
+            return "Error: 'selector' required for hover"
+        try:
+            await page.hover(selector, timeout=timeout)
+            return f"Hovered: {selector}"
+        except Exception as e:
+            return f"Hover error: {e}"
+
+    if sub_action == "select":
+        if not selector:
+            return "Error: 'selector' required for select"
+        if value is None:
+            return "Error: 'value' required for select"
+        try:
+            await page.select_option(selector, value, timeout=timeout)
+            return f"Selected '{value}' in '{selector}'"
+        except Exception as e:
+            return f"Select error: {e}"
+
+    if sub_action == "scroll":
+        try:
+            scroll_map = {"down": (0, amount), "up": (0, -amount), "right": (amount, 0), "left": (-amount, 0)}
+            dx, dy = scroll_map.get(direction.lower(), (0, amount))
+            await page.evaluate(f"window.scrollBy({dx}, {dy})")
+            return f"Scrolled {direction} {abs(dx or dy)}px"
+        except Exception as e:
+            return f"Scroll error: {e}"
+
+    if sub_action == "wait":
+        import asyncio
+        await asyncio.sleep(wait_ms / 1000)
+        return f"Waited {wait_ms}ms"
+
+    if sub_action == "evaluate":
+        if not script:
+            return "Error: 'script' required for evaluate"
+        try:
+            result = await page.evaluate(script)
+            return f"Result: {result}"
+        except Exception as e:
+            return f"Evaluate error: {e}"
+
+    if sub_action == "drag":
+        if not selector or not value:
+            return "Error: 'selector' (source) and 'value' (target selector) required for drag"
+        try:
+            src = await page.query_selector(selector)
+            dst = await page.query_selector(value)
+            if not src or not dst:
+                return f"Drag error: selector not found"
+            src_box = await src.bounding_box()
+            dst_box = await dst.bounding_box()
+            if not src_box or not dst_box:
+                return "Drag error: could not get element bounding boxes"
+            await page.mouse.move(src_box["x"] + src_box["width"] / 2, src_box["y"] + src_box["height"] / 2)
+            await page.mouse.down()
+            await page.mouse.move(dst_box["x"] + dst_box["width"] / 2, dst_box["y"] + dst_box["height"] / 2)
+            await page.mouse.up()
+            return f"Dragged from '{selector}' to '{value}'"
+        except Exception as e:
+            return f"Drag error: {e}"
+
+    return f"Unknown act sub_action '{sub_action}'. Use: click, fill, type, press, hover, select, scroll, wait, evaluate, drag"
+
+
+# ------------------------------------------------------------------
+# Browser lifecycle helpers
+# ------------------------------------------------------------------
+
 async def _start_browser(headless: bool = True) -> None:
-    global _playwright_instance, _browser_instance, _page
+    global _playwright_instance, _browser_instance, _tabs, _active_tab_id, _tab_counter
     from playwright.async_api import async_playwright
 
     _playwright_instance = await async_playwright().start()
     _browser_instance = await _playwright_instance.chromium.launch(headless=headless)
-    _page = await _browser_instance.new_page()
+    # Create initial tab
+    _tabs = {}
+    _tab_counter = 0
+    page = await _browser_instance.new_page()
+    _tab_counter += 1
+    tab = TabInfo(tab_id=_tab_counter, page=page)
+    _tabs[_tab_counter] = tab
+    _active_tab_id = _tab_counter
     logger.info("Browser started (headless=%s)", headless)
 
 
-async def _close_browser() -> None:
-    global _playwright_instance, _browser_instance, _page
+async def _new_tab() -> TabInfo:
+    global _tab_counter, _active_tab_id
+    page = await _browser_instance.new_page()
+    _tab_counter += 1
+    tab = TabInfo(tab_id=_tab_counter, page=page)
+    _tabs[_tab_counter] = tab
+    _active_tab_id = _tab_counter
+    return tab
+
+
+async def _get_page(tab_id: int | None = None):
+    if tab_id is not None:
+        t = _tabs.get(tab_id)
+        return t.page if t else None
+    if _active_tab_id and _active_tab_id in _tabs:
+        return _tabs[_active_tab_id].page
+    if _tabs:
+        return next(iter(_tabs.values())).page
+    # No tab — create one
+    tab = await _new_tab()
+    return tab.page
+
+
+async def _close_all() -> None:
+    global _playwright_instance, _browser_instance, _tabs, _active_tab_id
     try:
-        if _page:
-            await _page.close()
+        for t in list(_tabs.values()):
+            try:
+                await t.page.close()
+            except Exception:
+                pass
         if _browser_instance:
             await _browser_instance.close()
         if _playwright_instance:
@@ -284,6 +573,21 @@ async def _close_browser() -> None:
     except Exception as e:
         logger.debug("Browser close error: %s", e)
     finally:
-        _page = None
+        _tabs = {}
+        _active_tab_id = None
         _browser_instance = None
         _playwright_instance = None
+
+
+def _format_tab_list() -> str:
+    if not _tabs:
+        return "(no tabs)"
+    lines = []
+    for tid, t in _tabs.items():
+        active_marker = " [active]" if tid == _active_tab_id else ""
+        try:
+            tab_url = t.page.url
+        except Exception:
+            tab_url = "?"
+        lines.append(f"  Tab {tid}{active_marker}: {tab_url}")
+    return "\n".join(lines)

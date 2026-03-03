@@ -41,7 +41,7 @@ TOOL_DEFINITION = ToolDefinition(
         "properties": {
             "action": {
                 "type": "string",
-                "description": "Action: status | list | add | update | remove | run | enable | disable | wake",
+                "description": "Action: status | list | add | update | remove | run | runs | enable | disable | wake",
             },
             "job_id": {
                 "type": "string",
@@ -119,6 +119,11 @@ async def _cron(
             return "Error: provide at least one of schedule, message, or description to update"
         return await _manager.update_job(job_id, patch)
 
+    if action == "runs":
+        if not job_id:
+            return "Error: 'job_id' is required for runs action"
+        return _manager.get_run_history(job_id)
+
     if action == "remove":
         if not job_id:
             return "Error: 'job_id' is required for remove action"
@@ -142,4 +147,4 @@ async def _cron(
     if action == "wake":
         return await _manager.wake(wake_text or "")
 
-    return f"Unknown action '{action}'. Use: status, list, add, update, remove, run, enable, disable, wake"
+    return f"Unknown action '{action}'. Use: status, list, add, update, remove, run, runs, enable, disable, wake"

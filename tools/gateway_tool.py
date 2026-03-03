@@ -29,18 +29,21 @@ TOOL_DEFINITION = ToolDefinition(
     description=(
         "Control the PyGate process itself.\n"
         "Actions:\n"
-        "  status      — show uptime and process info\n"
-        "  restart     — restart the bot process\n"
-        "  config.get  — view current configuration (sensitive values redacted)\n"
-        "  config.set  — set a config value in .env (key=value format, requires restart)\n"
-        "  update.run  — git pull latest code and restart"
+        "  status         — show uptime and process info\n"
+        "  restart        — restart the bot process\n"
+        "  config.get     — view current configuration (sensitive values redacted)\n"
+        "  config.schema  — show all available config keys and their types\n"
+        "  config.set     — set a single config value in .env (key + value, requires restart)\n"
+        "  config.apply   — replace .env entirely with the provided raw content\n"
+        "  config.patch   — merge-patch .env with key=value pairs (partial update)\n"
+        "  update.run     — git pull latest code and restart"
     ),
     parameters={
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "description": "Action: status | restart | config.get | config.set | update.run",
+                "description": "Action: status | restart | config.get | config.schema | config.set | config.apply | config.patch | update.run",
             },
             "key": {
                 "type": "string",
@@ -50,6 +53,10 @@ TOOL_DEFINITION = ToolDefinition(
                 "type": "string",
                 "description": "Config value to set (for config.set action)",
             },
+            "raw": {
+                "type": "string",
+                "description": "Raw .env file content (for config.apply) or KEY=VALUE lines to merge (for config.patch)",
+            },
         },
         "required": ["action"],
     },
@@ -57,7 +64,12 @@ TOOL_DEFINITION = ToolDefinition(
 )
 
 
-async def _gateway(action: str, key: str | None = None, value: str | None = None) -> str:
+async def _gateway(
+    action: str,
+    key: str | None = None,
+    value: str | None = None,
+    raw: str | None = None,
+) -> str:
     action = action.lower().strip()
 
     if action == "status":
@@ -79,6 +91,16 @@ async def _gateway(action: str, key: str | None = None, value: str | None = None
         loop = asyncio.get_running_loop()
         loop.call_later(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM))
         return "PyGate restart scheduled in 1 second... ✅"
+
+    if action == "config.schema":
+        import dataclasses
+        from config import Config
+        lines = ["PyGate configuration schema (.env keys):"]
+        for f in dataclasses.fields(Config):
+            env_key = f.name.upper()
+            type_name = str(f.type) if isinstance(f.type, str) else type(f.default).__name__
+            lines.append(f"  {env_key}: {type_name}")
+        return "\n".join(lines)
 
     if action == "config.get":
         from config import get_config
@@ -114,6 +136,46 @@ async def _gateway(action: str, key: str | None = None, value: str | None = None
         env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         return f"Config updated: {key}={value}\nRestart required to apply (use gateway restart)."
 
+    if action == "config.apply":
+        if not raw:
+            return "Error: 'raw' (.env content) is required for config.apply"
+        env_path = Path(".env")
+        # Create backup
+        if env_path.exists():
+            env_path.rename(env_path.with_suffix(".env.bak"))
+        env_path.write_text(raw, encoding="utf-8")
+        return "Config replaced ✅ (.env.bak created). Restart required."
+
+    if action == "config.patch":
+        if not raw:
+            return "Error: 'raw' (KEY=VALUE lines) is required for config.patch"
+        env_path = Path(".env")
+        content = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        lines = content.splitlines()
+        # Parse patch lines
+        patch_pairs: dict[str, str] = {}
+        for line in raw.strip().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                patch_pairs[k.strip()] = v.strip()
+        # Apply patch
+        updated: list[str] = []
+        applied = set()
+        for line in lines:
+            key_part = line.split("=")[0].strip() if "=" in line else ""
+            if key_part in patch_pairs:
+                updated.append(f"{key_part}={patch_pairs[key_part]}")
+                applied.add(key_part)
+            else:
+                updated.append(line)
+        # Append any keys not already present
+        for k, v in patch_pairs.items():
+            if k not in applied:
+                updated.append(f"{k}={v}")
+        env_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+        patched_keys = ", ".join(patch_pairs.keys())
+        return f"Config patched ✅ ({patched_keys}). Restart required."
+
     if action == "update.run":
         import asyncio
         try:
@@ -135,4 +197,4 @@ async def _gateway(action: str, key: str | None = None, value: str | None = None
         except Exception as e:
             return f"Update error: {e}"
 
-    return f"Unknown action '{action}'. Use: status, restart, config.get, config.set, update.run"
+    return f"Unknown action '{action}'. Use: status, restart, config.get, config.schema, config.set, config.apply, config.patch, update.run"

@@ -157,17 +157,20 @@ def main() -> None:
     message_tool.set_telegram_fns(
         send_photo=telegram.send_photo,
         send_document=telegram.send_document,
+        send_sticker=telegram.send_sticker,
         edit=telegram.edit_message,
         delete=telegram.delete_message,
         react=telegram.react_to_message,
         send_buttons=telegram.send_with_buttons,
+        create_forum_topic=telegram.create_forum_topic,
     )
 
     # Audio + TTS
     media_tool.set_send_audio(telegram.send_audio)
 
-    # Browser screenshot → send as Telegram photo
+    # Browser screenshot → Telegram photo; PDF → Telegram document
     browser_tool.set_send_photo_fn(telegram.send_photo)
+    browser_tool.set_send_document_fn(telegram.send_document)
 
     # Cron manager
     cron_tool.set_manager(cron_mgr)
@@ -224,6 +227,19 @@ def main() -> None:
         hb_scheduler.start()
         heartbeat.start(hb_scheduler)
         logger.info("Heartbeat-only scheduler started")
+
+    # ----------------------------------------------------------------
+    # Start Telegram bot (blocking)
+    # ----------------------------------------------------------------
+
+    # ----------------------------------------------------------------
+    # Load plugins and register their tools
+    # ----------------------------------------------------------------
+
+    from tools.plugin_loader import register_plugins
+    plugin_tools = register_plugins(registry)
+    if plugin_tools:
+        logger.info("Loaded plugin tools: %s", ", ".join(plugin_tools))
 
     # ----------------------------------------------------------------
     # Start Telegram bot (blocking)

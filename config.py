@@ -70,7 +70,9 @@ class Config:
     brave_api_key: str = field(default_factory=lambda: _env("BRAVE_API_KEY"))
     perplexity_api_key: str = field(default_factory=lambda: _env("PERPLEXITY_API_KEY"))
     gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY"))
-    web_search_max_results: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 5))
+    grok_api_key: str = field(default_factory=lambda: _env("GROK_API_KEY"))
+    kimi_api_key: str = field(default_factory=lambda: _env("KIMI_API_KEY"))
+    web_search_max_results: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 10))
 
     # Exec
     exec_enabled: bool = field(default_factory=lambda: _env_bool("EXEC_ENABLED", False))
@@ -87,6 +89,9 @@ class Config:
     # Memory
     memory_enabled: bool = field(default_factory=lambda: _env_bool("MEMORY_ENABLED", True))
     memory_dir: str = field(default_factory=lambda: _env("MEMORY_DIR", "~/.pygate/memory"))
+    memory_semantic: bool = field(
+        default_factory=lambda: _env_bool("MEMORY_SEMANTIC", False)
+    )  # Enable OpenAI embedding-based semantic search (requires OPENAI_API_KEY)
 
     # Cron
     cron_enabled: bool = field(default_factory=lambda: _env_bool("CRON_ENABLED", True))

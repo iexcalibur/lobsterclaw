@@ -466,6 +466,13 @@ class TelegramChannel:
         markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
         await self._safe_send(target, text, reply_markup=markup)
 
+    async def send_sticker(self, chat_id: int, file_id: str) -> None:
+        """Send a sticker by file_id."""
+        try:
+            await self._bot.send_sticker(chat_id=chat_id, sticker=file_id)
+        except Exception as e:
+            logger.error("Failed to send sticker: %s", e)
+
     async def create_forum_topic(self, chat_id: int, name: str) -> str:
         """Create a forum topic in a group/supergroup."""
         try:

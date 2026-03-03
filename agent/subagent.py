@@ -79,6 +79,9 @@ class SubagentManager:
         label: str = "",
         parent_session_id: str = "main",
         model: str | None = None,
+        thinking: str | None = None,
+        sandbox: str = "inherit",
+        cleanup: str = "keep",
     ) -> dict:
         """
         Spawn a sub-agent for the given task. Returns immediately with run info.
@@ -134,6 +137,9 @@ class SubagentManager:
             parent_session_id=parent_session_id,
             depth=child_depth,
         )
+        run._cleanup = cleanup
+        run._sandbox = sandbox
+        run._thinking = thinking
         self._registry[run_id] = run
 
         # Launch in background
@@ -177,12 +183,27 @@ class SubagentManager:
             cfg = get_config()
             registry: ToolRegistry = self._agent_loop_factory()
 
-            # Subagent system prompt includes context about its role
+            # Apply sandbox mode — restrict dangerous tools in strict mode
+            sandbox = getattr(run, "_sandbox", "inherit")
+            if sandbox == "strict":
+                STRICT_DENY = {"exec", "process", "browser", "write", "edit", "apply_patch", "delete", "move", "gateway"}
+                registry.cfg.tools_deny = list(set(registry.cfg.tools_deny) | STRICT_DENY)
+
+            # Thinking budget injection
+            thinking = getattr(run, "_thinking", None)
+            thinking_note = ""
+            if thinking and thinking != "off":
+                budget_map = {"low": 1024, "medium": 4096, "high": 10000}
+                budget = budget_map.get(thinking, 0)
+                if budget:
+                    thinking_note = f"\n[Extended thinking enabled: budget={thinking}]"
+
             system = build_system_prompt(cfg, registry.get_names()) + (
                 f"\n\n[Subagent Context] You are a sub-agent (depth {run.depth}/{MAX_SESSION_DEPTH}) "
                 f"spawned by the main session to complete a specific task. "
                 f"Complete the task and return a clear, concise result. "
                 f"Do not ask follow-up questions — complete the task autonomously."
+                f"{thinking_note}"
             )
 
             messages = [{"role": "user", "content": f"[Subagent Task]: {run.task}"}]
@@ -196,6 +217,11 @@ class SubagentManager:
             await store.update_session_status(session.id, "completed")
             await store.append_message(session.id, "user", run.task)
             await store.append_message(session.id, "assistant", result)
+
+            # Cleanup if requested
+            if getattr(run, "_cleanup", "keep") == "delete":
+                await store.delete_session(session.id)
+                logger.debug("Sub-agent session %s deleted (cleanup=delete)", session.id)
 
             logger.info("Sub-agent run_id=%s completed", run.run_id)
 

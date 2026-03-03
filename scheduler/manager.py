@@ -76,6 +76,16 @@ class CronManager:
                 last_run    TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS job_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                fired_at    TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                error       TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_job ON job_runs(job_id, fired_at DESC)")
         conn.commit()
         conn.close()
 
@@ -136,15 +146,17 @@ class CronManager:
     async def _fire(self, job_id: str, message: str) -> None:
         logger.info("Firing cron job: %s", job_id)
         conn = sqlite3.connect(str(self.cfg.cron_db))
+        fired_at = datetime.now().isoformat(timespec="seconds")
         conn.execute(
             "UPDATE jobs SET run_count=run_count+1, last_run=? WHERE id=?",
-            (datetime.now().isoformat(timespec="seconds"), job_id),
+            (fired_at, job_id),
         )
         conn.commit()
         conn.close()
 
         if not self._send_fn:
             logger.warning("No send_fn — cannot deliver cron job %s", job_id)
+            self._record_run(job_id, fired_at, "skipped", "No send_fn")
             return
 
         try:
@@ -153,8 +165,10 @@ class CronManager:
                 await self._send_fn(reply)
             else:
                 await self._send_fn(f"⏰ *Reminder*\n\n{message}")
+            self._record_run(job_id, fired_at, "ok")
         except Exception as e:
             logger.error("Cron job %s fire failed: %s", job_id, e)
+            self._record_run(job_id, fired_at, "error", str(e))
 
     # ------------------------------------------------------------------
     # Public API
@@ -308,6 +322,49 @@ class CronManager:
             return "Wake triggered ✅"
         except Exception as e:
             return f"Wake failed: {e}"
+
+    def _record_run(self, job_id: str, fired_at: str, status: str, error: str | None = None) -> None:
+        try:
+            conn = sqlite3.connect(str(self.cfg.cron_db))
+            conn.execute(
+                "INSERT INTO job_runs(job_id, fired_at, status, error) VALUES (?,?,?,?)",
+                (job_id, fired_at, status, error),
+            )
+            # Keep only last 100 runs per job
+            conn.execute(
+                """DELETE FROM job_runs WHERE id IN (
+                    SELECT id FROM job_runs WHERE job_id=?
+                    ORDER BY fired_at DESC LIMIT -1 OFFSET 100
+                )""",
+                (job_id,),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.debug("Failed to record run: %s", e)
+
+    def get_run_history(self, job_id: str, limit: int = 20) -> str:
+        conn = sqlite3.connect(str(self.cfg.cron_db))
+        # Verify job exists
+        row = conn.execute("SELECT description FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            conn.close()
+            return f"No job found with ID `{job_id}`"
+        runs = conn.execute(
+            "SELECT fired_at, status, error FROM job_runs WHERE job_id=? ORDER BY fired_at DESC LIMIT ?",
+            (job_id, limit),
+        ).fetchall()
+        conn.close()
+
+        if not runs:
+            return f"No run history for job `{job_id}` yet."
+
+        lines = [f"Run history for `{job_id}` ({row[0]}):"]
+        for fired_at, status, error in runs:
+            icon = "✅" if status == "ok" else ("⚠️" if status == "skipped" else "❌")
+            err_str = f" — {error}" if error else ""
+            lines.append(f"  {icon} {fired_at}{err_str}")
+        return "\n".join(lines)
 
     def status(self) -> str:
         running = self.scheduler.running
