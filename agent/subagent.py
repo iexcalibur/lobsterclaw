@@ -87,23 +87,30 @@ class SubagentManager:
         store = get_session_store()
         cfg = get_config()
 
+        # Use config values (fall back to module constants if config missing)
+        max_depth = getattr(cfg, "subagents_max_depth", MAX_SESSION_DEPTH)
+        max_children = getattr(cfg, "subagents_max_children", MAX_CHILDREN_PER_SESSION)
+
+        if not getattr(cfg, "subagents_enabled", True):
+            return {"status": "forbidden", "error": "Sub-agents are disabled (SUBAGENTS_ENABLED=false)"}
+
         # Depth check
         parent = await store.get_session(parent_session_id)
         parent_depth = parent.depth if parent else 0
         child_depth = parent_depth + 1
-        if child_depth > MAX_SESSION_DEPTH:
+        if child_depth > max_depth:
             return {
                 "status": "forbidden",
-                "error": f"sessions_spawn not allowed at depth {child_depth} (max: {MAX_SESSION_DEPTH})",
+                "error": f"sessions_spawn not allowed at depth {child_depth} (max: {max_depth})",
             }
 
         # Concurrency check
         active_children = await store.count_active_children(parent_session_id)
-        if active_children >= MAX_CHILDREN_PER_SESSION:
+        if active_children >= max_children:
             return {
                 "status": "forbidden",
                 "error": (
-                    f"Max active sub-agents reached ({active_children}/{MAX_CHILDREN_PER_SESSION}). "
+                    f"Max active sub-agents reached ({active_children}/{max_children}). "
                     f"Wait for existing sub-agents to complete before spawning more."
                 ),
             }

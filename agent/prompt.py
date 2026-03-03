@@ -13,6 +13,7 @@ def build_system_prompt(
     include_heartbeat: bool = False,
 ) -> str:
     from agent.workspace import load_workspace_context
+    from agent.skills import format_skills_for_prompt
 
     now = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
 
@@ -29,19 +30,24 @@ def build_system_prompt(
             f"Approve/Deny button. Wait for their decision."
         )
 
-    # Memory instruction — always remind agent to check memory before answering
+    # Memory instruction
     memory_instruction = (
         "\n\nBefore answering questions about the user's preferences, past decisions, "
-        "ongoing projects, or personal details: run memory_search on MEMORY.md and memory/ files "
-        "first. Use memory_get to pull specific entries. If unsure after searching, say so."
+        "ongoing projects, or personal details: run memory_search on MEMORY.md and memory/ files. "
+        "Use memory_get to read specific entries. Use memory_list to see all keys. "
+        "If unsure after searching, say so."
     )
 
-    # Load workspace MD files (SOUL, USER, MEMORY, IDENTITY, TOOLS)
+    # Workspace MD files (SOUL, USER, MEMORY, IDENTITY, TOOLS, optionally HEARTBEAT)
     workspace_context = load_workspace_context(
         workspace_dir=workspace_dir,
         include_heartbeat=include_heartbeat,
     )
     workspace_section = f"\n\n---\n\n{workspace_context}" if workspace_context else ""
+
+    # Skills from workspace/skills/
+    skills_text = format_skills_for_prompt()
+    skills_section = f"\n\n---\n\n{skills_text}" if skills_text else ""
 
     return (
         f"You are a personal AI assistant running privately for one person only.\n\n"
@@ -50,4 +56,5 @@ def build_system_prompt(
         f"{confirmation_note}"
         f"{memory_instruction}"
         f"{workspace_section}"
+        f"{skills_section}"
     )

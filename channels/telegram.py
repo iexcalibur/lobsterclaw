@@ -1,11 +1,38 @@
+"""
+Telegram channel — full mirror of OpenClaw's Telegram capabilities.
+
+Receives: text, photos, documents, voice, audio, video, stickers, locations
+Sends: text, photos, documents, voice/audio, stickers, inline buttons
+
+Agent-callable actions via message_tool / telegram_actions_tool:
+  send, edit, delete, react, send_photo, send_document,
+  send_sticker, send_voice, create_forum_topic
+
+Safety:
+  - ParseMode: tries MARKDOWN first, falls back to plain text on parse errors
+  - Message splitting respects word/line boundaries
+  - Typing indicator refreshed every 4s during long agent runs
+  - All temp files are cleaned up after use
+"""
+
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+import os
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Awaitable, Callable
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -20,10 +47,12 @@ from config import get_config
 if TYPE_CHECKING:
     from agent.history import HistoryManager
     from agent.loop import AgentLoop
-    from agent.prompt import build_system_prompt
     from tools.approval import ApprovalGate
 
 logger = logging.getLogger(__name__)
+
+MAX_MESSAGE_LENGTH = 4000
+TYPING_REFRESH_INTERVAL = 4  # seconds between typing indicator refreshes
 
 
 class TelegramChannel:
@@ -32,218 +61,514 @@ class TelegramChannel:
         agent: "AgentLoop",
         history: "HistoryManager",
         approval: "ApprovalGate",
-        build_prompt,
+        build_prompt: Callable,
     ) -> None:
         self.cfg = get_config()
         self.agent = agent
         self.history = history
         self.approval = approval
-        self._build_prompt = build_prompt
+        self.build_prompt = build_prompt
 
-        # One lock per user — prevents overlapping agent runs
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._app = (
+            Application.builder()
+            .token(self.cfg.telegram_bot_token)
+            .build()
+        )
+        self._bot: Bot = self._app.bot
 
-        self.app = Application.builder().token(self.cfg.telegram_bot_token).build()
-
-        # Wire approval gate to this channel's send function
-        self.approval.configure(
+        # Wire approval gate
+        approval.configure(
             send_fn=self._send_approval_request,
             timeout=self.cfg.exec_confirmation_timeout_seconds,
         )
 
-        # Register handlers
-        self.app.add_handler(CommandHandler("start", self._cmd_start))
-        self.app.add_handler(CommandHandler("reset", self._cmd_reset))
-        self.app.add_handler(CommandHandler("help", self._cmd_help))
-        self.app.add_handler(CommandHandler("status", self._cmd_status))
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message))
-        self.app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, self._handle_image))
-        self.app.add_handler(CallbackQueryHandler(self._handle_callback))
+        self._register_handlers()
+
+    # ------------------------------------------------------------------
+    # Handler registration
+    # ------------------------------------------------------------------
+
+    def _register_handlers(self) -> None:
+        app = self._app
+
+        # Commands
+        app.add_handler(CommandHandler("start", self._cmd_start))
+        app.add_handler(CommandHandler("reset", self._cmd_reset))
+        app.add_handler(CommandHandler("help", self._cmd_help))
+        app.add_handler(CommandHandler("status", self._cmd_status))
+
+        # Approval inline buttons
+        app.add_handler(CallbackQueryHandler(self._handle_callback))
+
+        # Text messages
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
+
+        # Photos
+        app.add_handler(MessageHandler(filters.PHOTO, self._handle_photo))
+
+        # Voice messages
+        app.add_handler(MessageHandler(filters.VOICE, self._handle_voice))
+
+        # Audio files
+        app.add_handler(MessageHandler(filters.AUDIO, self._handle_audio))
+
+        # Video
+        app.add_handler(MessageHandler(filters.VIDEO, self._handle_video))
+
+        # Documents (catch-all for files)
+        app.add_handler(MessageHandler(filters.Document.ALL, self._handle_document))
+
+        # Stickers
+        app.add_handler(MessageHandler(filters.Sticker.ALL, self._handle_sticker))
+
+        # Location
+        app.add_handler(MessageHandler(filters.LOCATION, self._handle_location))
 
     # ------------------------------------------------------------------
     # Auth guard
     # ------------------------------------------------------------------
 
-    def _is_owner(self, user_id: int) -> bool:
-        return user_id == self.cfg.telegram_owner_id
+    def _is_owner(self, update: Update) -> bool:
+        return update.effective_user and update.effective_user.id == self.cfg.telegram_owner_id
 
     # ------------------------------------------------------------------
     # Commands
     # ------------------------------------------------------------------
 
     async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_owner(update.effective_user.id):
+        if not self._is_owner(update):
             return
-        await update.message.reply_text(
-            "👋 Personal AI assistant ready.\n\n"
-            "Commands:\n"
-            "/reset — Clear conversation history\n"
-            "/status — Show active cron jobs\n"
-            "/help — Show this message"
-        )
+        await update.message.reply_text("PyGate is running. Send me a message.")
 
     async def _cmd_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_owner(update.effective_user.id):
+        if not self._is_owner(update):
             return
-        self.history.clear(update.effective_user.id)
-        await update.message.reply_text("Conversation cleared ✅")
+        self.history.clear(str(update.effective_user.id))
+        await update.message.reply_text("Conversation reset.")
 
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_owner(update.effective_user.id):
+        if not self._is_owner(update):
             return
-        await update.message.reply_text(
-            "*Commands*\n"
+        help_text = (
+            "*PyGate — Commands*\n\n"
             "/reset — Clear conversation history\n"
-            "/status — Show active cron jobs and system status\n"
-            "/help — Show this message\n\n"
-            "Just send a message to chat with the AI assistant.",
-            parse_mode=ParseMode.MARKDOWN,
+            "/status — Show bot and agent status\n"
+            "/help — This message\n\n"
+            "Send any text, photo, voice, video, or document to chat with the agent."
         )
+        await self._safe_send(update.effective_chat.id, help_text)
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_owner(update.effective_user.id):
+        if not self._is_owner(update):
             return
-        # Let agent respond with status info
-        await self._run_agent(update, "Show me the status of all scheduled cron jobs")
+        from config import get_config
+        cfg = get_config()
+        tools = self.agent.registry.get_names()
+        status = (
+            f"*PyGate Status*\n\n"
+            f"Model: `{cfg.llm_model}` ({cfg.llm_provider})\n"
+            f"Tools ({len(tools)}): {', '.join(tools)}\n"
+            f"Cron: {'✅' if cfg.cron_enabled else '❌'}\n"
+            f"Browser: {'✅' if cfg.browser_enabled else '❌'}\n"
+            f"Exec: {'✅' if cfg.exec_enabled else '❌'}\n"
+            f"Memory: {'✅' if cfg.memory_enabled else '❌'}\n"
+        )
+        await self._safe_send(update.effective_chat.id, status)
 
     # ------------------------------------------------------------------
-    # Message handler
+    # Message handlers
     # ------------------------------------------------------------------
 
-    async def _handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_owner(update.effective_user.id):
+    async def _handle_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update):
             return
-        await self._run_agent(update, update.message.text)
+        text = update.message.text or ""
+        await self._run_agent(update, text)
 
-    async def _handle_image(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_owner(update.effective_user.id):
+    async def _handle_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update):
             return
+        caption = update.message.caption or ""
+        photo = update.message.photo[-1]  # largest size
+        tmp_path = None
+        try:
+            tmp_path = await self._download_file(photo.file_id, suffix=".jpg")
+            text = f"[Photo attached: {tmp_path}]{(' — ' + caption) if caption else ''}"
+            await self._run_agent(update, text)
+        finally:
+            _cleanup_file(tmp_path)
 
-        # Download and pass to agent as image analysis request
-        if update.message.photo:
-            photo = update.message.photo[-1]  # largest size
-            file = await photo.get_file()
-        elif update.message.document:
-            file = await update.message.document.get_file()
-        else:
+    async def _handle_voice(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update):
             return
+        voice = update.message.voice
+        tmp_path = None
+        try:
+            tmp_path = await self._download_file(voice.file_id, suffix=".ogg")
+            text = f"[Voice message received: {tmp_path} ({voice.duration}s). Transcription not available — reply to acknowledge or ask me to process it.]"
+            await self._run_agent(update, text)
+        finally:
+            _cleanup_file(tmp_path)
 
-        import tempfile, os
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-            await file.download_to_drive(f.name)
-            tmp_path = f.name
+    async def _handle_audio(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update):
+            return
+        audio = update.message.audio
+        tmp_path = None
+        try:
+            suffix = Path(audio.file_name or "audio.mp3").suffix or ".mp3"
+            tmp_path = await self._download_file(audio.file_id, suffix=suffix)
+            name = audio.title or audio.file_name or "audio"
+            text = f"[Audio file received: {name} ({audio.duration}s) at {tmp_path}]"
+            await self._run_agent(update, text)
+        finally:
+            _cleanup_file(tmp_path)
 
-        caption = update.message.caption or "Describe this image."
-        prompt = f"[Image attached at {tmp_path}] {caption}"
-        await self._run_agent(update, prompt)
+    async def _handle_video(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update):
+            return
+        video = update.message.video
+        caption = update.message.caption or ""
+        tmp_path = None
+        try:
+            suffix = Path(video.file_name or "video.mp4").suffix or ".mp4"
+            tmp_path = await self._download_file(video.file_id, suffix=suffix)
+            text = f"[Video received: {video.file_name or 'video'} ({video.duration}s) at {tmp_path}]{(' — ' + caption) if caption else ''}"
+            await self._run_agent(update, text)
+        finally:
+            _cleanup_file(tmp_path)
+
+    async def _handle_document(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update):
+            return
+        doc = update.message.document
+        caption = update.message.caption or ""
+        tmp_path = None
+        try:
+            suffix = Path(doc.file_name or "file").suffix or ""
+            tmp_path = await self._download_file(doc.file_id, suffix=suffix)
+            # For images sent as documents
+            if doc.mime_type and doc.mime_type.startswith("image/"):
+                text = f"[Image document: {doc.file_name} at {tmp_path}]{(' — ' + caption) if caption else ''}"
+            else:
+                text = f"[Document received: {doc.file_name} ({doc.mime_type}) at {tmp_path}]{(' — ' + caption) if caption else ''}"
+            await self._run_agent(update, text)
+        finally:
+            _cleanup_file(tmp_path)
+
+    async def _handle_sticker(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update):
+            return
+        sticker = update.message.sticker
+        emoji = sticker.emoji or ""
+        text = f"[Sticker received: {emoji} (set: {sticker.set_name or 'unknown'}, file_id: {sticker.file_id})]"
+        await self._run_agent(update, text)
+
+    async def _handle_location(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update):
+            return
+        loc = update.message.location
+        text = f"[Location shared: lat={loc.latitude}, lon={loc.longitude}]"
+        await self._run_agent(update, text)
 
     # ------------------------------------------------------------------
-    # Core: run agent loop
+    # Core agent run
     # ------------------------------------------------------------------
 
-    async def _run_agent(self, update: Update, text: str) -> None:
-        user_id = update.effective_user.id
+    async def _run_agent(self, update: Update, user_text: str) -> None:
+        chat_id = update.effective_chat.id
+        user_id = str(update.effective_user.id)
 
-        if user_id not in self._locks:
-            self._locks[user_id] = asyncio.Lock()
+        # Add to history
+        self.history.add(user_id, "user", user_text)
 
-        async with self._locks[user_id]:
-            # Add user message to history
-            self.history.add(user_id, "user", text)
+        # Build prompt and messages
+        tool_names = self.agent.registry.get_names()
+        system = self.build_prompt(self.cfg, tool_names)
+        messages = self.history.get_for_llm(user_id)
 
-            # Show typing indicator
-            await update.effective_chat.send_action(ChatAction.TYPING)
-
-            try:
-                messages = self.history.get_for_llm(user_id)
-                system = self._build_prompt(self.cfg, self.agent.registry.get_names())
-                reply = await self.agent.run(messages, system)
-
-                # Store assistant reply
-                self.history.add(user_id, "assistant", reply)
-
-                # Send reply (split if over Telegram's 4096 char limit)
-                for chunk in _split_message(reply):
-                    await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-
-            except Exception as e:
-                logger.exception("Agent error")
-                await update.message.reply_text(f"⚠️ Error: {e}")
-
-    # ------------------------------------------------------------------
-    # Approval callbacks
-    # ------------------------------------------------------------------
-
-    async def _send_approval_request(self, text: str, request_id: str) -> None:
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve:{request_id}"),
-            InlineKeyboardButton("❌ Deny", callback_data=f"deny:{request_id}"),
-        ]])
-        await self.app.bot.send_message(
-            chat_id=self.cfg.telegram_owner_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN,
+        # Start typing indicator, refresh it while agent runs
+        typing_task = asyncio.create_task(
+            self._typing_loop(chat_id)
         )
 
-    async def _handle_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-
-        data = query.data or ""
-        if not (data.startswith("approve:") or data.startswith("deny:")):
-            return
-
-        action, request_id = data.split(":", 1)
-        approved = action == "approve"
-        resolved = self.approval.resolve(request_id, approved)
-
-        label = "✅ Approved" if approved else "❌ Denied"
-        suffix = label if resolved else "⏰ Expired"
         try:
-            await query.edit_message_text(
-                f"{query.message.text}\n\n{suffix}",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            reply = await self.agent.run(messages, system, session_id="main")
+        except Exception as e:
+            logger.exception("Agent run failed")
+            reply = f"Sorry, something went wrong: {e}"
+        finally:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
+
+        if reply:
+            self.history.add(user_id, "assistant", reply)
+            await self._send_chunked(chat_id, reply)
+
+    async def _typing_loop(self, chat_id: int) -> None:
+        """Send typing action every TYPING_REFRESH_INTERVAL seconds until cancelled."""
+        try:
+            while True:
+                await self._bot.send_chat_action(chat_id, ChatAction.TYPING)
+                await asyncio.sleep(TYPING_REFRESH_INTERVAL)
+        except asyncio.CancelledError:
+            pass
         except Exception:
             pass
 
     # ------------------------------------------------------------------
-    # Send helpers (used by tools and cron jobs)
+    # Approval gate
+    # ------------------------------------------------------------------
+
+    async def _send_approval_request(self, text: str, request_id: str) -> None:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{request_id}"),
+                InlineKeyboardButton("❌ Deny", callback_data=f"deny:{request_id}"),
+            ]
+        ])
+        await self._safe_send(
+            self.cfg.telegram_owner_id,
+            text,
+            reply_markup=keyboard,
+        )
+
+    async def _handle_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        await query.answer()
+
+        data = query.data or ""
+        if data.startswith("approve:") or data.startswith("deny:"):
+            approved = data.startswith("approve:")
+            request_id = data.split(":", 1)[1]
+            resolved = self.approval.resolve(request_id, approved)
+            action = "Approved ✅" if approved else "Denied ❌"
+            if resolved:
+                await query.edit_message_text(
+                    f"{query.message.text}\n\n— {action}"
+                )
+            else:
+                await query.edit_message_text("This request has already been resolved.")
+        elif data.startswith("btn:"):
+            # Agent-defined inline button callback — pass back to history
+            payload = data[4:]
+            await query.edit_message_reply_markup(reply_markup=None)
+            await self._run_agent_from_button(update, payload)
+
+    async def _run_agent_from_button(self, update: Update, payload: str) -> None:
+        """Handle user pressing an agent-defined inline button."""
+        await self._run_agent(update, f"[Button pressed: {payload}]")
+
+    # ------------------------------------------------------------------
+    # Proactive send methods (called by tools)
     # ------------------------------------------------------------------
 
     async def send_message(self, text: str) -> None:
-        for chunk in _split_message(text):
-            await self.app.bot.send_message(
-                chat_id=self.cfg.telegram_owner_id,
-                text=chunk,
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        """Send a text message to the owner. Called by message_tool."""
+        await self._send_chunked(self.cfg.telegram_owner_id, text)
 
-    async def send_audio(self, file_path: str) -> None:
-        import os
-        with open(file_path, "rb") as f:
-            await self.app.bot.send_voice(
-                chat_id=self.cfg.telegram_owner_id,
-                voice=f,
+    async def send_audio(self, audio_path: str) -> None:
+        """Send an audio file as a voice message. Called by tts tool."""
+        try:
+            with open(audio_path, "rb") as f:
+                await self._bot.send_voice(
+                    chat_id=self.cfg.telegram_owner_id,
+                    voice=f,
+                )
+        except Exception as e:
+            logger.error("Failed to send audio: %s", e)
+
+    async def send_photo(self, photo_path_or_url: str, caption: str = "") -> None:
+        """Send a photo to the owner."""
+        try:
+            if photo_path_or_url.startswith("http"):
+                await self._bot.send_photo(
+                    chat_id=self.cfg.telegram_owner_id,
+                    photo=photo_path_or_url,
+                    caption=caption or None,
+                )
+            else:
+                with open(photo_path_or_url, "rb") as f:
+                    await self._bot.send_photo(
+                        chat_id=self.cfg.telegram_owner_id,
+                        photo=f,
+                        caption=caption or None,
+                    )
+        except Exception as e:
+            logger.error("Failed to send photo: %s", e)
+
+    async def send_document(self, file_path: str, caption: str = "") -> None:
+        """Send a document/file to the owner."""
+        try:
+            with open(file_path, "rb") as f:
+                await self._bot.send_document(
+                    chat_id=self.cfg.telegram_owner_id,
+                    document=f,
+                    caption=caption or None,
+                    filename=Path(file_path).name,
+                )
+        except Exception as e:
+            logger.error("Failed to send document: %s", e)
+
+    async def edit_message(self, chat_id: int, message_id: int, text: str) -> None:
+        """Edit an existing message."""
+        try:
+            await self._bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text[:4096],
             )
-        os.unlink(file_path)  # clean up temp file
+        except Exception as e:
+            logger.error("Failed to edit message: %s", e)
+
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        """Delete a message."""
+        try:
+            await self._bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            logger.error("Failed to delete message: %s", e)
+
+    async def react_to_message(self, chat_id: int, message_id: int, emoji: str) -> None:
+        """Set a reaction on a message (requires Bot API 7.0+)."""
+        try:
+            from telegram import ReactionTypeEmoji
+            await self._bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+            )
+        except Exception as e:
+            logger.error("Failed to react to message: %s", e)
+
+    async def send_with_buttons(
+        self,
+        text: str,
+        buttons: list[dict],
+        chat_id: int | None = None,
+    ) -> None:
+        """
+        Send a message with agent-defined inline buttons.
+        buttons = [{"text": "...", "data": "..."}]
+        """
+        target = chat_id or self.cfg.telegram_owner_id
+        keyboard_rows = []
+        for btn in buttons:
+            label = btn.get("text", "")
+            data = btn.get("data", label)
+            keyboard_rows.append([
+                InlineKeyboardButton(label, callback_data=f"btn:{data}"[:64])
+            ])
+        markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
+        await self._safe_send(target, text, reply_markup=markup)
+
+    async def create_forum_topic(self, chat_id: int, name: str) -> str:
+        """Create a forum topic in a group/supergroup."""
+        try:
+            topic = await self._bot.create_forum_topic(chat_id=chat_id, name=name)
+            return f"Forum topic '{name}' created (id: {topic.message_thread_id})"
+        except Exception as e:
+            return f"Failed to create forum topic: {e}"
 
     # ------------------------------------------------------------------
-    # Run
+    # Safe send with ParseMode fallback + chunking
+    # ------------------------------------------------------------------
+
+    async def _safe_send(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup=None,
+    ) -> list[Message]:
+        """Send text with markdown, falling back to plain text on parse errors."""
+        chunks = _split_message(text)
+        sent = []
+        for i, chunk in enumerate(chunks):
+            markup = reply_markup if i == 0 else None
+            try:
+                msg = await self._bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=markup,
+                )
+                sent.append(msg)
+            except BadRequest as e:
+                if "can't parse" in str(e).lower() or "parse" in str(e).lower():
+                    # ParseMode failure — retry as plain text
+                    try:
+                        msg = await self._bot.send_message(
+                            chat_id=chat_id,
+                            text=chunk,
+                            reply_markup=markup,
+                        )
+                        sent.append(msg)
+                    except Exception as inner:
+                        logger.error("Failed to send plain text message: %s", inner)
+                else:
+                    logger.error("Failed to send message: %s", e)
+            except Exception as e:
+                logger.error("Failed to send message: %s", e)
+        return sent
+
+    async def _send_chunked(self, chat_id: int, text: str) -> None:
+        await self._safe_send(chat_id, text)
+
+    # ------------------------------------------------------------------
+    # File download helper
+    # ------------------------------------------------------------------
+
+    async def _download_file(self, file_id: str, suffix: str = "") -> str:
+        """Download a Telegram file to a temp path. Caller must clean up."""
+        tg_file = await self._bot.get_file(file_id)
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        await tg_file.download_to_drive(tmp_path)
+        return tmp_path
+
+    # ------------------------------------------------------------------
+    # Entry point
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        logger.info("Starting Telegram bot (owner_id=%s)", self.cfg.telegram_owner_id)
-        self.app.run_polling(drop_pending_updates=True)
+        self._app.run_polling(drop_pending_updates=True)
 
 
-def _split_message(text: str, limit: int = 4000) -> list[str]:
-    """Split a long message into Telegram-safe chunks."""
-    if len(text) <= limit:
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> list[str]:
+    """Split text at word/line boundaries."""
+    if len(text) <= max_len:
         return [text]
-    chunks = []
-    while text:
-        chunks.append(text[:limit])
-        text = text[limit:]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_len:
+        # Try to split at last newline within limit
+        split_at = remaining.rfind("\n", 0, max_len)
+        if split_at <= 0:
+            # Try last space
+            split_at = remaining.rfind(" ", 0, max_len)
+        if split_at <= 0:
+            # Hard split
+            split_at = max_len
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:].lstrip("\n")
+
+    if remaining:
+        chunks.append(remaining)
     return chunks
+
+
+def _cleanup_file(path: str | None) -> None:
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass

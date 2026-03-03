@@ -29,11 +29,15 @@ class ApprovalGate:
             return False
 
         request_id = uuid.uuid4().hex[:8]
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future: asyncio.Future[bool] = loop.create_future()
         self._pending[request_id] = future
 
-        args_preview = json.dumps(args, indent=2)[:600]
+        # Safe preview: truncate at last complete line to avoid broken JSON mid-string
+        raw_preview = json.dumps(args, indent=2)
+        if len(raw_preview) > 600:
+            raw_preview = raw_preview[:600].rsplit("\n", 1)[0] + "\n..."
+        args_preview = raw_preview
 
         try:
             await self._send_fn(

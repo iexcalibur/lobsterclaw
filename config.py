@@ -47,7 +47,8 @@ class Config:
         default_factory=lambda: _env_list(
             "TOOLS_ALLOW",
             (
-                "web_fetch,web_search,cron,memory_search,memory_get,memory_write,"
+                "web_fetch,web_search,cron,read,"
+                "memory_search,memory_get,memory_write,memory_list,memory_delete,"
                 "message,tts,pdf,image,"
                 "sessions_spawn,sessions_list,sessions_history,sessions_send,"
                 "session_status,subagents,agents_list"
@@ -57,7 +58,7 @@ class Config:
     tools_deny: list[str] = field(
         default_factory=lambda: _env_list(
             "TOOLS_DENY",
-            "exec,process,browser,write,edit,apply_patch",
+            "exec,process,browser,write,edit,apply_patch,delete,move,gateway",
         )
     )
     tools_require_confirmation: list[str] = field(

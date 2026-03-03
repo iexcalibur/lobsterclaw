@@ -26,8 +26,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def build_registry(send_fn=None):
-    """Build and return a ToolRegistry with all registered tools."""
+def build_registry():
+    """Build and return a ToolRegistry with all tools registered and policy applied."""
     from tools.registry import ToolRegistry
     from tools import (
         web_fetch,
@@ -40,6 +40,7 @@ def build_registry(send_fn=None):
         message_tool,
         cron_tool,
         sessions_tool,
+        gateway_tool,
     )
 
     registry = ToolRegistry()
@@ -52,28 +53,35 @@ def build_registry(send_fn=None):
     registry.register(exec_tool.TOOL_DEFINITION)
     registry.register(exec_tool.PROCESS_TOOL_DEFINITION)
 
-    # File system
+    # File system (full suite)
     registry.register(filesystem.READ_TOOL)
     registry.register(filesystem.WRITE_TOOL)
     registry.register(filesystem.EDIT_TOOL)
     registry.register(filesystem.APPLY_PATCH_TOOL)
+    registry.register(filesystem.LIST_DIR_TOOL)
+    registry.register(filesystem.GLOB_TOOL)
+    registry.register(filesystem.DELETE_TOOL)
+    registry.register(filesystem.MOVE_TOOL)
 
     # Browser
     registry.register(browser_tool.TOOL_DEFINITION)
 
-    # Memory
+    # Memory (full suite)
     registry.register(memory_tool.MEMORY_SEARCH_TOOL)
     registry.register(memory_tool.MEMORY_GET_TOOL)
     registry.register(memory_tool.MEMORY_WRITE_TOOL)
+    registry.register(memory_tool.MEMORY_LIST_TOOL)
+    registry.register(memory_tool.MEMORY_DELETE_TOOL)
 
     # Media
     registry.register(media_tool.PDF_TOOL)
     registry.register(media_tool.IMAGE_TOOL)
     registry.register(media_tool.TTS_TOOL)
 
-    # Messaging + scheduling
+    # Messaging + scheduling + gateway
     registry.register(message_tool.TOOL_DEFINITION)
     registry.register(cron_tool.TOOL_DEFINITION)
+    registry.register(gateway_tool.TOOL_DEFINITION)
 
     # Sessions / sub-agents / orchestration
     registry.register(sessions_tool.SESSIONS_SPAWN_TOOL)
@@ -137,23 +145,42 @@ def main() -> None:
     )
 
     # ----------------------------------------------------------------
-    # Wire lazy send functions
+    # Wire all lazy send / action functions into tools
     # ----------------------------------------------------------------
 
-    from tools import message_tool, media_tool, cron_tool
+    from tools import message_tool, media_tool, cron_tool, browser_tool
 
+    # Text message
     message_tool.set_send_fn(telegram.send_message)
+
+    # Extended Telegram actions for message tool
+    message_tool.set_telegram_fns(
+        send_photo=telegram.send_photo,
+        send_document=telegram.send_document,
+        edit=telegram.edit_message,
+        delete=telegram.delete_message,
+        react=telegram.react_to_message,
+        send_buttons=telegram.send_with_buttons,
+    )
+
+    # Audio + TTS
     media_tool.set_send_audio(telegram.send_audio)
+
+    # Browser screenshot → send as Telegram photo
+    browser_tool.set_send_photo_fn(telegram.send_photo)
+
+    # Cron manager
     cron_tool.set_manager(cron_mgr)
 
     # ----------------------------------------------------------------
-    # Sub-agent factory — creates a fresh registry for each sub-agent
-    # (each sub-agent gets its own isolated tool registry + message_tool wired)
+    # Sub-agent factory — isolated tool registry + all send fns wired
     # ----------------------------------------------------------------
 
     def subagent_registry_factory():
         sub_registry = build_registry()
         sub_registry.set_approval_gate(approval)
+        # Re-wire send functions into the sub-agent's tool modules
+        # Note: module-level globals are shared, so setting them here is safe
         message_tool.set_send_fn(telegram.send_message)
         return sub_registry
 
@@ -163,7 +190,7 @@ def main() -> None:
     )
 
     # ----------------------------------------------------------------
-    # Background agent runner (used by cron + heartbeat)
+    # Background agent runner (cron + heartbeat)
     # ----------------------------------------------------------------
 
     async def agent_for_bg(message: str, system_prompt: str | None = None) -> str:
@@ -187,18 +214,23 @@ def main() -> None:
     if cfg.cron_enabled:
         cron_mgr.start()
         logger.info("Cron scheduler started")
-        if getattr(cfg, "heartbeat_enabled", False):
+        if cfg.heartbeat_enabled:
             heartbeat.start(cron_mgr.scheduler)
-            logger.info("Heartbeat runner attached")
+            logger.info("Heartbeat runner attached (schedule: %s)", cfg.heartbeat_schedule)
+    elif cfg.heartbeat_enabled:
+        # Heartbeat without cron: start its own scheduler
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        hb_scheduler = AsyncIOScheduler()
+        hb_scheduler.start()
+        heartbeat.start(hb_scheduler)
+        logger.info("Heartbeat-only scheduler started")
 
     # ----------------------------------------------------------------
     # Start Telegram bot (blocking)
     # ----------------------------------------------------------------
 
-    logger.info(
-        "Bot ready. Tools: %s",
-        ", ".join(registry.get_names()),
-    )
+    all_tools = registry.get_names()
+    logger.info("Bot ready. %d tools: %s", len(all_tools), ", ".join(all_tools))
     telegram.run()
 
 

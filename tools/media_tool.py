@@ -1,6 +1,14 @@
+"""
+Media tools — mirrors OpenClaw's pdf, image, and tts tools.
+
+All temp files are cleaned up after use.
+"""
+
 from __future__ import annotations
 
+import base64
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -10,7 +18,7 @@ from tools.registry import ToolDefinition
 
 logger = logging.getLogger(__name__)
 
-# send_audio_fn is set by main.py after Telegram is ready
+# Injected by main.py after Telegram is ready
 _send_audio_fn: Callable[[str], Awaitable[None]] | None = None
 
 
@@ -26,7 +34,7 @@ PDF_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "source": {"type": "string", "description": "Local file path (~/ supported) or HTTPS URL"},
-            "pages": {"type": "string", "description": "Page range, e.g. '1-5' or '3' (optional, all pages if omitted)"},
+            "pages": {"type": "string", "description": "Page range e.g. '1-5' or single page '3' (optional, all pages if omitted)"},
         },
         "required": ["source"],
     },
@@ -35,12 +43,12 @@ PDF_TOOL = ToolDefinition(
 
 IMAGE_TOOL = ToolDefinition(
     name="image",
-    description="Analyze or describe an image file (local path or URL).",
+    description="Analyze or describe an image file (local path or URL). Uses vision-capable model.",
     parameters={
         "type": "object",
         "properties": {
             "source": {"type": "string", "description": "Local file path (~/ supported) or HTTPS URL"},
-            "question": {"type": "string", "description": "What to ask about the image (default: 'Describe this image')"},
+            "question": {"type": "string", "description": "What to ask about the image (default: describe it)"},
         },
         "required": ["source"],
     },
@@ -49,12 +57,15 @@ IMAGE_TOOL = ToolDefinition(
 
 TTS_TOOL = ToolDefinition(
     name="tts",
-    description="Convert text to speech and send it as a voice message via Telegram.",
+    description=(
+        "Convert text to speech and send it as a Telegram voice message. "
+        "Requires TTS_ENABLED=true."
+    ),
     parameters={
         "type": "object",
         "properties": {
             "text": {"type": "string", "description": "Text to convert to speech"},
-            "voice": {"type": "string", "description": "Edge TTS voice name (optional, uses default from .env)"},
+            "voice": {"type": "string", "description": "Edge TTS voice name (optional, uses TTS_VOICE from .env)"},
         },
         "required": ["text"],
     },
@@ -63,60 +74,78 @@ TTS_TOOL = ToolDefinition(
 
 
 async def _pdf(source: str, pages: str | None = None) -> str:
+    tmp_path: str | None = None
     try:
         import fitz  # PyMuPDF
 
         # Download if URL
         if source.startswith("http"):
             import httpx
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
                 r = await client.get(source)
                 r.raise_for_status()
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-                    f.write(r.content)
-                    source = f.name
+            fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            with open(tmp_path, "wb") as f:
+                f.write(r.content)
+            source = tmp_path
 
         doc = fitz.open(Path(source).expanduser())
         total_pages = len(doc)
 
-        # Parse page range
+        # Parse page range — 1-indexed
         start, end = 0, total_pages
         if pages:
             parts = pages.split("-")
-            start = max(0, int(parts[0]) - 1)
-            end = int(parts[1]) if len(parts) > 1 else int(parts[0])
+            try:
+                start = max(0, int(parts[0]) - 1)
+                end = int(parts[1]) if len(parts) > 1 else int(parts[0])
+            except ValueError:
+                pass  # fallback to all pages
 
         text_parts = []
         for i in range(start, min(end, total_pages)):
-            text_parts.append(f"--- Page {i+1} ---\n{doc[i].get_text()}")
+            text_parts.append(f"--- Page {i + 1} ---\n{doc[i].get_text()}")
 
         doc.close()
-        return "\n\n".join(text_parts)[:10000]
+        combined = "\n\n".join(text_parts)
+        return combined[:10_000] + ("\n\n[truncated]" if len(combined) > 10_000 else "")
     except ImportError:
         return "Error: PyMuPDF not installed. Run: pip install PyMuPDF"
     except Exception as e:
         return f"Error reading PDF: {e}"
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 async def _image(source: str, question: str = "Describe this image in detail.") -> str:
     cfg = get_config()
+    tmp_path: str | None = None
 
     try:
-        import base64
         import httpx
 
         # Load image bytes
         if source.startswith("http"):
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
                 r = await client.get(source)
                 r.raise_for_status()
                 image_bytes = r.content
                 media_type = r.headers.get("content-type", "image/jpeg").split(";")[0]
         else:
             p = Path(source).expanduser()
+            if not p.exists():
+                return f"Error: file not found: {source}"
             image_bytes = p.read_bytes()
-            suffix = p.suffix.lower()
-            media_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}.get(suffix.lstrip("."), "image/jpeg")
+            suffix = p.suffix.lower().lstrip(".")
+            media_type = {
+                "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "png": "image/png", "gif": "image/gif", "webp": "image/webp",
+            }.get(suffix, "image/jpeg")
 
         b64 = base64.standard_b64encode(image_bytes).decode()
 
@@ -149,9 +178,17 @@ async def _image(source: str, question: str = "Describe this image in detail.") 
                 }],
                 max_tokens=1024,
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content or "(no response)"
+    except ImportError:
+        return "Error: required library not installed (httpx)"
     except Exception as e:
         return f"Error analyzing image: {e}"
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 async def _tts(text: str, voice: str | None = None) -> str:
@@ -159,22 +196,28 @@ async def _tts(text: str, voice: str | None = None) -> str:
     if not cfg.tts_enabled:
         return "TTS is disabled (TTS_ENABLED=false)"
 
+    tmp_path: str | None = None
     try:
         import edge_tts
 
         voice = voice or cfg.tts_voice
         communicate = edge_tts.Communicate(text, voice)
 
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            tmp_path = f.name
-
+        fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
         await communicate.save(tmp_path)
 
         if _send_audio_fn:
             await _send_audio_fn(tmp_path)
-            return f"Voice message sent ({len(text)} chars)"
-        return f"Audio saved to {tmp_path} (no Telegram send function configured)"
+            return f"Voice message sent ✅ ({len(text)} chars)"
+        return f"Audio generated but no Telegram send function configured (file: {tmp_path})"
     except ImportError:
         return "Error: edge-tts not installed. Run: pip install edge-tts"
     except Exception as e:
         return f"Error generating TTS: {e}"
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
