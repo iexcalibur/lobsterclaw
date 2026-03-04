@@ -151,6 +151,7 @@ def build_system_prompt(
     has_gateway = "gateway" in tool_names_lower
     has_sessions_spawn = "sessions_spawn" in tool_names_lower
     has_memory_tools = any(t.startswith("memory") for t in tool_names_lower)
+    has_file_write_tools = any(t in tool_names_lower for t in ("write", "edit", "apply_patch"))
     has_tts = "tts" in tool_names_lower
 
     # Reasoning mode
@@ -166,10 +167,18 @@ def build_system_prompt(
     # Model aliases
     model_aliases: dict[str, str] = getattr(cfg, "model_aliases", {})
 
+    # Determine session type from prompt_mode
+    session_type = "main"
+    if is_minimal:
+        session_type = "subagent"
+    if include_heartbeat:
+        session_type = "cron"
+
     # Workspace MD files
     workspace_context = load_workspace_context(
         workspace_dir=workspace_dir,
         include_heartbeat=include_heartbeat,
+        session_type=session_type,
     )
 
     # Skills
@@ -267,7 +276,9 @@ def build_system_prompt(
             "Before answering anything about prior work, decisions, dates, people, "
             "preferences, or todos: run memory_search on MEMORY.md + memory/*.md; "
             "then use memory_get to pull only the needed lines. "
-            "If low confidence after search, say you checked.",
+            "If low confidence after search, say you checked. "
+            "Exception: do NOT search memory for the user's name or identity — "
+            "that is always available in the sender metadata above (display_name).",
         ]
         if memory_citations == "off":
             memory_lines.append(
@@ -314,14 +325,47 @@ def build_system_prompt(
     # ----------------------------------------------------------------
     if workspace_context:
         soul_loaded = "SOUL.md" in workspace_context
-        lines += ["## Project Context", ""]
+        lines += ["# Project Context", "", "The following project context files have been loaded:"]
         if soul_loaded:
             lines.append(
                 "If SOUL.md is present, embody its persona and tone. "
                 "Avoid stiff, generic replies; follow its guidance unless "
                 "higher-priority instructions override it."
             )
-        lines += ["The following workspace context files have been loaded:", "", workspace_context, ""]
+        lines += ["", workspace_context, ""]
+
+    # ----------------------------------------------------------------
+    # ## Onboarding Ritual (OpenClaw-style bootstrap behavior)
+    # ----------------------------------------------------------------
+    needs_onboarding = (
+        not is_minimal
+        and not include_heartbeat
+        and _needs_onboarding_bootstrap(workspace_dir)
+    )
+    if needs_onboarding:
+        lines += [
+            "## Onboarding Ritual",
+            "This workspace appears fresh or profile-incomplete. Start with a natural bootstrap conversation.",
+            "Do not interrogate. Be warm, direct, and conversational.",
+            "Open with a short line like: \"Hey, I just came online. Who am I, and what should I call you?\"",
+            "Collect essentials over the next turns (one or two questions at a time):",
+            "- User name + preferred way to be addressed",
+            "- User timezone",
+            "- Agent identity preferences (name, vibe) if they want changes",
+            "Never ask the user to edit USER.md or IDENTITY.md unless they explicitly ask where to change these settings.",
+            "Once basics are captured, continue in normal assistant mode.",
+            "",
+        ]
+        if has_file_write_tools:
+            lines += [
+                "Persist confirmed profile details quietly by updating USER.md / IDENTITY.md in the background.",
+                "",
+            ]
+        elif has_memory_tools:
+            lines += [
+                "Persist confirmed profile details using memory_write. Keep file names internal unless asked.",
+                "",
+            ]
 
     # ----------------------------------------------------------------
     # ## Silent Replies
@@ -527,6 +571,29 @@ def _build_owner_line(cfg: "Config") -> str:
         return ""
 
 
+# Model capability detection (mirrors OpenClaw's model metadata)
+_MODEL_CAPABILITIES: dict[str, dict] = {
+    "claude-opus-4": {"thinking": True, "vision": True, "context": 200000},
+    "claude-sonnet-4": {"thinking": True, "vision": True, "context": 200000},
+    "claude-haiku": {"thinking": False, "vision": True, "context": 200000},
+    "claude-3-5": {"thinking": False, "vision": True, "context": 200000},
+    "claude-3-7": {"thinking": True, "vision": True, "context": 200000},
+    "gpt-4o": {"thinking": False, "vision": True, "context": 128000},
+    "gpt-4-turbo": {"thinking": False, "vision": True, "context": 128000},
+    "o1": {"thinking": True, "vision": False, "context": 200000},
+    "o3": {"thinking": True, "vision": False, "context": 200000},
+    "o4": {"thinking": True, "vision": True, "context": 200000},
+}
+
+
+def _get_model_capabilities(model: str) -> dict:
+    model_lower = model.lower()
+    for prefix, caps in _MODEL_CAPABILITIES.items():
+        if model_lower.startswith(prefix):
+            return caps
+    return {"thinking": False, "vision": False, "context": 100000}
+
+
 def _build_runtime_line(
     cfg: "Config",
     channel: str,
@@ -545,7 +612,6 @@ def _build_runtime_line(
     parts.append(f"os={platform.system().lower()} ({platform.machine()})")
     parts.append(f"python={sys.version_info.major}.{sys.version_info.minor}")
 
-    # Shell detection: config > env $SHELL > "unknown"
     shell_name = getattr(cfg, "shell", "") or ""
     if not shell_name:
         env_shell = os.environ.get("SHELL", "")
@@ -556,6 +622,20 @@ def _build_runtime_line(
     if repo_root:
         parts.append(f"repo={repo_root}")
     parts.append(f"model={cfg.llm_model}")
+    parts.append(f"provider={cfg.llm_provider}")
+
+    # Model capabilities
+    model_caps = _get_model_capabilities(cfg.llm_model)
+    cap_strs = []
+    if model_caps.get("thinking"):
+        cap_strs.append("thinking")
+    if model_caps.get("vision"):
+        cap_strs.append("vision")
+    if model_caps.get("context"):
+        cap_strs.append(f"ctx={model_caps['context']//1000}k")
+    if cap_strs:
+        parts.append(f"model_capabilities={','.join(cap_strs)}")
+
     parts.append(f"channel={channel}")
     caps_str = ",".join(str(c) for c in capabilities) if capabilities else "none"
     parts.append(f"capabilities={caps_str}")
@@ -575,6 +655,7 @@ def _build_telegram_messaging_section(
         f"normal assistant voice and send the update (do not forward raw internal metadata or "
         f"default to {silent_token}).",
         f"- Never use exec/curl for provider messaging; LobsterClaw handles all routing internally.",
+        "- Keep internal implementation details private; do not mention workspace files by path unless the user asks.",
         "",
         "### message tool",
         "- Use `message` for proactive sends + channel actions (polls, reactions, etc.).",
@@ -631,3 +712,68 @@ def _get_tz(cfg: "Config | None" = None) -> str:
         return datetime.now().astimezone().strftime("%Z")
     except Exception:
         return ""
+
+
+def _workspace_root(workspace_dir: Path | None = None) -> Path:
+    if workspace_dir is not None:
+        return workspace_dir
+    return Path(__file__).parent.parent / "workspace"
+
+
+def _safe_read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _is_placeholder_value(value: str) -> bool:
+    raw = (value or "").strip()
+    if not raw:
+        return True
+    compact = re.sub(r"[\s_*`]", "", raw).lower()
+    placeholder_tokens = {
+        "(optional)",
+        "optional",
+        "(brief/detailed/casual/formal)",
+        "(english/hindi/mixed)",
+        "(short/medium/detailed)",
+    }
+    if compact in placeholder_tokens:
+        return True
+    return raw.startswith("_(") or raw.startswith("(")
+
+
+def _extract_user_field(user_md: str, label: str) -> str:
+    pattern = rf"(?im)^\s*-\s*\*\*{re.escape(label)}:\*\*\s*(.*)$"
+    m = re.search(pattern, user_md)
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
+def _needs_onboarding_bootstrap(workspace_dir: Path | None = None) -> bool:
+    """
+    Return True when the workspace looks uninitialized for profile/persona setup.
+
+    Heuristics (OpenClaw-like):
+    - BOOTSTRAP.md exists with content, or
+    - USER.md is missing essentials (Name / What to call them / Timezone).
+    """
+    root = _workspace_root(workspace_dir)
+
+    bootstrap = _safe_read_text(root / "BOOTSTRAP.md").strip()
+    if bootstrap:
+        return True
+
+    user_md = _safe_read_text(root / "USER.md")
+    if not user_md.strip():
+        return True
+
+    required_labels = ("Name", "What to call them", "Timezone")
+    for label in required_labels:
+        value = _extract_user_field(user_md, label)
+        if _is_placeholder_value(value):
+            return True
+
+    return False

@@ -131,7 +131,7 @@ class Config:
         default_factory=lambda: _env_list(
             "TOOLS_ALLOW",
             (
-                "web_fetch,web_search,cron,read,"
+                "web_fetch,web_search,cron,read,write,edit,glob,list_dir,"
                 "memory_search,memory_get,memory_write,memory_list,memory_delete,"
                 "message,tts,pdf,image,"
                 "sessions_spawn,sessions_list,sessions_history,sessions_send,"
@@ -142,7 +142,7 @@ class Config:
     tools_deny: list[str] = field(
         default_factory=lambda: _env_list(
             "TOOLS_DENY",
-            "exec,process,browser,write,edit,apply_patch,delete,move,gateway",
+            "exec,process,browser,apply_patch,delete,move,gateway",
         )
     )
     tools_require_confirmation: list[str] = field(
@@ -157,6 +157,8 @@ class Config:
     grok_api_key: str = field(default_factory=lambda: _env("GROK_API_KEY"))
     kimi_api_key: str = field(default_factory=lambda: _env("KIMI_API_KEY"))
     web_search_max_results: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 10))
+    google_search_api_key: str = field(default_factory=lambda: _env("GOOGLE_SEARCH_API_KEY"))
+    google_search_cx: str = field(default_factory=lambda: _env("GOOGLE_SEARCH_CX"))
 
     # Exec
     exec_enabled: bool = field(default_factory=lambda: _env_bool("EXEC_ENABLED", False))
@@ -225,7 +227,7 @@ class Config:
     llm_streaming: bool = field(default_factory=lambda: _env_bool("LLM_STREAMING", True))
     # Minimum seconds between streaming preview edits (Telegram rate-limit guard)
     llm_stream_min_edit_interval: float = field(
-        default_factory=lambda: _env_float("LLM_STREAM_MIN_EDIT_INTERVAL", 1.5)
+        default_factory=lambda: _env_float("LLM_STREAM_MIN_EDIT_INTERVAL", 3.0)
     )
     # Show extended thinking blocks in Telegram (shown as spoiler/code if true)
     llm_show_thinking: bool = field(default_factory=lambda: _env_bool("LLM_SHOW_THINKING", False))
@@ -241,6 +243,11 @@ class Config:
     )
     # How long wait_event polls for a user interaction (seconds)
     canvas_event_timeout: int = field(default_factory=lambda: _env_int("CANVAS_EVENT_TIMEOUT", 60))
+
+    # Gateway (Mission Control dashboard)
+    gateway_enabled: bool = field(default_factory=lambda: _env_bool("GATEWAY_ENABLED", True))
+    gateway_port: int = field(default_factory=lambda: _env_int("GATEWAY_PORT", 4400))
+    gateway_bind: str = field(default_factory=lambda: _env("GATEWAY_BIND", "127.0.0.1"))
 
     # Agent identity
     # Human-readable agent identifier shown in the ## Runtime prompt line.

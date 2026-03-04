@@ -1,14 +1,43 @@
+# Environment & secrets
 .env
+
+# Python
 __pycache__/
 *.py[cod]
 *.pyc
-.DS_Store
 *.egg-info/
 dist/
 build/
 .venv/
 venv/
 env/
+.pytest_cache/
+
+# Node.js / Next.js
+node_modules/
+.next/
+out/
+gateway_ui/node_modules/
+gateway_ui/.next/
+gateway_ui/out/
+canvas_frontend/node_modules/
+canvas_frontend/.next/
+canvas_frontend/out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Media artifacts
 *.mp3
 *.wav
+
+# Data
 ~/.pygate/
+~/.lobsterclaw/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

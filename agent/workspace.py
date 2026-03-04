@@ -44,6 +44,16 @@ MAX_FILE_BYTES = 2 * 1024 * 1024
 # Where the workspace files live relative to the project root
 DEFAULT_WORKSPACE_DIR = Path(__file__).parent.parent / "workspace"
 
+# Bootstrap context truncation budget (mirrors OpenClaw's buildBootstrapContextFiles)
+BOOTSTRAP_PER_FILE_CHAR_BUDGET = 20_000
+BOOTSTRAP_TOTAL_CHAR_BUDGET = 150_000
+BOOTSTRAP_HEAD_RATIO = 0.7
+BOOTSTRAP_TAIL_RATIO = 0.2
+BOOTSTRAP_TRUNCATION_MARKER = "\n\n[... middle truncated ({removed} chars) — head + tail preserved ...]\n\n"
+
+# Files loaded for sub-agent and cron sessions (minimal set)
+MINIMAL_SESSION_FILES = ["AGENTS.md", "TOOLS.md", "SOUL.md", "IDENTITY.md", "USER.md"]
+
 # File content cache: path → {"content": str, "identity": str}
 # Identity = f"{size}:{mtime_ns}" — cheap inode-free freshness check
 _file_cache: dict[str, dict] = {}
@@ -106,6 +116,17 @@ def _strip_front_matter(content: str) -> str:
     return trimmed.lstrip()
 
 
+def _truncate_content(content: str, budget: int) -> str:
+    """Truncate content using head/tail strategy (70% head, 20% tail, middle truncated)."""
+    if len(content) <= budget:
+        return content
+    head_size = int(budget * BOOTSTRAP_HEAD_RATIO)
+    tail_size = int(budget * BOOTSTRAP_TAIL_RATIO)
+    removed = len(content) - head_size - tail_size
+    marker = BOOTSTRAP_TRUNCATION_MARKER.format(removed=removed)
+    return content[:head_size] + marker + content[-tail_size:]
+
+
 def _is_effectively_empty(content: str) -> bool:
     """Return True if the file contains only comments or whitespace."""
     for line in content.splitlines():
@@ -118,17 +139,25 @@ def _is_effectively_empty(content: str) -> bool:
 def load_workspace_context(
     workspace_dir: Path | None = None,
     include_heartbeat: bool = False,
+    session_type: str = "main",  # "main" | "subagent" | "cron"
 ) -> str:
     """
     Load all relevant MD files and return them as a single formatted string
     to be appended to the system prompt.
     """
     directory = workspace_dir or DEFAULT_WORKSPACE_DIR
-    filenames = list(ALWAYS_LOADED)
-    if include_heartbeat:
-        filenames += HEARTBEAT_ONLY
+
+    # Session-type filtering
+    if session_type in ("subagent", "cron"):
+        filenames = list(MINIMAL_SESSION_FILES)
+    else:
+        filenames = list(ALWAYS_LOADED)
+        if include_heartbeat:
+            filenames += HEARTBEAT_ONLY
 
     sections: list[str] = []
+    total_chars = 0
+
     for filename in filenames:
         path = directory / filename
         if not path.exists():
@@ -138,7 +167,20 @@ def load_workspace_context(
         if not content or _is_effectively_empty(content):
             continue
 
+        # Per-file truncation
+        content = _truncate_content(content, BOOTSTRAP_PER_FILE_CHAR_BUDGET)
+
+        # Total budget check
+        if total_chars + len(content) > BOOTSTRAP_TOTAL_CHAR_BUDGET:
+            remaining = BOOTSTRAP_TOTAL_CHAR_BUDGET - total_chars
+            if remaining > 500:
+                content = _truncate_content(content, remaining)
+            else:
+                logger.warning("Total bootstrap budget exceeded, skipping %s", filename)
+                continue
+
         sections.append(f"## [{filename}]\n\n{content}")
+        total_chars += len(content)
 
     if not sections:
         return ""

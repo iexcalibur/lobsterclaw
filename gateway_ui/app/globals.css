@@ -1,0 +1,108 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #09090b;
+  --bg-card: #18181b;
+  --bg-hover: #27272a;
+  --border: #27272a;
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl bg-zinc-900 border border-zinc-800 p-5;
+  }
+
+  .card-hover {
+    @apply card transition-colors hover:border-zinc-700;
+  }
+
+  .badge {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
+  }
+
+  .badge-green {
+    @apply badge bg-emerald-500/10 text-emerald-400 ring-1 ring-emerald-500/20;
+  }
+
+  .badge-blue {
+    @apply badge bg-blue-500/10 text-blue-400 ring-1 ring-blue-500/20;
+  }
+
+  .badge-yellow {
+    @apply badge bg-yellow-500/10 text-yellow-400 ring-1 ring-yellow-500/20;
+  }
+
+  .badge-red {
+    @apply badge bg-red-500/10 text-red-400 ring-1 ring-red-500/20;
+  }
+
+  .badge-zinc {
+    @apply badge bg-zinc-500/10 text-zinc-400 ring-1 ring-zinc-500/20;
+  }
+
+  .badge-purple {
+    @apply badge bg-purple-500/10 text-purple-400 ring-1 ring-purple-500/20;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center rounded-lg px-3 py-1.5 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-zinc-900;
+  }
+
+  .btn-primary {
+    @apply btn bg-blue-600 text-white hover:bg-blue-500;
+  }
+
+  .btn-ghost {
+    @apply btn text-zinc-400 hover:text-white hover:bg-zinc-800;
+  }
+
+  .input {
+    @apply w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white placeholder-zinc-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500;
+  }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.pulse-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-in {
+  animation: fade-in 0.3s ease-out;
+}

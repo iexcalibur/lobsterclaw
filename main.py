@@ -287,6 +287,22 @@ def main() -> None:
     )
 
     # ----------------------------------------------------------------
+    # Configure Gateway API (Mission Control dashboard)
+    # ----------------------------------------------------------------
+
+    use_gateway = cfg.gateway_enabled
+    if use_gateway:
+        from gateway.server import configure as configure_gateway
+        configure_gateway(
+            registry=registry,
+            cron_mgr=cron_mgr,
+            agent_fn=lambda msg: agent_for_bg(msg),
+            send_fn=primary.send_message,
+            history_mgr=history,
+        )
+        logger.info("Gateway API configured (port %d)", cfg.gateway_port)
+
+    # ----------------------------------------------------------------
     # Start schedulers
     # ----------------------------------------------------------------
 
@@ -328,26 +344,36 @@ def main() -> None:
             cfg.canvas_host_port,
         )
 
-    if len(channels) == 1 and not use_canvas_host:
-        # Simple single-account blocking path (no canvas host)
+    if len(channels) == 1 and not use_canvas_host and not use_gateway:
+        # Simple single-account blocking path (no extra servers)
         logger.info("Starting single-account bot...")
         channels[0].run()
     else:
-        # Async path: multi-account OR canvas host (or both)
+        # Async path: multi-account OR canvas host OR gateway (or any combo)
         logger.info(
-            "Starting %d account(s) in async mode (canvas_host=%s)...",
+            "Starting %d account(s) in async mode (canvas_host=%s, gateway=%s)...",
             len(channels),
             use_canvas_host,
+            use_gateway,
         )
-        asyncio.run(_run_async_main(channels, start_canvas_host=use_canvas_host))
+        asyncio.run(_run_async_main(
+            channels,
+            start_canvas_host=use_canvas_host,
+            start_gateway=use_gateway,
+        ))
 
 
-async def _run_async_main(channels: list, *, start_canvas_host: bool = False) -> None:
+async def _run_async_main(
+    channels: list,
+    *,
+    start_canvas_host: bool = False,
+    start_gateway: bool = False,
+) -> None:
     """
     Async entry point for:
     - Multi-account Telegram bots
-    - Single account + canvas host
-    - Both
+    - Single account + canvas host / gateway
+    - All together
     """
     stop_event = asyncio.Event()
 
@@ -356,12 +382,11 @@ async def _run_async_main(channels: list, *, start_canvas_host: bool = False) ->
         try:
             loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
-            # Windows doesn't support add_signal_handler
             pass
 
     tasks: list[asyncio.Task] = []
 
-    # Start canvas host (runs alongside the Telegram bot(s))
+    # Canvas host
     if start_canvas_host:
         from canvas_host.server import run_server
         cfg = get_config()
@@ -372,7 +397,18 @@ async def _run_async_main(channels: list, *, start_canvas_host: bool = False) ->
         tasks.append(canvas_task)
         logger.info("Canvas host task started on %s:%d", cfg.canvas_host_bind, cfg.canvas_host_port)
 
-    # Start all Telegram channels
+    # Gateway API (Mission Control dashboard)
+    if start_gateway:
+        from gateway.server import run_server as run_gateway
+        cfg = get_config()
+        gw_task = asyncio.create_task(
+            run_gateway(host=cfg.gateway_bind, port=cfg.gateway_port),
+            name="gateway-api",
+        )
+        tasks.append(gw_task)
+        logger.info("Gateway API task started on %s:%d", cfg.gateway_bind, cfg.gateway_port)
+
+    # Telegram channels
     for ch in channels:
         t = asyncio.create_task(ch.run_async(), name=f"telegram-{getattr(ch, 'label', 'main')}")
         tasks.append(t)
@@ -383,11 +419,9 @@ async def _run_async_main(channels: list, *, start_canvas_host: bool = False) ->
     # Graceful shutdown
     logger.info("Shutting down...")
 
-    # Stop Telegram bots first
     stop_tasks = [asyncio.create_task(ch.stop_async()) for ch in channels]
     await asyncio.gather(*stop_tasks, return_exceptions=True)
 
-    # Cancel remaining tasks (canvas host, etc.)
     for t in tasks:
         if not t.done():
             t.cancel()

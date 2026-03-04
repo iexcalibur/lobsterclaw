@@ -12,6 +12,7 @@ On load, the last max_history_messages entries are loaded into memory.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Message:
     role: str   # "user" | "assistant" | "system"
-    content: str
+    content: str | list  # str for text, list for structured blocks (tool_use, images, etc.)
 
 
 class HistoryManager:
@@ -67,7 +68,18 @@ class HistoryManager:
         ).fetchall()
         conn.close()
         # Reverse so oldest-first
-        return [Message(role=r, content=c) for r, c in reversed(rows)]
+        messages = []
+        for r, c in reversed(rows):
+            content: str | list = c
+            if c.startswith("["):
+                try:
+                    parsed = json.loads(c)
+                    if isinstance(parsed, list):
+                        content = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            messages.append(Message(role=r, content=content))
+        return messages
 
     def _persist(self, user_id: str, role: str, content: str) -> None:
         try:
@@ -94,7 +106,7 @@ class HistoryManager:
         except Exception as e:
             logger.warning("History persist failed: %s", e)
 
-    def add(self, user_id: str, role: str, content: str) -> None:
+    def add(self, user_id: str, role: str, content: str | list) -> None:
         if user_id not in self._cache:
             self._cache[user_id] = self._load_from_db(user_id)
 
@@ -105,7 +117,8 @@ class HistoryManager:
         if len(self._cache[user_id]) > max_msgs:
             self._cache[user_id] = self._cache[user_id][-max_msgs:]
 
-        self._persist(user_id, role, content)
+        db_content = json.dumps(content, ensure_ascii=False) if isinstance(content, list) else content
+        self._persist(user_id, role, db_content)
 
     def get_for_llm(self, user_id: str) -> list[dict]:
         if user_id not in self._cache:

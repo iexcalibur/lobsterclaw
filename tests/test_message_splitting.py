@@ -1,6 +1,6 @@
 """Tests for Telegram message splitting."""
 import pytest
-from channels.telegram import _split_message
+from channels.telegram import _render_telegram_markdown_html, _split_message
 
 
 def test_short_message_not_split():
@@ -52,3 +52,25 @@ def test_unicode_not_corrupted():
     result = _split_message(text)
     combined = "".join(result)
     assert combined == text
+
+
+def test_render_markdown_bold_and_inline_code():
+    raw = "Hello **world** with `x=1`."
+    rendered = _render_telegram_markdown_html(raw)
+    assert "<b>world</b>" in rendered
+    assert "<code>x=1</code>" in rendered
+    assert "**" not in rendered
+
+
+def test_render_markdown_fenced_code():
+    raw = "```python\nprint('hi')\n```"
+    rendered = _render_telegram_markdown_html(raw)
+    assert rendered.startswith("<pre><code")
+    assert "print" in rendered
+    assert "```" not in rendered
+
+
+def test_render_skips_plain_html_without_markdown_markers():
+    raw = "<b>Status</b>\nReady"
+    rendered = _render_telegram_markdown_html(raw)
+    assert rendered == raw

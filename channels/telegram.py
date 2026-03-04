@@ -8,13 +8,14 @@ Sends: text (HTML ParseMode), photos, documents, voice/audio, stickers,
        inline buttons, pin/unpin, reactions
 
 Auth policy:
-  DM:    "owner" | "allowlist" (+ allow_from) | "pairing" (approve flow) | "open"
+  DM:    "owner" | "allowlist" (+ allow_from) | "pairing" (approve or code flow) | "open"
   Group: "disabled" | "open" | "allowlist" (TELEGRAM_GROUP_ALLOWLIST)
   Per-chat overrides via TELEGRAM_CHAT_POLICIES JSON (checked first).
   Forum threads: each thread gets its own isolated conversation context.
 
 New features (Tier 1 + 2):
   - Pairing mode: unknown DM users get Approve/Deny flow to owner
+  - Pairing codes: owner can generate one-time codes; users redeem via /pair <code> or /start <code>
   - Mention gating: TELEGRAM_MENTION_REQUIRED=true ignores non-mentions in groups
   - requireTopic: TELEGRAM_REQUIRE_TOPIC=<thread_id> restricts group to one thread
   - setMyCommands: synced to Telegram on startup
@@ -42,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import json
 import logging
 import os
@@ -186,7 +188,7 @@ class TelegramChannel:
             BotCommand("help", "Show help"),
             BotCommand("status", "Show bot status"),
             BotCommand("model", "Show or switch LLM model"),
-            BotCommand("pair", "List or revoke paired users (owner only)"),
+            BotCommand("pair", "Pairing status / code (owner) or redeem code"),
         ]
         try:
             await self._bot.set_my_commands(commands)
@@ -362,21 +364,57 @@ class TelegramChannel:
     def _context_key(self, update: Update) -> str:
         """
         Return the conversation context key for history lookups.
-        Namespaced by account label for multi-account safety.
-        - DM:           "main:user:<user_id>"
-        - Group:        "main:group:<chat_id>"
-        - Forum thread: "main:thread:<chat_id>:<thread_id>"
+        Uses OpenClaw's hierarchical session key format:
+          agent:main:telegram:direct:<user_id>
+          agent:main:telegram:group:<chat_id>
+          agent:main:telegram:group:<chat_id>:thread:<thread_id>
         """
-        label = self._label
+        agent_id = getattr(self.cfg, "agent_id", "") or "main"
         chat = update.effective_chat
         msg = update.effective_message
         if chat and chat.type in ("group", "supergroup"):
             thread_id = msg.message_thread_id if msg else None
             if thread_id:
-                return f"{label}:thread:{chat.id}:{thread_id}"
-            return f"{label}:group:{chat.id}"
+                return f"agent:{agent_id}:telegram:group:{chat.id}:thread:{thread_id}"
+            return f"agent:{agent_id}:telegram:group:{chat.id}"
         user_id = update.effective_user.id if update.effective_user else "unknown"
-        return f"{label}:user:{user_id}"
+        return f"agent:{agent_id}:telegram:direct:{user_id}"
+
+    def _build_sender_context(self, update: Update) -> str:
+        """Build per-turn sender metadata from Telegram update JSON fields."""
+        user = update.effective_user
+        chat = update.effective_chat
+        msg = update.effective_message
+        if not user:
+            return ""
+
+        name_parts = [p for p in [user.first_name, user.last_name] if p]
+        display_name = " ".join(name_parts).strip() or (user.username or str(user.id))
+        role = "owner" if user.id == self._owner_id else "user"
+
+        lines = [
+            "Current sender metadata (from Telegram update):",
+            f"- role: {role}",
+            f"- user_id: {user.id}",
+            f"- username: @{user.username}" if user.username else "- username: (none)",
+            f"- display_name: {display_name}  ← this IS the user's name; use it directly to answer 'what is my name?' questions",
+        ]
+        if chat:
+            lines.append(f"- chat_id: {chat.id}")
+            lines.append(f"- chat_type: {chat.type}")
+            title = getattr(chat, "title", None)
+            if title:
+                lines.append(f"- chat_title: {title}")
+        if msg:
+            lines.append(f"- message_id: {msg.message_id}")
+            if msg.message_thread_id:
+                lines.append(f"- message_thread_id: {msg.message_thread_id}")
+        lines.append(
+            "Use display_name as the user's name. "
+            "Do NOT say you don't know the user's name — it is always available above. "
+            "Do not dump raw metadata unless asked."
+        )
+        return "\n".join(lines)
 
     def _should_respond_in_group(self, update: Update) -> bool:
         """
@@ -421,6 +459,15 @@ class TelegramChannel:
         if dm_policy == "pairing" and chat.type == "private" and user.id != self._owner_id:
             from agent.pairing import get_pairing_store
             store = get_pairing_store()
+            # Support Telegram deep-link pairing: /start <CODE>
+            start_code = (ctx.args[0].strip() if ctx.args else "")
+            if start_code and not store.is_approved(user.id):
+                ok, status = await self._redeem_pairing_code(user, start_code, store)
+                if ok:
+                    await update.message.reply_text("Pairing successful. You can now chat with the bot.")
+                else:
+                    await update.message.reply_text(self._pairing_code_error_text(status))
+                return
             if store.is_approved(user.id):
                 await update.message.reply_text("You're already connected. Send me a message.")
             elif store.is_pending(user.id):
@@ -433,7 +480,7 @@ class TelegramChannel:
 
         if not self._is_allowed(update):
             return
-        await update.message.reply_text("LobsterClaw is running. Send me a message.")
+        await update.message.reply_text("LobsterClaw is online. Send me a message to get started.")
 
     async def _send_pairing_request(self, user, store) -> None:
         import uuid
@@ -464,10 +511,43 @@ class TelegramChannel:
         try:
             await self._bot.send_message(
                 chat_id=user.id,
-                text="Your access request has been sent to the owner. Please wait for approval.",
+                text=(
+                    "LobsterClaw: access not configured. "
+                    "Your request has been sent to the owner for approval. "
+                    "Alternatively, ask the owner for a pairing code and use /pair <code>."
+                ),
             )
         except Exception:
             pass
+
+    def _pairing_code_error_text(self, status: str) -> str:
+        if status == "expired":
+            return "That pairing code has expired. Ask the owner for a new one."
+        if status == "used":
+            return "That pairing code has already been used. Ask for a fresh code."
+        return "Invalid pairing code. Use /pair <code> with a valid code from the owner."
+
+    async def _redeem_pairing_code(self, user, code: str, store) -> tuple[bool, str]:
+        ok, status = store.redeem_code(
+            code=code,
+            user_id=user.id,
+            username=user.username or "",
+            first_name=user.first_name or "",
+        )
+        if ok and status == "approved":
+            # Notify owner that this user was approved via code.
+            try:
+                await self._safe_send(
+                    self._owner_id,
+                    (
+                        "<b>Pairing approved by code</b>\n\n"
+                        f"User: <b>{user.first_name or user.username or user.id}</b> "
+                        f"(@{user.username or 'no_username'}, ID: <code>{user.id}</code>)"
+                    ),
+                )
+            except Exception:
+                pass
+        return ok, status
 
     async def _cmd_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_allowed(update):
@@ -484,7 +564,7 @@ class TelegramChannel:
             "/reset — Clear conversation history\n"
             "/status — Show bot and agent status\n"
             "/model [name] — Show or switch LLM model\n"
-            "/pair — List/revoke paired users (owner only)\n"
+            "/pair — Pairing status / generate code (owner), or redeem code (user)\n"
             "/help — This message\n\n"
             "Send any text, photo, voice, video, or document to chat with the agent."
         )
@@ -531,12 +611,72 @@ class TelegramChannel:
             )
 
     async def _cmd_pair(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """List approved/pending pairings or revoke a user (owner only)."""
-        if not self._is_owner(update):
-            return
+        """
+        Pairing command.
+        - Owner: list/revoke users, generate one-time codes.
+        - Non-owner (DM, pairing mode): redeem a code via /pair <code>.
+        """
         from agent.pairing import get_pairing_store
+
+        user = update.effective_user
+        chat = update.effective_chat
+        if not user or not chat:
+            return
+
+        dm_policy = (
+            self._account.dm_policy
+            or getattr(self.cfg, "telegram_dm_policy", "owner")
+        )
+        if dm_policy != "pairing":
+            if self._is_owner(update):
+                await update.message.reply_text("Pairing mode is disabled (TELEGRAM_DM_POLICY is not 'pairing').")
+            return
+
         store = get_pairing_store()
         args = ctx.args or []
+
+        # Non-owner path: redeem pairing code
+        if not self._is_owner(update):
+            if chat.type != "private":
+                return
+            if store.is_approved(user.id):
+                await update.message.reply_text("You're already connected. Send me a message.")
+                return
+            if not args:
+                await update.message.reply_text("Use /pair <code> with a code from the owner.")
+                return
+            ok, status = await self._redeem_pairing_code(user, args[0], store)
+            if ok:
+                await update.message.reply_text("Pairing successful. You can now chat with the bot.")
+            else:
+                await update.message.reply_text(self._pairing_code_error_text(status))
+            return
+
+        # Owner path: generate one-time code
+        if args and args[0] == "code":
+            ttl_minutes = 15
+            if len(args) > 1:
+                try:
+                    ttl_minutes = int(args[1])
+                except ValueError:
+                    await update.message.reply_text("Usage: /pair code [ttl_minutes]")
+                    return
+            if ttl_minutes < 1 or ttl_minutes > 1440:
+                await update.message.reply_text("TTL must be between 1 and 1440 minutes.")
+                return
+            code = store.create_pairing_code(created_by=self._owner_id, ttl_minutes=ttl_minutes)
+            bot_username = getattr(self._bot, "username", "") or ""
+            deep_link = f"https://t.me/{bot_username}?start={code}" if bot_username else ""
+            text = (
+                "<b>Pairing code created</b>\n\n"
+                f"Code: <code>{code}</code>\n"
+                f"TTL: {ttl_minutes} minute(s)\n"
+                "Redeem: <code>/pair &lt;code&gt;</code>"
+            )
+            if deep_link:
+                text += f"\nDeep link: {deep_link}"
+            await self._safe_send(update.effective_chat.id, text)
+            return
 
         if args and args[0] == "revoke" and len(args) > 1:
             try:
@@ -550,6 +690,8 @@ class TelegramChannel:
 
         approved = store.list_approved()
         pending = store.list_pending()
+        active_codes = store.list_active_codes()
+
         lines = ["<b>Pairing Status</b>\n"]
         if approved:
             lines.append(f"<b>Approved ({len(approved)}):</b>")
@@ -567,6 +709,14 @@ class TelegramChannel:
                     f"  • {u.get('first_name', '')} @{u.get('username', '')} "
                     f"(<code>{u['user_id']}</code>)"
                 )
+        if active_codes:
+            lines.append(f"\n<b>Active Codes ({len(active_codes)}):</b>")
+            for c in active_codes:
+                lines.append(
+                    f"  • <code>{c['code']}</code> "
+                    f"(uses_left={c['uses_left']}, expires={c['expires_at']} UTC)"
+                )
+        lines.append("\nUsage: /pair code [ttl_minutes] | /pair revoke <user_id>")
         await self._safe_send(update.effective_chat.id, "\n".join(lines))
 
     # ------------------------------------------------------------------
@@ -952,7 +1102,10 @@ class TelegramChannel:
             "agent_id": getattr(self.cfg, "agent_id", ""),
         }
         system = self.build_prompt(
-            self.cfg, tool_names, runtime_info=_runtime_info
+            self.cfg,
+            tool_names,
+            runtime_info=_runtime_info,
+            extra_system_prompt=self._build_sender_context(update),
         )
         messages = self.history.get_for_llm(context_key)
         reactions_enabled = getattr(self.cfg, "telegram_reactions_enabled", True)
@@ -1040,10 +1193,13 @@ class TelegramChannel:
     async def _stream_update(self, state: _StreamState, text: str) -> None:
         """Send or edit the streaming preview message (rate-limited)."""
         now = time.monotonic()
-        min_interval = getattr(self.cfg, "llm_stream_min_edit_interval", 1.5)
+        min_interval = getattr(self.cfg, "llm_stream_min_edit_interval", 3.0)
+        min_chars_delta = 100
 
         if state.preview_msg_id is None:
-            # First chunk: send initial message
+            if len(text) < 50:
+                state.text = text
+                return
             try:
                 preview_text = text[:MAX_STREAM_PREVIEW_LEN]
                 if len(text) > MAX_STREAM_PREVIEW_LEN:
@@ -1052,6 +1208,7 @@ class TelegramChannel:
                     state.chat_id,
                     preview_text,
                     message_thread_id=state.message_thread_id,
+                    format_markdown=True,
                 )
                 if msgs:
                     state.preview_msg_id = msgs[-1].message_id
@@ -1061,18 +1218,20 @@ class TelegramChannel:
                 logger.debug("[%s] Stream initial send failed: %s", self._label, e)
             return
 
-        # Rate-limit subsequent edits
         if now - state.last_edit_at < min_interval:
+            return
+        if len(text) - len(state.text) < min_chars_delta:
             return
 
         try:
             preview_text = text[:MAX_STREAM_PREVIEW_LEN]
             if len(text) > MAX_STREAM_PREVIEW_LEN:
                 preview_text += "…"
+            rendered_preview = _render_telegram_markdown_html(preview_text)
             await self._bot.edit_message_text(
                 chat_id=state.chat_id,
                 message_id=state.preview_msg_id,
-                text=preview_text,
+                text=rendered_preview,
                 parse_mode=ParseMode.HTML,
             )
             state.last_edit_at = now
@@ -1084,7 +1243,7 @@ class TelegramChannel:
             elif "can't parse" in err or "html" in err:
                 # Parse error in preview — try plain text
                 try:
-                    plain = HTML_STRIP_RE.sub("", text[:MAX_STREAM_PREVIEW_LEN])
+                    plain = HTML_STRIP_RE.sub("", _render_telegram_markdown_html(text[:MAX_STREAM_PREVIEW_LEN]))
                     await self._bot.edit_message_text(
                         chat_id=state.chat_id,
                         message_id=state.preview_msg_id,
@@ -1107,17 +1266,23 @@ class TelegramChannel:
         """
         if state.preview_msg_id is None:
             # No streaming happened — send normally
-            await self._send_chunked(chat_id, reply, message_thread_id=state.message_thread_id)
+            await self._send_chunked(
+                chat_id,
+                reply,
+                message_thread_id=state.message_thread_id,
+                format_markdown=True,
+            )
             return
 
         chunks = _split_message(reply)
         if len(chunks) == 1:
             # Single chunk: do a final edit with the complete text
             try:
+                rendered_reply = _render_telegram_markdown_html(reply)
                 await self._bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=state.preview_msg_id,
-                    text=reply,
+                    text=rendered_reply,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=not getattr(self.cfg, "telegram_link_preview", True),
                 )
@@ -1129,7 +1294,7 @@ class TelegramChannel:
                 if "can't parse" in err or "html" in err:
                     # Strip HTML and retry edit
                     try:
-                        plain = HTML_STRIP_RE.sub("", reply)
+                        plain = HTML_STRIP_RE.sub("", _render_telegram_markdown_html(reply))
                         await self._bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=state.preview_msg_id,
@@ -1147,7 +1312,12 @@ class TelegramChannel:
             await self._bot.delete_message(chat_id, state.preview_msg_id)
         except Exception:
             pass
-        await self._send_chunked(chat_id, reply, message_thread_id=state.message_thread_id)
+        await self._send_chunked(
+            chat_id,
+            reply,
+            message_thread_id=state.message_thread_id,
+            format_markdown=True,
+        )
 
     async def _typing_loop(self, chat_id: int) -> None:
         _backoff = False
@@ -1265,7 +1435,7 @@ class TelegramChannel:
 
     async def send_message(self, text: str) -> None:
         """Send text to owner."""
-        await self._send_chunked(self._owner_id, text)
+        await self._send_chunked(self._owner_id, text, format_markdown=True)
 
     async def send_to(
         self,
@@ -1285,7 +1455,7 @@ class TelegramChannel:
         chunks = _split_message(text)
         last_msg = None
         for chunk in chunks:
-            msgs = await self._safe_send(int(chat_id), chunk, **kwargs)
+            msgs = await self._safe_send(int(chat_id), chunk, format_markdown=True, **kwargs)
             if msgs:
                 last_msg = msgs[-1]
         return last_msg.message_id if last_msg else None
@@ -1363,12 +1533,26 @@ class TelegramChannel:
         kwargs: dict = {}
         if markup:
             kwargs["reply_markup"] = markup
-        result = await self._bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text[:4096],
-            **kwargs,
-        )
+        rendered = _render_telegram_markdown_html(text[:4096])
+        try:
+            result = await self._bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=rendered,
+                parse_mode=ParseMode.HTML,
+                **kwargs,
+            )
+        except BadRequest as e:
+            err_lower = str(e).lower()
+            if "can't parse" in err_lower or "parse" in err_lower or "html" in err_lower:
+                result = await self._bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=HTML_STRIP_RE.sub("", rendered),
+                    **kwargs,
+                )
+            else:
+                raise
         return result.message_id if isinstance(result, Message) else message_id
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
@@ -1563,6 +1747,7 @@ class TelegramChannel:
         reply_to_message_id: int | None = None,
         message_thread_id: int | None = None,
         disable_notification: bool = False,
+        format_markdown: bool = False,
     ) -> list[Message]:
         chunks = _split_message(text)
         sent = []
@@ -1578,10 +1763,11 @@ class TelegramChannel:
                 kwargs["disable_notification"] = True
             if disable_web_preview:
                 kwargs["disable_web_page_preview"] = True
+            outbound_text = _render_telegram_markdown_html(chunk) if format_markdown else chunk
             try:
                 msg = await self._bot.send_message(
                     chat_id=chat_id,
-                    text=chunk,
+                    text=outbound_text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=markup,
                     **kwargs,
@@ -1590,7 +1776,7 @@ class TelegramChannel:
             except BadRequest as e:
                 err_lower = str(e).lower()
                 if "can't parse" in err_lower or "parse" in err_lower or "html" in err_lower:
-                    plain = HTML_STRIP_RE.sub("", chunk)
+                    plain = HTML_STRIP_RE.sub("", outbound_text)
                     try:
                         msg = await self._bot.send_message(
                             chat_id=chat_id,
@@ -1612,8 +1798,15 @@ class TelegramChannel:
         chat_id: int,
         text: str,
         message_thread_id: int | None = None,
+        *,
+        format_markdown: bool = False,
     ) -> None:
-        await self._safe_send(chat_id, text, message_thread_id=message_thread_id)
+        await self._safe_send(
+            chat_id,
+            text,
+            message_thread_id=message_thread_id,
+            format_markdown=format_markdown,
+        )
 
     # ------------------------------------------------------------------
     # File download helper
@@ -1738,6 +1931,53 @@ def _split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def _render_telegram_markdown_html(text: str) -> str:
+    """
+    Convert common markdown-ish patterns to Telegram HTML.
+    Leaves pure plain/HTML text unchanged to avoid breaking bot-authored HTML responses.
+    """
+    if not text:
+        return ""
+    if not any(tok in text for tok in ("```", "**", "__", "`", "~~", "# ")):
+        return text
+
+    placeholders: list[str] = []
+
+    def _stash(value: str) -> str:
+        token = f"@@TGPH{len(placeholders)}@@"
+        placeholders.append(value)
+        return token
+
+    # Preserve fenced code blocks first.
+    def _fence_repl(match: re.Match) -> str:
+        lang = (match.group(1) or "").strip()
+        code = (match.group(2) or "").strip("\n")
+        lang_attr = f' class="language-{html.escape(lang)}"' if lang else ""
+        return _stash(f"<pre><code{lang_attr}>{html.escape(code)}</code></pre>")
+
+    staged = re.sub(r"```([A-Za-z0-9_.+-]*)\n(.*?)```", _fence_repl, text, flags=re.DOTALL)
+
+    # Preserve inline code spans before escaping.
+    def _inline_code_repl(match: re.Match) -> str:
+        return _stash(f"<code>{html.escape(match.group(1))}</code>")
+
+    staged = re.sub(r"`([^`\n]+)`", _inline_code_repl, staged)
+
+    # Escape remaining text, then apply lightweight markdown transforms.
+    rendered = html.escape(staged)
+    rendered = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"\*\*([^\n*][^*]*?)\*\*", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"__([^_\n][^_]*?)__", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"~~([^~\n][^~]*?)~~", r"<s>\1</s>", rendered)
+
+    # Restore preserved HTML segments.
+    for idx, value in enumerate(placeholders):
+        token = html.escape(f"@@TGPH{idx}@@")
+        rendered = rendered.replace(token, value)
+
+    return rendered
 
 
 def _extract_reply_body(reply_msg: Message) -> str | None:

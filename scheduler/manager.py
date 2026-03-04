@@ -152,6 +152,25 @@ class CronManager:
             logger.error("Failed to schedule job %s (%s): %s", job_id, schedule, e)
             raise
 
+    async def _get_recent_context(self, n: int = 5) -> str:
+        """Fetch N most recent messages from the main session history for context."""
+        try:
+            from agent.sessions import get_session_store
+            store = get_session_store()
+            messages = await store.get_messages("main", limit=n)
+            if not messages:
+                return ""
+            lines = []
+            for msg in messages[-n:]:
+                role = msg["role"].upper()
+                content = msg["content"]
+                if len(content) > 200:
+                    content = content[:200] + "..."
+                lines.append(f"[{role}]: {content}")
+            return "Recent conversation context:\n" + "\n".join(lines)
+        except Exception:
+            return ""
+
     async def _fire(self, job_id: str, message: str) -> None:
         logger.info("Firing cron job: %s", job_id)
         conn = sqlite3.connect(str(self.cfg.cron_db))
@@ -178,32 +197,48 @@ class CronManager:
 
         try:
             if delivery == "direct":
-                # Skip AI — send reminder text directly to the user
                 await self._send_fn(f"⏰ *Reminder*\n\n{message}")
                 self._record_run(job_id, fired_at, "ok")
             elif session_target == "isolated":
-                # Spawn a sub-agent for this cron run
                 if self._agent_fn:
                     import asyncio
                     asyncio.create_task(
                         self._fire_isolated(job_id, fired_at, message)
                     )
-                    # Note: delete_after_run handled in _fire_isolated
                     return
                 else:
                     await self._send_fn(f"⏰ *Reminder* (isolated mode unavailable)\n\n{message}")
                     self._record_run(job_id, fired_at, "ok")
             else:
-                # Default: agent delivery in main session
                 if self._agent_fn:
-                    reply = await self._agent_fn(f"[Scheduled reminder] {message}")
-                    await self._send_fn(reply)
+                    context = await self._get_recent_context(5)
+                    prompt = f"[Scheduled reminder — deliver this to the user] {message}"
+                    if context:
+                        prompt = f"{context}\n\n{prompt}"
+
+                    reply = await self._agent_fn(prompt)
+
+                    silent_token = "NO_REPLY"
+                    heartbeat_ok = "HEARTBEAT_OK"
+                    if reply and reply.strip() in (silent_token, heartbeat_ok):
+                        reply = f"⏰ Reminder: {message}"
+
+                    if reply and reply.strip():
+                        await self._send_fn(reply)
+                    else:
+                        await self._send_fn(f"⏰ Reminder: {message}")
+                    self._record_run(job_id, fired_at, "ok")
                 else:
                     await self._send_fn(f"⏰ *Reminder*\n\n{message}")
-                self._record_run(job_id, fired_at, "ok")
+                    self._record_run(job_id, fired_at, "ok")
         except Exception as e:
             logger.error("Cron job %s fire failed: %s", job_id, e)
             self._record_run(job_id, fired_at, "error", str(e))
+            try:
+                if self._send_fn:
+                    await self._send_fn(f"⏰ Reminder (agent unavailable): {message}")
+            except Exception:
+                pass
         finally:
             # deleteAfterRun: remove from DB and scheduler after first successful execution
             if delete_after_run:

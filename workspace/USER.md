@@ -1,4 +1,4 @@
-# USER.md — About Your Human
+# USER.md - About Your Human
 
 _Learn about the person you're helping. Update this as you go._
 
@@ -6,20 +6,12 @@ _Learn about the person you're helping. Update this as you go._
 - **What to call them:**
 - **Pronouns:** _(optional)_
 - **Timezone:**
-- **Location:**
-- **Occupation:**
-
-## Preferences
-
-- **Communication style:** _(brief / detailed / casual / formal)_
-- **Language:** _(English / Hindi / mixed)_
-- **Response length preference:** _(short / medium / detailed)_
+- **Notes:**
 
 ## Context
 
-_(What do they care about? What projects are they working on?
-What annoys them? What makes them laugh? Build this over time.)_
+_(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)_
 
-## Notes
+---
 
-_(Anything else the assistant should know and remember.)_
+The more you know, the better you can help. But remember — you're learning about a person, not building a dossier. Respect the difference.

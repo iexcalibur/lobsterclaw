@@ -59,6 +59,15 @@ _OPENAI_RETRY_TYPES = (
     openai.InternalServerError,
 )
 
+# Per-session locks to prevent concurrent agent runs on the same session
+_session_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_session_lock(session_id: str) -> asyncio.Lock:
+    if session_id not in _session_locks:
+        _session_locks[session_id] = asyncio.Lock()
+    return _session_locks[session_id]
+
 
 async def _retry_api(coro_factory, max_retries: int, label: str):
     """Retry an API call up to max_retries times with exponential back-off."""
@@ -88,6 +97,21 @@ def _sanitize_error(e: Exception) -> str:
     if len(msg) > 400:
         msg = msg[:400] + "…"
     return f"[{name}] {msg}"
+
+
+_ANTHROPIC_REFUSAL_STRINGS = [
+    "I cannot and will not",
+    "I need to be direct",
+    "I don't feel comfortable",
+    "I'm not able to help with",
+    "I appreciate you sharing",
+]
+
+
+def _scrub_refusal_strings(text: str) -> str:
+    for pattern in _ANTHROPIC_REFUSAL_STRINGS:
+        text = text.replace(pattern, "[...]")
+    return text
 
 
 def repair_transcript(messages: list[dict]) -> list[dict]:
@@ -178,6 +202,17 @@ def repair_transcript(messages: list[dict]) -> list[dict]:
         logger.debug("repair_transcript: removing leading assistant message")
         cleaned.pop(0)
 
+    # Pass 5: scrub known Anthropic refusal magic strings from assistant messages
+    for msg in cleaned:
+        if msg.get("role") == "assistant":
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = _scrub_refusal_strings(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        block["text"] = _scrub_refusal_strings(block.get("text", ""))
+
     return cleaned
 
 
@@ -205,6 +240,169 @@ def _extract_reasoning_split(text: str, show_thinking: bool) -> str:
     return final_text or text  # fallback to original if nothing parsed
 
 
+def _coerce_text_value(value) -> str:
+    """Coerce unknown Anthropic content values into plain text."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("text", "value", "content"):
+            maybe = value.get(key)
+            if isinstance(maybe, str):
+                return maybe
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _coerce_tool_input(value) -> dict:
+    """Normalize tool input payload to a dict shape Anthropic accepts."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"value": parsed}
+        except Exception:
+            return {"value": value}
+    return {"value": value}
+
+
+def _sanitize_anthropic_block(block) -> dict | None:
+    """
+    Keep only Anthropic-supported block fields.
+    This strips SDK extras (e.g. parsed_output) that can cause 400 errors.
+    """
+    if not isinstance(block, dict):
+        return {"type": "text", "text": _coerce_text_value(block)}
+
+    btype = block.get("type")
+    if btype == "text":
+        return {"type": "text", "text": _coerce_text_value(block.get("text", ""))}
+
+    if btype == "image":
+        source = block.get("source")
+        if not isinstance(source, dict):
+            return None
+        stype = source.get("type")
+        if stype == "base64":
+            data = source.get("data")
+            media_type = source.get("media_type")
+            if isinstance(data, str) and data and isinstance(media_type, str) and media_type:
+                return {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    },
+                }
+        if stype == "url":
+            url = source.get("url")
+            if isinstance(url, str) and url:
+                return {
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": url,
+                    },
+                }
+        return None
+
+    if btype == "tool_use":
+        tool_id = block.get("id") or block.get("tool_use_id")
+        name = block.get("name")
+        if not tool_id or not name:
+            return None
+        return {
+            "type": "tool_use",
+            "id": str(tool_id),
+            "name": str(name),
+            "input": _coerce_tool_input(block.get("input", {})),
+        }
+
+    if btype == "tool_result":
+        tool_use_id = block.get("tool_use_id")
+        if not tool_use_id:
+            return None
+        content = block.get("content", "")
+        if isinstance(content, (dict, list)):
+            try:
+                content = json.dumps(content, ensure_ascii=False)
+            except Exception:
+                content = str(content)
+        elif content is None:
+            content = ""
+        else:
+            content = str(content)
+        result = {
+            "type": "tool_result",
+            "tool_use_id": str(tool_use_id),
+            "content": content,
+        }
+        if "is_error" in block:
+            result["is_error"] = bool(block.get("is_error"))
+        return result
+
+    # Skip unknown/unsupported block types (e.g. thinking) in request transcripts.
+    return None
+
+
+def _sanitize_anthropic_messages(messages: list[dict]) -> list[dict]:
+    """Sanitize transcript before Anthropic API calls."""
+    out: list[dict] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = msg.get("content", "")
+
+        if isinstance(content, list):
+            blocks: list[dict] = []
+            for block in content:
+                normalized = _sanitize_anthropic_block(block)
+                if normalized:
+                    blocks.append(normalized)
+            if blocks:
+                out.append({"role": role, "content": blocks})
+            continue
+
+        if not isinstance(content, str):
+            content = _coerce_text_value(content)
+        if content:
+            out.append({"role": role, "content": content})
+    return out
+
+
+def _response_blocks_to_anthropic_input_blocks(response_blocks) -> list[dict]:
+    """Convert Anthropic response blocks to valid request blocks for transcript replay."""
+    blocks: list[dict] = []
+    for block in response_blocks:
+        btype = getattr(block, "type", None)
+        if btype == "text":
+            text = _coerce_text_value(getattr(block, "text", ""))
+            blocks.append({"type": "text", "text": text})
+        elif btype == "tool_use":
+            tool_id = getattr(block, "id", None)
+            name = getattr(block, "name", None)
+            if not tool_id or not name:
+                continue
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": str(tool_id),
+                    "name": str(name),
+                    "input": _coerce_tool_input(getattr(block, "input", {})),
+                }
+            )
+    return blocks
+
+
 class AgentLoop:
     """Core agent loop — sends messages to the LLM, handles tool calls, loops until done."""
 
@@ -223,12 +421,23 @@ class AgentLoop:
             "total_tokens": 0,
         }
 
+        # Build auth profile lists for rotation (comma-separated keys)
+        self._anthropic_keys = [k.strip() for k in (self.cfg.anthropic_api_key or "").split(",") if k.strip()]
+        self._openai_keys = [k.strip() for k in (self.cfg.openai_api_key or "").split(",") if k.strip()]
+        self._current_anthropic_idx = 0
+        self._current_openai_idx = 0
+        self._key_cooldowns: dict[str, float] = {}
+
         if self.cfg.llm_provider == "anthropic":
-            self._anthropic = anthropic.AsyncAnthropic(api_key=self.cfg.anthropic_api_key)
+            self._anthropic = anthropic.AsyncAnthropic(
+                api_key=self._anthropic_keys[0] if self._anthropic_keys else "",
+            )
             self._openai = None
         else:
             self._anthropic = None
-            self._openai = openai.AsyncOpenAI(api_key=self.cfg.openai_api_key)
+            self._openai = openai.AsyncOpenAI(
+                api_key=self._openai_keys[0] if self._openai_keys else "",
+            )
 
     def get_token_usage(self) -> dict[str, int]:
         """Return cumulative token usage for this loop (input + output + total)."""
@@ -238,6 +447,24 @@ class AgentLoop:
         self._token_usage["input_tokens"] += input_tokens
         self._token_usage["output_tokens"] += output_tokens
         self._token_usage["total_tokens"] += input_tokens + output_tokens
+
+    def _rotate_anthropic_key(self) -> str | None:
+        if len(self._anthropic_keys) <= 1:
+            return None
+        self._current_anthropic_idx = (self._current_anthropic_idx + 1) % len(self._anthropic_keys)
+        new_key = self._anthropic_keys[self._current_anthropic_idx]
+        self._anthropic = anthropic.AsyncAnthropic(api_key=new_key)
+        logger.info("Rotated to Anthropic key profile #%d", self._current_anthropic_idx)
+        return new_key
+
+    def _rotate_openai_key(self) -> str | None:
+        if len(self._openai_keys) <= 1:
+            return None
+        self._current_openai_idx = (self._current_openai_idx + 1) % len(self._openai_keys)
+        new_key = self._openai_keys[self._current_openai_idx]
+        self._openai = openai.AsyncOpenAI(api_key=new_key)
+        logger.info("Rotated to OpenAI key profile #%d", self._current_openai_idx)
+        return new_key
 
     async def run(
         self,
@@ -261,80 +488,83 @@ class AgentLoop:
             stream_callback: called with accumulated text on each streamed chunk
             on_tool_start:   called once when the first tool_use block begins
         """
-        effective_model = model_override or self.cfg.llm_model
+        # Acquire per-session lock to serialize concurrent calls
+        lock = _get_session_lock(session_id or "__global__")
+        async with lock:
+            effective_model = model_override or self.cfg.llm_model
 
-        # Resolve model aliases (e.g., "sonnet" → "claude-sonnet-4-5")
-        effective_model = self.cfg.resolve_model(effective_model)
+            # Resolve model aliases (e.g., "sonnet" → "claude-sonnet-4-5")
+            effective_model = self.cfg.resolve_model(effective_model)
 
-        api_key = (
-            self.cfg.anthropic_api_key
-            if self.cfg.llm_provider == "anthropic"
-            else self.cfg.openai_api_key
-        )
-
-        # Transcript repair: strip orphaned tool_use/tool_result blocks before sending.
-        if getattr(self.cfg, "transcript_repair_enabled", True):
-            messages = repair_transcript(messages)
-
-        # Pre-compaction memory flush: ask the agent to write durable memories before
-        # the history gets compacted and older turns are lost.
-        flush_enabled = getattr(self.cfg, "memory_flush_enabled", True)
-        flush_soft = getattr(self.cfg, "memory_flush_soft_tokens", 4000)
-        if (
-            flush_enabled
-            and not self._memory_flush_done
-            and needs_memory_flush(messages, effective_model, self.cfg.llm_max_tokens, flush_soft)
-        ):
-            logger.info("Pre-compaction memory flush: running flush turn")
-            today = __import__("datetime").date.today().isoformat()
-            flush_prompt = MEMORY_FLUSH_PROMPT.replace("YYYY-MM-DD", today)
-            try:
-                await self._run_flush_turn(messages, system_prompt, flush_prompt)
-                self._memory_flush_done = True
-            except Exception as exc:
-                logger.warning("Memory flush turn failed (continuing): %s", exc)
-
-        if needs_compaction(messages, effective_model, self.cfg.llm_max_tokens):
-            messages = await compact_messages(
-                messages=messages,
-                model=effective_model,
-                api_key=api_key,
-                provider=self.cfg.llm_provider,
-            )
-            self._memory_flush_done = False  # reset for the next compaction cycle
-
-        if self.cfg.llm_provider == "anthropic":
-            result = await self._run_anthropic(
-                messages, system_prompt,
-                session_id=session_id,
-                model=effective_model,
-                thinking_budget=thinking_budget,
-                stream_callback=stream_callback,
-                on_tool_start=on_tool_start,
-            )
-        else:
-            result = await self._run_openai(
-                messages, system_prompt,
-                session_id=session_id,
-                model=effective_model,
-                stream_callback=stream_callback,
-                on_tool_start=on_tool_start,
+            api_key = (
+                self.cfg.anthropic_api_key
+                if self.cfg.llm_provider == "anthropic"
+                else self.cfg.openai_api_key
             )
 
-        # Persist token usage to SessionStore if available
-        if session_id:
-            try:
-                from agent.sessions import get_session_store
-                store = get_session_store()
-                await store.add_token_usage(
-                    session_id,
-                    self._token_usage["input_tokens"],
-                    self._token_usage["output_tokens"],
+            # Transcript repair: strip orphaned tool_use/tool_result blocks before sending.
+            if getattr(self.cfg, "transcript_repair_enabled", True):
+                messages = repair_transcript(messages)
+
+            # Pre-compaction memory flush: ask the agent to write durable memories before
+            # the history gets compacted and older turns are lost.
+            flush_enabled = getattr(self.cfg, "memory_flush_enabled", True)
+            flush_soft = getattr(self.cfg, "memory_flush_soft_tokens", 4000)
+            if (
+                flush_enabled
+                and not self._memory_flush_done
+                and needs_memory_flush(messages, effective_model, self.cfg.llm_max_tokens, flush_soft)
+            ):
+                logger.info("Pre-compaction memory flush: running flush turn")
+                today = __import__("datetime").date.today().isoformat()
+                flush_prompt = MEMORY_FLUSH_PROMPT.replace("YYYY-MM-DD", today)
+                try:
+                    await self._run_flush_turn(messages, system_prompt, flush_prompt)
+                    self._memory_flush_done = True
+                except Exception as exc:
+                    logger.warning("Memory flush turn failed (continuing): %s", exc)
+
+            if needs_compaction(messages, effective_model, self.cfg.llm_max_tokens):
+                messages = await compact_messages(
+                    messages=messages,
+                    model=effective_model,
+                    api_key=api_key,
+                    provider=self.cfg.llm_provider,
                 )
-            except Exception:
-                pass  # SessionStore may not be initialized in tests
+                self._memory_flush_done = False  # reset for the next compaction cycle
 
-        return result
+            if self.cfg.llm_provider == "anthropic":
+                result = await self._run_anthropic(
+                    messages, system_prompt,
+                    session_id=session_id,
+                    model=effective_model,
+                    thinking_budget=thinking_budget,
+                    stream_callback=stream_callback,
+                    on_tool_start=on_tool_start,
+                )
+            else:
+                result = await self._run_openai(
+                    messages, system_prompt,
+                    session_id=session_id,
+                    model=effective_model,
+                    stream_callback=stream_callback,
+                    on_tool_start=on_tool_start,
+                )
+
+            # Persist token usage to SessionStore if available
+            if session_id:
+                try:
+                    from agent.sessions import get_session_store
+                    store = get_session_store()
+                    await store.add_token_usage(
+                        session_id,
+                        self._token_usage["input_tokens"],
+                        self._token_usage["output_tokens"],
+                    )
+                except Exception:
+                    pass  # SessionStore may not be initialized in tests
+
+            return result
 
     # ------------------------------------------------------------------
     # Anthropic
@@ -361,10 +591,12 @@ class AgentLoop:
         if budget is None:
             budget = getattr(self.cfg, "llm_thinking_budget", 0)
 
+        overflow_attempts = 0
+
         for iteration in range(self.cfg.max_tool_iterations):
             if needs_compaction(working, effective_model, self.cfg.llm_max_tokens):
                 working = await compact_messages(
-                    messages=working,
+                    messages=_sanitize_anthropic_messages(working),
                     model=effective_model,
                     api_key=self.cfg.anthropic_api_key,
                     provider="anthropic",
@@ -374,7 +606,7 @@ class AgentLoop:
                 "model": effective_model,
                 "max_tokens": self.cfg.llm_max_tokens,
                 "system": system_prompt,
-                "messages": working,
+                "messages": _sanitize_anthropic_messages(working),
             }
             if tools:
                 kwargs["tools"] = tools
@@ -386,6 +618,34 @@ class AgentLoop:
                     response = await self._anthropic_stream_turn(
                         kwargs, stream_callback, on_tool_start, max_retries
                     )
+                except anthropic.BadRequestError as e:
+                    err_str = str(e).lower()
+                    if ("thinking" in err_str or "budget" in err_str) and budget and budget > 0:
+                        logger.warning("Thinking budget rejected, retrying without extended thinking")
+                        budget = 0
+                        if "thinking" in kwargs:
+                            del kwargs["thinking"]
+                        continue
+                    if "context" in err_str or "token" in err_str or "too long" in err_str:
+                        logger.warning("Context overflow detected, attempting compaction (attempt %d/3)", overflow_attempts + 1)
+                        overflow_attempts += 1
+                        if overflow_attempts <= 3:
+                            working = await compact_messages(
+                                messages=_sanitize_anthropic_messages(working),
+                                model=effective_model,
+                                api_key=self.cfg.anthropic_api_key,
+                                provider="anthropic",
+                            )
+                            continue
+                        else:
+                            return "Context overflow: could not reduce context after 3 compaction attempts."
+                    raise
+                except anthropic.RateLimitError:
+                    rotated = self._rotate_anthropic_key()
+                    if rotated:
+                        logger.info("Rate limited — rotated to next API key profile")
+                        continue
+                    raise
                 except Exception as e:
                     logger.error("Anthropic streaming fatal error: %s", e)
                     return f"Sorry, I couldn't reach the AI service: {_sanitize_error(e)}"
@@ -396,6 +656,34 @@ class AgentLoop:
                         max_retries=max_retries,
                         label="anthropic",
                     )
+                except anthropic.BadRequestError as e:
+                    err_str = str(e).lower()
+                    if ("thinking" in err_str or "budget" in err_str) and budget and budget > 0:
+                        logger.warning("Thinking budget rejected, retrying without extended thinking")
+                        budget = 0
+                        if "thinking" in kwargs:
+                            del kwargs["thinking"]
+                        continue
+                    if "context" in err_str or "token" in err_str or "too long" in err_str:
+                        logger.warning("Context overflow detected, attempting compaction (attempt %d/3)", overflow_attempts + 1)
+                        overflow_attempts += 1
+                        if overflow_attempts <= 3:
+                            working = await compact_messages(
+                                messages=_sanitize_anthropic_messages(working),
+                                model=effective_model,
+                                api_key=self.cfg.anthropic_api_key,
+                                provider="anthropic",
+                            )
+                            continue
+                        else:
+                            return "Context overflow: could not reduce context after 3 compaction attempts."
+                    raise
+                except anthropic.RateLimitError:
+                    rotated = self._rotate_anthropic_key()
+                    if rotated:
+                        logger.info("Rate limited — rotated to next API key profile")
+                        continue
+                    raise
                 except Exception as e:
                     logger.error("Anthropic API fatal error: %s", e)
                     return f"Sorry, I couldn't reach the AI service: {_sanitize_error(e)}"
@@ -426,7 +714,9 @@ class AgentLoop:
                         getattr(response.usage, "input_tokens", 0),
                         getattr(response.usage, "output_tokens", 0),
                     )
-                working.append({"role": "assistant", "content": [b.model_dump() for b in response.content]})
+                assistant_blocks = _response_blocks_to_anthropic_input_blocks(response.content)
+                if assistant_blocks:
+                    working.append({"role": "assistant", "content": assistant_blocks})
 
                 tool_results = []
                 for block in response.content:
@@ -498,7 +788,7 @@ class AgentLoop:
                 "model": self.cfg.llm_model,
                 "max_tokens": 2048,
                 "system": MEMORY_FLUSH_SYSTEM_PROMPT,
-                "messages": flush_messages,
+                "messages": _sanitize_anthropic_messages(flush_messages),
             }
             if memory_tools:
                 kwargs["tools"] = memory_tools
@@ -629,6 +919,8 @@ class AgentLoop:
         effective_model = model or self.cfg.llm_model
         use_streaming = stream_callback is not None and getattr(self.cfg, "llm_streaming", True)
 
+        overflow_attempts = 0
+
         for iteration in range(self.cfg.max_tool_iterations):
             if needs_compaction(working, effective_model, self.cfg.llm_max_tokens):
                 working = await compact_messages(
@@ -647,6 +939,28 @@ class AgentLoop:
                     finish_reason, content_text, assembled_calls = await self._openai_stream_turn(
                         kwargs, stream_callback, on_tool_start, max_retries
                     )
+                except openai.BadRequestError as e:
+                    err_str = str(e).lower()
+                    if "context" in err_str or "token" in err_str or "too long" in err_str:
+                        logger.warning("Context overflow detected, attempting compaction (attempt %d/3)", overflow_attempts + 1)
+                        overflow_attempts += 1
+                        if overflow_attempts <= 3:
+                            working = await compact_messages(
+                                messages=working,
+                                model=effective_model,
+                                api_key=self.cfg.openai_api_key,
+                                provider="openai",
+                            )
+                            continue
+                        else:
+                            return "Context overflow: could not reduce context after 3 compaction attempts."
+                    raise
+                except openai.RateLimitError:
+                    rotated = self._rotate_openai_key()
+                    if rotated:
+                        logger.info("Rate limited — rotated to next API key profile")
+                        continue
+                    raise
                 except Exception as e:
                     logger.error("OpenAI streaming fatal error: %s", e)
                     return f"Sorry, I couldn't reach the AI service: {_sanitize_error(e)}"
@@ -721,6 +1035,28 @@ class AgentLoop:
                         max_retries=max_retries,
                         label="openai",
                     )
+                except openai.BadRequestError as e:
+                    err_str = str(e).lower()
+                    if "context" in err_str or "token" in err_str or "too long" in err_str:
+                        logger.warning("Context overflow detected, attempting compaction (attempt %d/3)", overflow_attempts + 1)
+                        overflow_attempts += 1
+                        if overflow_attempts <= 3:
+                            working = await compact_messages(
+                                messages=working,
+                                model=effective_model,
+                                api_key=self.cfg.openai_api_key,
+                                provider="openai",
+                            )
+                            continue
+                        else:
+                            return "Context overflow: could not reduce context after 3 compaction attempts."
+                    raise
+                except openai.RateLimitError:
+                    rotated = self._rotate_openai_key()
+                    if rotated:
+                        logger.info("Rate limited — rotated to next API key profile")
+                        continue
+                    raise
                 except Exception as e:
                     logger.error("OpenAI API fatal error: %s", e)
                     return f"Sorry, I couldn't reach the AI service: {_sanitize_error(e)}"

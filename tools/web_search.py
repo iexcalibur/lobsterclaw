@@ -21,7 +21,7 @@ TOOL_DEFINITION = ToolDefinition(
     name="web_search",
     description=(
         "Search the web and return results with titles, URLs, and descriptions.\n"
-        "Providers: brave (ranked list), perplexity/gemini/grok/kimi (AI answer).\n\n"
+        "Providers: ddg (free, no API key), brave (ranked list), google (Custom Search API), perplexity/gemini/grok/kimi (AI answer).\n\n"
         "Field parity with OpenClaw web-search.ts:\n"
         "  query       — search terms\n"
         "  count       — number of results (1-10, default 5)\n"
@@ -123,15 +123,17 @@ async def _web_search(
         augmented_query = query + " [" + "; ".join(filter_hints) + "]"
 
     providers = {
+        "google": lambda: _google(query, count),
         "brave": lambda: _brave(query, count, cfg.brave_api_key, freshness=resolved_freshness, country=country, search_lang=resolved_lang, ui_lang=ui_lang, safe_search=safe_search),
         "perplexity": lambda: _perplexity(augmented_query, cfg.perplexity_api_key),
         "gemini": lambda: _gemini(augmented_query, cfg.gemini_api_key),
         "grok": lambda: _grok(augmented_query, getattr(cfg, "grok_api_key", "")),
         "kimi": lambda: _kimi(augmented_query, getattr(cfg, "kimi_api_key", "")),
+        "ddg": lambda: _duckduckgo(query, count),
     }
 
     if provider not in providers:
-        return f"Error: unknown search provider '{provider}'. Use: brave, perplexity, gemini, grok, kimi"
+        return f"Error: unknown search provider '{provider}'. Use: google, brave, perplexity, gemini, grok, kimi, ddg"
 
     # Try primary provider, then fall back to any available one
     tried: list[str] = []
@@ -152,6 +154,46 @@ async def _web_search(
 # ------------------------------------------------------------------
 # Provider implementations
 # ------------------------------------------------------------------
+
+async def _google(query: str, count: int = 5, **kwargs) -> str:
+    """Google Custom Search API — requires GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX."""
+    import os
+    api_key = os.getenv("GOOGLE_SEARCH_API_KEY", "")
+    cx = os.getenv("GOOGLE_SEARCH_CX", "")
+    if not api_key or not cx:
+        return "Error: GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX not set in .env"
+
+    params = {
+        "key": api_key,
+        "cx": cx,
+        "q": query,
+        "num": min(count, 10),
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params=params,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    items = data.get("items", [])
+    if not items:
+        return "No results found."
+
+    lines = []
+    for item in items[:count]:
+        title = item.get("title", "No title")
+        url = item.get("link", "")
+        snippet = item.get("snippet", "")[:300]
+        lines.append(f"**{title}**")
+        lines.append(url)
+        if snippet:
+            lines.append(snippet)
+        lines.append("")
+    return "\n".join(lines).strip()
+
 
 async def _brave(
     query: str,
@@ -303,3 +345,72 @@ async def _kimi(query: str, api_key: str) -> str:
         data = r.json()
 
     return data["choices"][0]["message"]["content"]
+
+
+async def _duckduckgo(query: str, count: int = 5) -> str:
+    """
+    DuckDuckGo search via the Lite HTML endpoint — no API key required.
+
+    DDG Lite structure:
+      <a class='result-link' href="URL">Title</a>   in one <tr>
+      <td class='result-snippet'>snippet text</td>   in the next <tr>
+    """
+    import re as _re
+    from lxml import html as lxml_html
+
+    async with httpx.AsyncClient(
+        timeout=20,
+        follow_redirects=True,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        },
+    ) as client:
+        r = await client.post(
+            "https://lite.duckduckgo.com/lite/",
+            data={"q": query, "kl": "us-en"},
+        )
+        r.raise_for_status()
+
+    tree = lxml_html.fromstring(r.content)
+
+    # Collect result links: <a class='result-link'>
+    # Skip ad links (duckduckgo.com/y.js redirects) and DDG-internal URLs
+    all_links = tree.xpath("//a[@class='result-link']")
+    result_links = [
+        a for a in all_links
+        if not (a.get("href") or "").startswith("https://duckduckgo.com/")
+    ]
+    # Collect snippets: <td class='result-snippet'>
+    # Build snippet map aligned with organic (non-ad) results using sibling proximity
+    all_snippet_tds = tree.xpath("//td[@class='result-snippet']")
+
+    results: list[dict] = []
+    snippet_idx = len(all_links) - len(result_links)  # skip snippets paired with ads
+    for i, a in enumerate(result_links[:count]):
+        title = (a.text_content() or "").strip()
+        url = (a.get("href") or "").strip()
+        snippet = ""
+        si = snippet_idx + i
+        if si < len(all_snippet_tds):
+            raw = (all_snippet_tds[si].text_content() or "").strip()
+            snippet = _re.sub(r"\s+", " ", raw)[:300]
+        if title and url:
+            results.append({"title": title, "url": url, "snippet": snippet})
+
+    if not results:
+        return "No results found from DuckDuckGo."
+
+    lines = []
+    for item in results:
+        lines.append(item["title"])
+        lines.append(item["url"])
+        if item.get("snippet"):
+            lines.append(item["snippet"])
+        lines.append("")
+    return "\n".join(lines).strip()

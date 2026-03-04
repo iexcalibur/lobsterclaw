@@ -219,6 +219,17 @@ class ToolRegistry:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # Overflow truncation
+    # ------------------------------------------------------------------
+
+    def truncate_for_overflow(self, result: str, aggressive: bool = False) -> str:
+        """Truncate a tool result more aggressively when context is overflowing."""
+        limit = self._result_max_chars
+        if aggressive:
+            limit = min(limit, 10_000)
+        return truncate_tool_result(result, limit)
+
+    # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
 
@@ -251,6 +262,12 @@ class ToolRegistry:
             if not approved:
                 return f"User denied execution of '{name}'"
 
+        # Build tool context from args and explicit context
+        tool_context = dict(context or {})
+        for ctx_key in ("_session_id", "_session_depth", "_caller_depth", "_channel", "_account_id", "_thread_id"):
+            if ctx_key in args:
+                tool_context[ctx_key.lstrip("_")] = args[ctx_key]
+
         hooks_enabled = getattr(self.cfg, "hooks_enabled", True)
 
         # Pre-execution hooks
@@ -268,7 +285,7 @@ class ToolRegistry:
             import inspect
             sig = inspect.signature(tool.fn)
             # Filter out internal context keys not in the tool signature
-            _internal_keys = {"_session_id", "_session_depth", "_caller_depth"}
+            _internal_keys = {"_session_id", "_session_depth", "_caller_depth", "_channel", "_account_id", "_thread_id"}
             clean_args = {
                 k: v for k, v in args.items()
                 if k not in _internal_keys or k in sig.parameters
