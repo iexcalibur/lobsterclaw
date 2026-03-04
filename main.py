@@ -274,7 +274,7 @@ def main() -> None:
 
     async def agent_for_bg(message: str, system_prompt: str | None = None) -> str:
         system = system_prompt or build_system_prompt(cfg, registry.get_names())
-        return await agent.run([{"role": "user", "content": message}], system)
+        return await agent.run([{"role": "user", "content": message}], system, session_id="main")
 
     cron_mgr.configure(
         send_fn=primary.send_message,
@@ -303,23 +303,6 @@ def main() -> None:
         logger.info("Gateway API configured (port %d)", cfg.gateway_port)
 
     # ----------------------------------------------------------------
-    # Start schedulers
-    # ----------------------------------------------------------------
-
-    if cfg.cron_enabled:
-        cron_mgr.start()
-        logger.info("Cron scheduler started")
-        if cfg.heartbeat_enabled:
-            heartbeat.start(cron_mgr.scheduler)
-            logger.info("Heartbeat runner attached (schedule: %s)", cfg.heartbeat_schedule)
-    elif cfg.heartbeat_enabled:
-        from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        hb_scheduler = AsyncIOScheduler()
-        hb_scheduler.start()
-        heartbeat.start(hb_scheduler)
-        logger.info("Heartbeat-only scheduler started")
-
-    # ----------------------------------------------------------------
     # Load plugins
     # ----------------------------------------------------------------
 
@@ -344,8 +327,24 @@ def main() -> None:
             cfg.canvas_host_port,
         )
 
+    # Helper to start schedulers (must be called inside a running event loop)
+    def start_schedulers():
+        if cfg.cron_enabled:
+            cron_mgr.start()
+            logger.info("Cron scheduler started")
+            if cfg.heartbeat_enabled:
+                heartbeat.start(cron_mgr.scheduler)
+                logger.info("Heartbeat runner attached (schedule: %s)", cfg.heartbeat_schedule)
+        elif cfg.heartbeat_enabled:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            hb_scheduler = AsyncIOScheduler()
+            hb_scheduler.start()
+            heartbeat.start(hb_scheduler)
+            logger.info("Heartbeat-only scheduler started")
+
     if len(channels) == 1 and not use_canvas_host and not use_gateway:
         # Simple single-account blocking path (no extra servers)
+        # channels[0].run() creates its own event loop internally
         logger.info("Starting single-account bot...")
         channels[0].run()
     else:
@@ -360,6 +359,7 @@ def main() -> None:
             channels,
             start_canvas_host=use_canvas_host,
             start_gateway=use_gateway,
+            on_ready=start_schedulers,
         ))
 
 
@@ -368,6 +368,7 @@ async def _run_async_main(
     *,
     start_canvas_host: bool = False,
     start_gateway: bool = False,
+    on_ready: callable = None,
 ) -> None:
     """
     Async entry point for:
@@ -383,6 +384,10 @@ async def _run_async_main(
             loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
             pass
+
+    # Start schedulers now that the event loop is running
+    if on_ready:
+        on_ready()
 
     tasks: list[asyncio.Task] = []
 

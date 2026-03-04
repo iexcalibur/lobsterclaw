@@ -1434,8 +1434,10 @@ class TelegramChannel:
     # ------------------------------------------------------------------
 
     async def send_message(self, text: str) -> None:
-        """Send text to owner."""
+        """Send text to owner (used by cron, gateway, and other proactive senders)."""
+        logger.info("[%s] Proactive send to owner %s (%d chars)", self._label, self._owner_id, len(text))
         await self._send_chunked(self._owner_id, text, format_markdown=True)
+        logger.info("[%s] Proactive send completed", self._label)
 
     async def send_to(
         self,

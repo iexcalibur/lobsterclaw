@@ -63,10 +63,10 @@ export default function DashboardPage() {
     try {
       const [s, m] = await Promise.all([
         api<StatusData>("/api/gateway/status"),
-        api<MetricsData>("/api/gateway/metrics"),
+        api<MetricsData>("/api/gateway/metrics").catch(() => null),
       ]);
       setStatus(s);
-      setMetrics(m);
+      if (m && m.all_sessions) setMetrics(m);
     } catch {
       /* retry next interval */
     } finally {
@@ -199,8 +199,10 @@ export default function DashboardPage() {
               </BarChart>
             </ResponsiveContainer>
           ) : (
-            <div className="flex items-center justify-center h-[200px] text-zinc-600 text-sm">
-              No token usage data yet
+            <div className="flex flex-col items-center justify-center h-[200px] text-zinc-600 text-sm gap-2">
+              <Cpu className="h-8 w-8 text-zinc-700" />
+              <p>Send a message to start tracking tokens</p>
+              <a href="/chat" className="text-xs text-blue-400 hover:underline">Open Chat</a>
             </div>
           )}
         </div>
@@ -248,8 +250,9 @@ export default function DashboardPage() {
               </div>
             </div>
           ) : (
-            <div className="flex items-center justify-center h-[160px] text-zinc-600 text-sm">
-              No token data yet
+            <div className="flex flex-col items-center justify-center h-[160px] text-zinc-600 text-sm gap-2">
+              <Activity className="h-8 w-8 text-zinc-700" />
+              <p>Token distribution appears after first conversation</p>
             </div>
           )}
         </div>

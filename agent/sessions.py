@@ -290,13 +290,13 @@ class SessionStore:
         output_tokens: int,
     ) -> None:
         """
-        Increment token counters for a session.
-        Mirrors OpenClaw's session token tracking (totalTokens after each turn).
+        Increment token counters for a session, auto-creating the row if needed.
         """
         async with self._lock:
             conn = self._connect()
             total = input_tokens + output_tokens
-            conn.execute(
+            now = _now()
+            affected = conn.execute(
                 """
                 UPDATE sessions
                 SET input_tokens  = input_tokens  + ?,
@@ -305,8 +305,17 @@ class SessionStore:
                     updated_at    = ?
                 WHERE id = ?
                 """,
-                (input_tokens, output_tokens, total, _now(), session_id),
-            )
+                (input_tokens, output_tokens, total, now, session_id),
+            ).rowcount
+            if affected == 0:
+                label = session_id.split(":")[-1] if ":" in session_id else session_id
+                conn.execute(
+                    """INSERT OR IGNORE INTO sessions
+                       (id, label, parent_id, status, model, created_at, updated_at, depth,
+                        token_usage, input_tokens, output_tokens)
+                       VALUES (?, ?, NULL, 'active', '', ?, ?, 0, ?, ?, ?)""",
+                    (session_id, label, now, now, total, input_tokens, output_tokens),
+                )
             conn.commit()
             conn.close()
 

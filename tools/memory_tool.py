@@ -197,7 +197,8 @@ async def _memory_search(
 
         memory_dir = _get_memory_dir()
         memory_md = _get_memory_md_path()
-        idx = MemoryIndex(memory_dir=memory_dir, memory_md=memory_md)
+        index_db = memory_dir / ".memory_index.db"
+        idx = MemoryIndex(memory_dir=memory_dir, memory_md=memory_md, index_db_path=index_db)
 
         use_semantic = (
             mode == "semantic"
@@ -275,15 +276,26 @@ async def _memory_write(key: str, content: str, append: bool = False) -> str:
     if not safe_key:
         return "Invalid key"
 
-    path = _get_memory_dir() / f"{safe_key}.md"
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    # Check workspace root first — update existing files like IDENTITY.md,
+    # USER.md, SOUL.md in-place instead of creating duplicates in memory/.
+    workspace_root = Path(__file__).parent.parent / "workspace"
+    workspace_file = workspace_root / f"{safe_key}.md"
+    memory_path = _get_memory_dir() / f"{safe_key}.md"
+
+    path = workspace_file if workspace_file.exists() else memory_path
+
     try:
-        if append and path.exists():
+        if (append or workspace_file.exists()) and path.exists():
             existing = path.read_text(encoding="utf-8")
-            updated = f"{existing.rstrip()}\n\n_Updated {now}_\n\n{content}"
+            if append:
+                updated = f"{existing.rstrip()}\n\n_Updated {now}_\n\n{content}"
+            else:
+                updated = f"# {safe_key}\n\n_Last updated: {now}_\n\n{content}"
             path.write_text(updated, encoding="utf-8")
-            return f"Memory '{safe_key}' updated (appended)"
+            loc = "workspace" if path == workspace_file else "workspace/memory"
+            return f"Memory '{safe_key}' updated → {loc}/{safe_key}.md"
         else:
             header = f"# {safe_key}\n\n_Last updated: {now}_\n\n"
             path.write_text(header + content, encoding="utf-8")

@@ -443,7 +443,11 @@ def create_app() -> FastAPI:
                 },
             }
         except Exception as e:
-            return {"error": str(e)}
+            return {
+                "main_session": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                "all_sessions": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "session_count": 0},
+                "error": str(e),
+            }
 
     # ------------------------------------------------------------------
     # Workspace files (read-only)

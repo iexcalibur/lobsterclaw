@@ -83,6 +83,39 @@ export default function CronPage() {
         </button>
       </div>
 
+      {/* Summary bar */}
+      {!loading && jobs.length > 0 && (
+        <div className="grid grid-cols-3 gap-3">
+          <div className="card flex items-center gap-3 py-3">
+            <div className="h-8 w-8 rounded-lg bg-emerald-900/40 flex items-center justify-center">
+              <Play className="h-4 w-4 text-emerald-400" />
+            </div>
+            <div>
+              <p className="text-lg font-semibold text-white">{enabledCount}</p>
+              <p className="text-xs text-zinc-500">Active</p>
+            </div>
+          </div>
+          <div className="card flex items-center gap-3 py-3">
+            <div className="h-8 w-8 rounded-lg bg-blue-900/40 flex items-center justify-center">
+              <RefreshCw className="h-4 w-4 text-blue-400" />
+            </div>
+            <div>
+              <p className="text-lg font-semibold text-white">{jobs.reduce((s, j) => s + j.run_count, 0)}</p>
+              <p className="text-xs text-zinc-500">Total Runs</p>
+            </div>
+          </div>
+          <div className="card flex items-center gap-3 py-3">
+            <div className="h-8 w-8 rounded-lg bg-zinc-800 flex items-center justify-center">
+              <Pause className="h-4 w-4 text-zinc-400" />
+            </div>
+            <div>
+              <p className="text-lg font-semibold text-white">{jobs.length - enabledCount}</p>
+              <p className="text-xs text-zinc-500">Paused</p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {loading ? (
         <div className="card text-center text-zinc-500 text-sm py-12">
           Loading cron jobs...
@@ -128,6 +161,14 @@ export default function CronPage() {
                   )}
                 </button>
 
+                {/* Status indicator */}
+                <div className="flex-shrink-0">
+                  <div className={clsx(
+                    "h-2 w-2 rounded-full",
+                    job.enabled ? "bg-emerald-400 pulse-dot" : "bg-zinc-600"
+                  )} />
+                </div>
+
                 {/* Info */}
                 <button
                   onClick={() =>
@@ -142,6 +183,9 @@ export default function CronPage() {
                     {job.delete_after_run && (
                       <span className="badge-yellow text-[10px]">once</span>
                     )}
+                    {job.run_count > 0 && (
+                      <span className="badge-green text-[10px]">{job.run_count} runs</span>
+                    )}
                   </div>
                   <div className="flex items-center gap-3 mt-1 text-xs text-zinc-500">
                     <span className="font-mono bg-zinc-800 px-1.5 py-0.5 rounded">
@@ -150,21 +194,28 @@ export default function CronPage() {
                     <span>
                       {job.delivery === "direct" ? "direct" : "agent"} delivery
                     </span>
-                    <span>{job.run_count} runs</span>
+                    {job.last_run ? (
+                      <span className="text-emerald-500">last ran {timeAgo(job.last_run)}</span>
+                    ) : (
+                      <span className="text-zinc-600">never ran</span>
+                    )}
                   </div>
                 </button>
 
                 {/* Timing */}
                 <div className="flex-shrink-0 text-right">
-                  {job.next_run && (
-                    <p className="text-xs text-zinc-400">
-                      Next: {new Date(job.next_run).toLocaleString()}
+                  {job.next_run && job.enabled && (
+                    <p className="text-xs text-emerald-400">
+                      Next: {new Date(job.next_run).toLocaleTimeString()}
                     </p>
                   )}
-                  {job.last_run && (
+                  {job.next_run && job.enabled && (
                     <p className="text-[10px] text-zinc-600">
-                      Last: {timeAgo(job.last_run)}
+                      {new Date(job.next_run).toLocaleDateString()}
                     </p>
+                  )}
+                  {!job.enabled && (
+                    <span className="text-xs text-zinc-600">paused</span>
                   )}
                 </div>
               </div>

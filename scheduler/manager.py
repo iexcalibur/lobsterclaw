@@ -193,12 +193,14 @@ class CronManager:
         if not self._send_fn:
             logger.warning("No send_fn — cannot deliver cron job %s", job_id)
             self._record_run(job_id, fired_at, "skipped", "No send_fn")
+            await self._publish_cron_event(job_id, message, "skipped", "No send function configured")
             return
 
         try:
+            outbound: str | None = None
+
             if delivery == "direct":
-                await self._send_fn(f"⏰ *Reminder*\n\n{message}")
-                self._record_run(job_id, fired_at, "ok")
+                outbound = f"⏰ *Reminder*\n\n{message}"
             elif session_target == "isolated":
                 if self._agent_fn:
                     import asyncio
@@ -207,8 +209,7 @@ class CronManager:
                     )
                     return
                 else:
-                    await self._send_fn(f"⏰ *Reminder* (isolated mode unavailable)\n\n{message}")
-                    self._record_run(job_id, fired_at, "ok")
+                    outbound = f"⏰ *Reminder* (isolated mode unavailable)\n\n{message}"
             else:
                 if self._agent_fn:
                     context = await self._get_recent_context(5)
@@ -216,24 +217,30 @@ class CronManager:
                     if context:
                         prompt = f"{context}\n\n{prompt}"
 
+                    logger.info("Cron %s: running agent for delivery...", job_id)
                     reply = await self._agent_fn(prompt)
+                    logger.info("Cron %s: agent replied (%d chars)", job_id, len(reply) if reply else 0)
 
                     silent_token = "NO_REPLY"
                     heartbeat_ok = "HEARTBEAT_OK"
                     if reply and reply.strip() in (silent_token, heartbeat_ok):
                         reply = f"⏰ Reminder: {message}"
 
-                    if reply and reply.strip():
-                        await self._send_fn(reply)
-                    else:
-                        await self._send_fn(f"⏰ Reminder: {message}")
-                    self._record_run(job_id, fired_at, "ok")
+                    outbound = reply if reply and reply.strip() else f"⏰ Reminder: {message}"
                 else:
-                    await self._send_fn(f"⏰ *Reminder*\n\n{message}")
-                    self._record_run(job_id, fired_at, "ok")
+                    outbound = f"⏰ *Reminder*\n\n{message}"
+
+            if outbound:
+                logger.info("Cron %s: sending message to Telegram (%d chars)...", job_id, len(outbound))
+                await self._send_fn(outbound)
+                logger.info("Cron %s: Telegram send completed", job_id)
+                self._record_run(job_id, fired_at, "ok")
+                await self._publish_cron_event(job_id, message, "ok", outbound)
+
         except Exception as e:
-            logger.error("Cron job %s fire failed: %s", job_id, e)
+            logger.error("Cron job %s fire failed: %s", job_id, e, exc_info=True)
             self._record_run(job_id, fired_at, "error", str(e))
+            await self._publish_cron_event(job_id, message, "error", str(e))
             try:
                 if self._send_fn:
                     await self._send_fn(f"⏰ Reminder (agent unavailable): {message}")
@@ -462,6 +469,19 @@ class CronManager:
             return "Wake triggered ✅"
         except Exception as e:
             return f"Wake failed: {e}"
+
+    async def _publish_cron_event(self, job_id: str, message: str, status: str, detail: str | None = None) -> None:
+        """Publish a cron fire event to the Gateway event bus (if available)."""
+        try:
+            from gateway.events import event_bus
+            await event_bus.publish("cron.fired", {
+                "job_id": job_id,
+                "message": message,
+                "status": status,
+                "detail": detail,
+            })
+        except Exception:
+            pass
 
     def _record_run(self, job_id: str, fired_at: str, status: str, error: str | None = None) -> None:
         try:

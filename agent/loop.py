@@ -491,6 +491,9 @@ class AgentLoop:
         # Acquire per-session lock to serialize concurrent calls
         lock = _get_session_lock(session_id or "__global__")
         async with lock:
+            # Reset per-run token counters so we only persist this run's usage
+            self._token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
             effective_model = model_override or self.cfg.llm_model
 
             # Resolve model aliases (e.g., "sonnet" → "claude-sonnet-4-5")
