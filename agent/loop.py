@@ -44,6 +44,30 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# P2 — Prompt injection fence
+# External content (web pages, files, search results) returned by tools is
+# wrapped in XML fences before being inserted into the LLM context window.
+# This signals to the model that fenced content is untrusted external data
+# and should never be treated as instructions to follow.
+
+_FENCE_TOOLS = frozenset({
+    "web_fetch", "web_search",
+    "read", "browser", "pdf", "image",
+    "memory_get", "memory_search",
+})
+_FENCE_OPEN  = "<external_content>"
+_FENCE_CLOSE = "</external_content>"
+
+
+def _fence_tool_result(tool_name: str, result: str) -> str:
+    """Wrap untrusted external tool results in XML fences (P2 prompt injection guard)."""
+    if tool_name not in _FENCE_TOOLS:
+        return result
+    if result.startswith(_FENCE_OPEN):
+        return result  # already fenced
+    return f"{_FENCE_OPEN}\n{result}\n{_FENCE_CLOSE}"
+
+
 # Regex patterns for reasoning lane split (<think>…</think> / <final>…</final>)
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 _FINAL_RE = re.compile(r"<final>(.*?)</final>", re.DOTALL | re.IGNORECASE)
@@ -782,6 +806,10 @@ class AgentLoop:
                     if check.action == "warn":
                         result = f"⚠️ {check.message}\n\n{result}"
 
+                    # P2: prompt injection fence — wrap external tool results
+                    if getattr(self.cfg, "prompt_injection_fence", True):
+                        result = _fence_tool_result(block.name, result)
+
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -1058,6 +1086,10 @@ class AgentLoop:
 
                         if check.action == "warn":
                             result = f"⚠️ {check.message}\n\n{result}"
+
+                        # P2: prompt injection fence — wrap external tool results
+                        if getattr(self.cfg, "prompt_injection_fence", True):
+                            result = _fence_tool_result(tc["name"], str(result))
 
                         working.append({
                             "role": "tool",

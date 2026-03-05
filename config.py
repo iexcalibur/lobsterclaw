@@ -271,6 +271,24 @@ class Config:
     # Requires watchdog>=3.0.0
     plugin_hot_reload: bool = field(default_factory=lambda: _env_bool("PLUGIN_HOT_RELOAD", True))
 
+    # P3 — Credential encryption at rest.
+    # When GATEWAY_ENCRYPT_SECRETS=true, LobsterClaw encrypts the values of
+    # *_KEY, *_TOKEN, *_SECRET fields using AES-256-GCM. Key stored in
+    # ~/.lobsterclaw/secrets.key (or system keyring if keyring is installed).
+    # Requires: pip install "cryptography>=41.0.0"
+    gateway_encrypt_secrets: bool = field(default_factory=lambda: _env_bool("GATEWAY_ENCRYPT_SECRETS", False))
+
+    # P2 — Prompt injection fence.
+    # When true (default), external tool results (web_fetch, read, browser, pdf, etc.)
+    # are wrapped in <external_content> XML fences before LLM context insertion.
+    # Set PROMPT_INJECTION_FENCE=false to disable (not recommended).
+    prompt_injection_fence: bool = field(default_factory=lambda: _env_bool("PROMPT_INJECTION_FENCE", True))
+
+    # P1 — SSRF allow-list override (advanced).
+    # Comma-separated trusted hosts exempt from SSRF block list.
+    # Example: SSRF_ALLOW_HOSTS=internal-api.corp,10.0.1.5
+    ssrf_allow_hosts: list[str] = field(default_factory=lambda: _env_list("SSRF_ALLOW_HOSTS", ""))
+
     # Agent identity
     # Human-readable agent identifier shown in the ## Runtime prompt line.
     agent_id: str = field(default_factory=lambda: _env("AGENT_ID", ""))

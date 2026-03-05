@@ -14,7 +14,10 @@ Params (matching OpenClaw schema):
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import re
+from urllib.parse import urlparse
 
 import httpx
 
@@ -22,6 +25,87 @@ from config import get_config
 from tools.registry import ToolDefinition
 
 logger = logging.getLogger(__name__)
+
+# CVE-2026-26322 — SSRF (Server-Side Request Forgery) guard
+# Blocks requests to private/loopback/link-local/metadata IP ranges before
+# any DNS resolution happens. Scheme allow-list prevents file://, gopher://, etc.
+
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+# RFC 1918 + loopback + link-local + APIPA + cloud metadata
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),        # RFC 1918
+    ipaddress.ip_network("172.16.0.0/12"),      # RFC 1918
+    ipaddress.ip_network("192.168.0.0/16"),     # RFC 1918
+    ipaddress.ip_network("127.0.0.0/8"),        # Loopback
+    ipaddress.ip_network("::1/128"),            # IPv6 loopback
+    ipaddress.ip_network("169.254.0.0/16"),     # Link-local / APIPA
+    ipaddress.ip_network("fe80::/10"),          # IPv6 link-local
+    ipaddress.ip_network("100.64.0.0/10"),      # Carrier-grade NAT
+    ipaddress.ip_network("0.0.0.0/8"),          # Current network
+    ipaddress.ip_network("192.0.2.0/24"),       # TEST-NET-1
+    ipaddress.ip_network("198.51.100.0/24"),    # TEST-NET-2
+    ipaddress.ip_network("203.0.113.0/24"),     # TEST-NET-3
+    ipaddress.ip_network("fc00::/7"),           # IPv6 unique local
+]
+
+# Blocked hostnames regardless of resolved IP
+_BLOCKED_HOSTNAMES = frozenset({
+    "localhost",
+    "metadata.google.internal",            # GCP metadata
+    "169.254.169.254",                     # AWS/Azure/GCP metadata (IP form)
+    "fd00:ec2::254",                       # AWS IPv6 metadata
+})
+
+
+def _ssrf_check(url: str, allow_hosts: list[str] | None = None) -> str | None:
+    """
+    Return an error string if the URL fails the SSRF check, else None.
+    Checks: scheme, hostname, and whether the host is a private/blocked IP.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return f"Invalid URL: {url!r}"
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        return (
+            f"Security: URL scheme {scheme!r} is not allowed. "
+            "Only http and https are permitted."
+        )
+
+    host = parsed.hostname or ""
+    if not host:
+        return f"Security: URL has no hostname: {url!r}"
+
+    # Honour the SSRF_ALLOW_HOSTS override (advanced — empty by default)
+    if allow_hosts and host.lower() in {h.lower() for h in allow_hosts}:
+        return None  # explicitly allowed — skip remaining checks
+
+    # Block known dangerous hostnames directly
+    if host.lower() in _BLOCKED_HOSTNAMES:
+        return f"Security: hostname {host!r} is blocked (SSRF protection)."
+
+    # Try to parse host as an IP address — block private ranges directly
+    try:
+        ip = ipaddress.ip_address(host)
+        for net in _BLOCKED_NETWORKS:
+            if ip in net:
+                return (
+                    f"Security: IP address {host!r} is in blocked range "
+                    f"{net} (SSRF protection)."
+                )
+    except ValueError:
+        # Not an IP — it's a hostname. We cannot resolve it here without
+        # making a blocking DNS call, so we rely on the blocked-hostname list
+        # and the metadata IP list above for the most common attack vectors.
+        # A post-connect check via httpx event hooks is the ideal hardening,
+        # but that requires a custom transport. This covers the primary vectors.
+        pass
+
+    return None  # safe to proceed
+
 
 TOOL_DEFINITION = ToolDefinition(
     name="web_fetch",
@@ -99,6 +183,13 @@ async def _web_fetch(
     maxChars: int = 50000,           # OpenClaw field name
     max_chars: int = 50000,          # alias
 ) -> str:
+    # CVE-2026-26322: SSRF check — must run before any network request
+    cfg = get_config()
+    _allow = list(getattr(cfg, "ssrf_allow_hosts", []) or [])
+    ssrf_err = _ssrf_check(url, allow_hosts=_allow)
+    if ssrf_err:
+        return f"Error: {ssrf_err}"
+
     # Resolve aliases
     effective_max_chars = maxChars if maxChars != 50000 else max_chars
     # extractMode="js" or render_js=true both mean JS rendering
@@ -259,6 +350,12 @@ async def _fetch_raw(
     max_chars: int = 50000,
 ) -> str:
     """Fetch raw HTML/text without any processing (extractMode='raw')."""
+    # CVE-2026-26322: SSRF check (raw path)
+    _cfg = get_config()
+    _allow = list(getattr(_cfg, "ssrf_allow_hosts", []) or [])
+    ssrf_err = _ssrf_check(url, allow_hosts=_allow)
+    if ssrf_err:
+        return f"Error: {ssrf_err}"
     extra_headers = {"User-Agent": "Mozilla/5.0", **(headers or {})}
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=extra_headers) as client:

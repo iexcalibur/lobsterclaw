@@ -592,12 +592,37 @@ async def _browser(
         if not effective_files:
             return "Error: 'paths' (or 'file_path') is required for upload"
         from pathlib import Path as _Path
-        file_list = [str(_Path(f).expanduser()) for f in effective_files]
-        for f in file_list:
-            if not _Path(f).exists():
-                return f"Error: file not found: {f}"
+        # CVE-2026-26329 — Path traversal guard.
+        # Resolve every upload path to its real absolute path and assert
+        # it stays within the user's home directory or the configured
+        # workspace. This blocks attacks like:
+        #   file_path: "../../etc/passwd"
+        #   file_path: "/proc/self/environ"
+        cfg = get_config()
+        _allowed_roots = [
+            _Path.home().resolve(),
+            _Path(cfg.exec_working_dir).expanduser().resolve() if hasattr(cfg, "exec_working_dir") else _Path.home().resolve(),
+        ]
+        safe_files: list[str] = []
+        for raw_f in effective_files:
+            resolved = _Path(raw_f).expanduser().resolve()
+            allowed = any(
+                str(resolved).startswith(str(root))
+                for root in _allowed_roots
+            )
+            if not allowed:
+                return (
+                    f"Security: upload path {raw_f!r} resolves to {resolved} which is "
+                    f"outside the allowed directories. "
+                    f"Only files within your home directory may be uploaded."
+                )
+            if not resolved.exists():
+                return f"Error: file not found: {raw_f}"
+            if resolved.is_dir():
+                return f"Error: {raw_f!r} is a directory, not a file."
+            safe_files.append(str(resolved))
         try:
-            await page.set_input_files(effective_selector, file_list, timeout=effective_timeout)
+            await page.set_input_files(effective_selector, safe_files, timeout=effective_timeout)
             return f"File(s) uploaded to '{effective_selector}' ✅"
         except Exception as e:
             return f"Upload error: {e}"

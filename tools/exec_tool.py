@@ -25,12 +25,67 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 from dataclasses import dataclass, field
 
 from config import get_config
 from tools.registry import ToolDefinition
 
 logger = logging.getLogger(__name__)
+
+# CVE-2026-25593 — command injection guard
+# Dangerous shell metacharacters that can break out of an intended command.
+# The agent can still use pipes/redirects in intentional shell commands —
+# this guard fires ONLY when elevated=True prepends `sudo`, ensuring the
+# sudo target cannot be overridden via shell metacharacters.
+_SHELL_INJECTION_CHARS = frozenset(';|&`$()<>\n\r\t')
+
+_DANGEROUS_PATTERNS = [
+    # Command chaining / execution
+    '&&', '||', ';;', '|&',
+    # Subshells
+    '$(', '${', '`',
+    # Redirects into privileged paths (elevated mode)
+    '>/etc', '>/usr', '>/bin', '>/sbin', '>/boot',
+]
+
+
+def _check_injection(command: str, elevated: bool) -> str | None:
+    """
+    Return an error string if the command looks like an injection attempt,
+    else return None (safe to proceed).
+
+    In elevated mode we are stricter — any shell metachar in the command
+    that would break sudo's argument parsing is rejected.
+    In normal mode we only block the most obviously malicious patterns
+    so as not to interfere with legitimate shell usage (pipes, redirects).
+    """
+    if elevated:
+        # shlex.split raises ValueError on unterminated quotes — treat as injection
+        try:
+            tokens = shlex.split(command)
+        except ValueError as exc:
+            return f"Security: malformed command rejected in elevated mode ({exc})"
+        # In elevated mode block any shell metacharacters
+        for ch in _SHELL_INJECTION_CHARS:
+            if ch in command:
+                return (
+                    f"Security: shell metacharacter {ch!r} rejected in elevated mode. "
+                    "Use exec with separate arguments rather than shell metacharacters."
+                )
+        # Also block token-level dangerous patterns
+        for pat in _DANGEROUS_PATTERNS:
+            if pat in command:
+                return f"Security: dangerous pattern {pat!r} rejected in elevated mode."
+    else:
+        # Normal mode: block only the most dangerous patterns
+        for pat in _DANGEROUS_PATTERNS[:4]:  # &&, ||, ;;, |& only
+            if pat in command:
+                return (
+                    f"Security: pattern {pat!r} detected. "
+                    "If intentional, split into separate exec calls."
+                )
+    return None
 
 
 @dataclass
@@ -245,6 +300,11 @@ async def _exec(
     work_dir = os.path.expanduser(effective_cwd)
     effective_timeout = min(timeout, cfg.exec_timeout_seconds)
 
+    # CVE-2026-25593: command injection check
+    injection_err = _check_injection(command, elevated)
+    if injection_err:
+        return f"Error: {injection_err}"
+
     # Remote node delegation
     if node:
         from tools.nodes_tool import _nodes
@@ -254,7 +314,9 @@ async def _exec(
     if elevated:
         if not getattr(cfg, "exec_elevated_enabled", False):
             return "Error: elevated exec requires EXEC_ELEVATED_ENABLED=true in .env"
-        command = f"sudo {command}"
+        # shlex.quote ensures the command string is treated as a single
+        # argument by sudo — prevents `sudo cmd; evil` style injection.
+        command = f"sudo -- {shlex.quote(command)}"
 
     # Build subprocess env
     proc_env = {**os.environ}
@@ -352,6 +414,10 @@ async def _process(
         if not command:
             return "Error: 'command' required for start"
         work_dir = os.path.expanduser(effective_cwd or cfg.exec_working_dir or "~")
+        # CVE-2026-25593: injection check on process start too
+        inj_err = _check_injection(command, False)
+        if inj_err:
+            return f"Error: {inj_err}"
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,

@@ -37,6 +37,8 @@ SendFn = Callable[[str], Awaitable[None]]
 
 @dataclass
 class SubagentRun:
+    # CVE-2026-24763: _enforced_depth is set by spawn() before the asyncio task
+    # starts, ensuring depth enforcement has no race window.
     run_id: str
     session_id: str
     label: str
@@ -154,6 +156,15 @@ class SubagentManager:
             "depth": child_depth,
         })
 
+        # CVE-2026-24763: set session depth BEFORE launching the task so that
+        # depth-gated tool checks in the registry are enforced from the very first
+        # tool call, with no window where depth=0 permits owner-only tools.
+        # (The registry is per-run; _run_subagent sets it again after building
+        #  a fresh registry, so this pre-set is belt-and-suspenders safety.)
+        # We record the depth in the run object so _run_subagent can apply it
+        # immediately when it builds its registry.
+        run._enforced_depth = child_depth
+
         # Launch in background
         task_coro = self._run_subagent(run, session, child_model)
         run.task_handle = asyncio.create_task(task_coro, name=f"subagent-{run_id}")
@@ -195,8 +206,10 @@ class SubagentManager:
             cfg = get_config()
             registry: ToolRegistry = self._agent_loop_factory()
 
-            # Set session depth on registry so owner_only / depth_limit checks work
-            registry.set_session_depth(run.depth)
+            # CVE-2026-24763: set session depth immediately after registry creation.
+            # run._enforced_depth was set by spawn() before this task was created,
+            # so the depth is always >= 1 before any tool can be called.
+            registry.set_session_depth(run._enforced_depth if hasattr(run, "_enforced_depth") else run.depth)
 
             # Apply sandbox mode — restrict dangerous tools in strict mode
             sandbox = getattr(run, "_sandbox", "inherit")

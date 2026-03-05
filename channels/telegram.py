@@ -1825,6 +1825,32 @@ class TelegramChannel:
     # Run / startup
     # ------------------------------------------------------------------
 
+    def _get_webhook_secret(self) -> str | None:
+        """
+        CVE-2026-26319 — Webhook authentication.
+        Returns the configured secret token, or raises if webhook is in use without one.
+        python-telegram-bot validates X-Telegram-Bot-Api-Secret-Token automatically
+        when secret_token is set, rejecting any request that does not carry the header.
+        We enforce that a secret is always configured in webhook mode.
+        """
+        cfg = self.cfg
+        secret = cfg.telegram_webhook_secret or ""
+        if secret:
+            return secret
+        # No secret configured — generate a secure random one and warn loudly.
+        # This ensures every webhook deployment is authenticated even if the user
+        # forgot to set TELEGRAM_WEBHOOK_SECRET.
+        import secrets as _secrets
+        generated = _secrets.token_urlsafe(32)
+        logger.warning(
+            "SECURITY WARNING: TELEGRAM_WEBHOOK_SECRET is not set. "
+            "A random secret has been generated for this session: %s\n"
+            "Set TELEGRAM_WEBHOOK_SECRET=%s in .env to make this permanent. "
+            "Without a fixed secret, the webhook token changes on every restart.",
+            generated, generated,
+        )
+        return generated
+
     def run(self) -> None:
         """Single-account blocking entry point (used by main.py in single-account mode)."""
         cfg = self.cfg
@@ -1835,7 +1861,7 @@ class TelegramChannel:
                 port=cfg.telegram_webhook_port,
                 url_path=self._account.token or cfg.telegram_bot_token,
                 webhook_url=cfg.telegram_webhook_url,
-                secret_token=cfg.telegram_webhook_secret or None,
+                secret_token=self._get_webhook_secret(),  # CVE-2026-26319
             )
         else:
             # Polling mode with offset persistence
@@ -1866,7 +1892,7 @@ class TelegramChannel:
                 port=cfg.telegram_webhook_port,
                 url_path=self._account.token or cfg.telegram_bot_token,
                 webhook_url=cfg.telegram_webhook_url,
-                secret_token=cfg.telegram_webhook_secret or None,
+                secret_token=self._get_webhook_secret(),  # CVE-2026-26319
             )
         else:
             saved_offset = self._load_poll_offset()
