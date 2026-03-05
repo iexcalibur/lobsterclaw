@@ -103,14 +103,38 @@ class CronManager:
         rows = conn.execute(
             "SELECT id, schedule, message FROM jobs WHERE enabled=1"
         ).fetchall()
+        now_dt = datetime.now()
         conn.close()
         restored = 0
+        stale_ids: list[str] = []
         for job_id, schedule, message in rows:
+            # Skip (and clean up) ISO datetime one-shots whose fire time has passed.
+            # These are stale rows from a crash between fire and remove_job().
+            if re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", schedule.strip()):
+                try:
+                    fire_dt = datetime.fromisoformat(schedule.strip())
+                    if fire_dt <= now_dt:
+                        logger.info(
+                            "Skipping stale one-shot job %s (was due %s, now %s) — disabling",
+                            job_id, schedule, now_dt.isoformat(timespec="seconds"),
+                        )
+                        stale_ids.append(job_id)
+                        continue
+                except ValueError:
+                    pass  # unparseable — let _schedule() handle/reject it
             try:
                 self._schedule(job_id, schedule, message)
                 restored += 1
             except Exception as e:
                 logger.warning("Could not restore job %s: %s", job_id, e)
+        # Disable stale one-shot rows so they don't re-fire on next restart
+        if stale_ids:
+            conn2 = sqlite3.connect(str(self.cfg.cron_db))
+            for sid in stale_ids:
+                conn2.execute("UPDATE jobs SET enabled=0 WHERE id=?", (sid,))
+            conn2.commit()
+            conn2.close()
+            logger.info("Disabled %d stale one-shot job(s) on restore", len(stale_ids))
         logger.info("Restored %d cron jobs", restored)
 
     # ------------------------------------------------------------------
@@ -196,11 +220,13 @@ class CronManager:
             await self._publish_cron_event(job_id, message, "skipped", "No send function configured")
             return
 
+        _ran_ok = False  # tracks whether this run completed successfully
+
         try:
             outbound: str | None = None
 
             if delivery == "direct":
-                outbound = f"⏰ *Reminder*\n\n{message}"
+                outbound = f"⏰ **Reminder**\n\n{message}"
             elif session_target == "isolated":
                 if self._agent_fn:
                     import asyncio
@@ -209,7 +235,7 @@ class CronManager:
                     )
                     return
                 else:
-                    outbound = f"⏰ *Reminder* (isolated mode unavailable)\n\n{message}"
+                    outbound = f"⏰ **Reminder** (isolated mode unavailable)\n\n{message}"
             else:
                 if self._agent_fn:
                     context = await self._get_recent_context(5)
@@ -228,12 +254,13 @@ class CronManager:
 
                     outbound = reply if reply and reply.strip() else f"⏰ Reminder: {message}"
                 else:
-                    outbound = f"⏰ *Reminder*\n\n{message}"
+                    outbound = f"⏰ **Reminder**\n\n{message}"
 
             if outbound:
                 logger.info("Cron %s: sending message to Telegram (%d chars)...", job_id, len(outbound))
                 await self._send_fn(outbound)
                 logger.info("Cron %s: Telegram send completed", job_id)
+                _ran_ok = True
                 self._record_run(job_id, fired_at, "ok")
                 await self._publish_cron_event(job_id, message, "ok", outbound)
 
@@ -247,11 +274,12 @@ class CronManager:
             except Exception:
                 pass
         finally:
-            # deleteAfterRun: remove from DB and scheduler after first successful execution
-            if delete_after_run:
+            # deleteAfterRun: remove ONLY on successful execution.
+            # If the job errored, keep it in DB so it can be inspected/retried.
+            if delete_after_run and _ran_ok:
                 try:
                     self.remove_job(job_id)
-                    logger.info("deleteAfterRun: removed job %s", job_id)
+                    logger.info("deleteAfterRun: removed job %s after successful run", job_id)
                 except Exception as e:
                     logger.warning("deleteAfterRun cleanup failed for %s: %s", job_id, e)
 
@@ -267,6 +295,7 @@ class CronManager:
         except Exception:
             pass
 
+        _isolated_ok = False
         try:
             from agent.subagent import get_subagent_manager
             mgr = get_subagent_manager()
@@ -275,15 +304,17 @@ class CronManager:
                 label=f"cron-{job_id}",
                 parent_session_id="main",
             )
+            _isolated_ok = True
             self._record_run(job_id, fired_at, "ok")
         except Exception as e:
             logger.error("Isolated cron job %s failed: %s", job_id, e)
             self._record_run(job_id, fired_at, "error", str(e))
         finally:
-            if delete_after:
+            # Only remove on success
+            if delete_after and _isolated_ok:
                 try:
                     self.remove_job(job_id)
-                    logger.info("deleteAfterRun: removed isolated job %s", job_id)
+                    logger.info("deleteAfterRun: removed isolated job %s after successful run", job_id)
                 except Exception as e:
                     logger.warning("deleteAfterRun cleanup failed for %s: %s", job_id, e)
 
@@ -313,6 +344,13 @@ class CronManager:
         # delivery: agent | direct | webhook (webhook stored but not yet wired)
         if delivery not in ("agent", "direct", "webhook"):
             delivery = "agent"  # graceful fallback
+
+        # One-shot jobs (ISO datetime → DateTrigger) must always be deleted after
+        # their single run. APScheduler removes the DateTrigger from memory after
+        # firing, but the DB row would stay with enabled=1 and re-fire on restart
+        # unless we force delete_after_run=True here.
+        if re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", schedule.strip()):
+            delete_after_run = True
 
         job_id = uuid.uuid4().hex[:8]
         now = datetime.now().isoformat(timespec="seconds")

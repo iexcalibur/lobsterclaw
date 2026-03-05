@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Send, Bot, User, Loader2, Clock, Bell } from "lucide-react";
 import clsx from "clsx";
+import MarkdownMessage from "@/components/MarkdownMessage";
 import { api, postJSON, connectGatewayWS, type GatewayEvent } from "@/lib/api";
 
 interface Message {
@@ -185,9 +186,7 @@ export default function ChatPage() {
                       <p className="text-[10px] font-medium text-amber-500 uppercase tracking-wider mb-1">
                         {msg.type === "cron" ? "Cron Reminder" : "System"}
                       </p>
-                      <p className="text-sm text-amber-200/80 whitespace-pre-wrap break-words">
-                        {msg.content}
-                      </p>
+                      <MarkdownMessage content={msg.content} className="text-sm text-amber-200/80" />
                     </div>
                   </div>
                 </div>
@@ -218,9 +217,7 @@ export default function ChatPage() {
                       : "bg-zinc-800 text-zinc-200 rounded-bl-md"
                   )}
                 >
-                  <p className="whitespace-pre-wrap break-words">
-                    {msg.content}
-                  </p>
+                  <MarkdownMessage content={msg.content} />
                 </div>
                 {msg.role === "user" && (
                   <div className="flex-shrink-0 mt-0.5">

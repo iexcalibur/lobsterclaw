@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { api, formatTokens, timeAgo } from "@/lib/api";
+import MarkdownMessage from "@/components/MarkdownMessage";
 
 interface Session {
   id: string;
@@ -274,9 +275,7 @@ export default function AgentsPage() {
                         <p className="text-[10px] font-medium text-zinc-500 uppercase mb-1">
                           {msg.role}
                         </p>
-                        <p className="text-zinc-300 whitespace-pre-wrap break-words line-clamp-6">
-                          {msg.content}
-                        </p>
+                        <MarkdownMessage content={msg.content} className="text-zinc-300 line-clamp-6" />
                       </div>
                     ))
                   )}

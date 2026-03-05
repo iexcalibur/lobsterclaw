@@ -7,6 +7,7 @@ PIP := $(VENV_BIN)/pip
 PY := $(VENV_BIN)/python
 NPM := npm
 GATEWAY_UI := gateway_ui
+GATEWAY_KEY := $(shell grep '^GATEWAY_API_KEY=' .env 2>/dev/null | cut -d= -f2- || true)
 
 .PHONY: help venv install install-ui setup check-env run run-debug test clean \
         gateway-ui gateway-ui-build all stop
@@ -59,11 +60,11 @@ install-ui:
 
 gateway-ui: install-ui
 	@echo "[Gateway UI] Starting dev server on http://localhost:3001"
-	@cd $(GATEWAY_UI) && $(NPM) run dev
+	@cd $(GATEWAY_UI) && NEXT_PUBLIC_GATEWAY_API_KEY="$(GATEWAY_KEY)" $(NPM) run dev
 
 gateway-ui-build: install-ui
 	@echo "[Gateway UI] Building for production..."
-	@cd $(GATEWAY_UI) && $(NPM) run build
+	@cd $(GATEWAY_UI) && NEXT_PUBLIC_GATEWAY_API_KEY="$(GATEWAY_KEY)" $(NPM) run build
 
 # ---------------------------------------------------------------
 # Run services
@@ -84,7 +85,7 @@ all: check-env install-ui
 	@echo ""
 	@trap 'kill 0' EXIT; \
 	GATEWAY_ENABLED=true $(PY) main.py & \
-	(cd $(GATEWAY_UI) && $(NPM) run dev) & \
+	(cd $(GATEWAY_UI) && NEXT_PUBLIC_GATEWAY_API_KEY="$(GATEWAY_KEY)" $(NPM) run dev) & \
 	wait
 
 # ---------------------------------------------------------------

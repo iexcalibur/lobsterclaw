@@ -279,10 +279,12 @@ def _job_to_manager_params(job: dict) -> dict:
     delivery_obj = job.get("delivery") or {}
 
     # Extract schedule string for backward-compat manager
+    is_one_shot = False
     if isinstance(schedule_obj, dict):
         kind = schedule_obj.get("kind", "")
         if kind == "at":
             schedule = schedule_obj.get("at", "")
+            is_one_shot = True
         elif kind == "every":
             ms = schedule_obj.get("everyMs", 60_000)
             if ms % 86_400_000 == 0:
@@ -299,6 +301,9 @@ def _job_to_manager_params(job: dict) -> dict:
             schedule = str(schedule_obj)
     else:
         schedule = str(schedule_obj)
+        # ISO datetime string → one-shot (e.g. "2026-03-05T18:48:30")
+        if schedule.strip() and len(schedule) >= 16 and schedule[4] == "-" and "T" in schedule:
+            is_one_shot = True
 
     # Extract message from payload
     if isinstance(payload_obj, dict):
@@ -322,6 +327,12 @@ def _job_to_manager_params(job: dict) -> dict:
     else:
         delivery = "agent"
 
+    # One-shot jobs (schedule.kind='at' or ISO datetime) default to delete_after_run=True
+    delete_after = job.get("deleteAfterRun", job.get("delete_after_run"))
+    if delete_after is None and is_one_shot:
+        delete_after = True
+    delete_after_run = bool(delete_after)
+
     return {
         "schedule": schedule,
         "message": message,
@@ -329,7 +340,7 @@ def _job_to_manager_params(job: dict) -> dict:
         "session_target": session_target,
         "delivery": delivery,
         "enabled": job.get("enabled", True),
-        "delete_after_run": bool(job.get("deleteAfterRun", job.get("delete_after_run", False))),
+        "delete_after_run": delete_after_run,
     }
 
 

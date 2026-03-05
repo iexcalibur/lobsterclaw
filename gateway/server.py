@@ -71,14 +71,23 @@ async def _ws_auth(websocket: WebSocket) -> bool:
     """
     WebSocket auth — check ?api_key= query param.
     Returns True if allowed, False if rejected.
+
+    IMPORTANT: call this BEFORE websocket.accept(). If called after accept(),
+    closing the socket raises AttributeError on websockets>=12 because the
+    protocol's transfer_data_task is not yet initialised.
+    When this returns False, the caller should NOT call websocket.accept() —
+    the WebSocket framework will drop the connection automatically.
     """
     expected = _get_api_key()
     if expected is None:
-        return True  # dev mode
+        return True  # dev mode — no key configured
     provided = websocket.query_params.get("api_key", "")
     if not provided or not secrets.compare_digest(provided.strip(), expected):
         logger.warning("Gateway WS: rejected connection — invalid or missing api_key param")
-        await websocket.close(code=4401, reason="Unauthorized")
+        # Do NOT call websocket.close() here — the connection has not been
+        # accepted yet, so close() crashes on websockets>=12.
+        # Returning False tells ws_events to skip accept() and return early,
+        # which causes the framework to cleanly drop the connection.
         return False
     return True
 
@@ -511,10 +520,14 @@ def create_app() -> FastAPI:
     # ── WebSocket — auth via ?api_key= query param ────────────────────────────
     @app.websocket("/ws/gateway")
     async def ws_events(websocket: WebSocket):
-        await websocket.accept()
-
+        # Auth check MUST happen before accept() — calling websocket.close()
+        # on an un-accepted connection crashes on websockets>=12.
+        # (AttributeError: 'WebSocketProtocol' object has no attribute
+        #  'transfer_data_task')
         if not await _ws_auth(websocket):
-            return  # already closed inside _ws_auth
+            return  # connection dropped cleanly — no accept() called
+
+        await websocket.accept()
 
         queue = event_bus.subscribe()
         logger.info("Gateway WS connected (subscribers: %d)", event_bus.subscriber_count)

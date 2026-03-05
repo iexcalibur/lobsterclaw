@@ -1968,7 +1968,8 @@ def _render_telegram_markdown_html(text: str) -> str:
     """
     if not text:
         return ""
-    if not any(tok in text for tok in ("```", "**", "__", "`", "~~", "# ")):
+    # Also check * (single) for *Reminder* etc. — treat as bold for headers
+    if not any(tok in text for tok in ("```", "**", "*", "__", "`", "~~", "# ")):
         return text
 
     placeholders: list[str] = []
@@ -1997,6 +1998,7 @@ def _render_telegram_markdown_html(text: str) -> str:
     rendered = html.escape(staged)
     rendered = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"<b>\1</b>", rendered)
     rendered = re.sub(r"\*\*([^\n*][^*]*?)\*\*", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"\*([^\n*][^*]*?)\*", r"<b>\1</b>", rendered)  # *word* → bold (e.g. *Reminder*)
     rendered = re.sub(r"__([^_\n][^_]*?)__", r"<b>\1</b>", rendered)
     rendered = re.sub(r"~~([^~\n][^~]*?)~~", r"<s>\1</s>", rendered)
 

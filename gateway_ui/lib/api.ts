@@ -1,16 +1,31 @@
 const API_BASE =
   process.env.NEXT_PUBLIC_GATEWAY_URL || "http://localhost:4400";
 
-const WS_URL =
+const WS_BASE =
   process.env.NEXT_PUBLIC_GATEWAY_WS || "ws://localhost:4400/ws/gateway";
+
+// API key — read from env. In dev with no key set, leave blank (gateway
+// runs in dev mode and accepts unauthenticated requests).
+const API_KEY = process.env.NEXT_PUBLIC_GATEWAY_API_KEY || "";
+
+// Build WebSocket URL, appending ?api_key= when a key is configured.
+const WS_URL = API_KEY ? `${WS_BASE}?api_key=${encodeURIComponent(API_KEY)}` : WS_BASE;
 
 export async function api<T = any>(
   path: string,
   opts?: RequestInit
 ): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(opts?.headers as Record<string, string>),
+  };
+  // Attach API key when configured
+  if (API_KEY) {
+    headers["X-API-Key"] = API_KEY;
+  }
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...opts?.headers },
     ...opts,
+    headers,
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
