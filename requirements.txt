@@ -14,6 +14,8 @@ Pillow>=10.0.0
 python-dotenv>=1.0.0
 aiofiles>=24.0.0
 aiosqlite>=0.20.0
+discord.py>=2.3.0
+watchdog>=3.0.0
 
 # Testing
 pytest>=8.0.0

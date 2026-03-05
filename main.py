@@ -43,8 +43,11 @@ if cfg.log_level.upper() != "DEBUG":
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def build_registry():
-    """Build and return a ToolRegistry with all tools registered and policy applied."""
+def build_registry(light: bool = False):
+    """Build and return a ToolRegistry with all tools registered and policy applied.
+
+    light=True skips browser, canvas, and multi-channel stubs — for fast cron/heartbeat runs.
+    """
     from tools.registry import ToolRegistry
     from tools import (
         web_fetch,
@@ -83,8 +86,9 @@ def build_registry():
     registry.register(filesystem.DELETE_TOOL)
     registry.register(filesystem.MOVE_TOOL)
 
-    # Browser
-    registry.register(browser_tool.TOOL_DEFINITION)
+    # Browser (skipped in light mode — Playwright startup is expensive)
+    if not light:
+        registry.register(browser_tool.TOOL_DEFINITION)
 
     # Memory (full suite)
     registry.register(memory_tool.MEMORY_SEARCH_TOOL)
@@ -106,13 +110,15 @@ def build_registry():
     # Nodes (remote device management)
     registry.register(nodes_tool.TOOL_DEFINITION)
 
-    # Canvas (interactive UI surfaces)
-    registry.register(canvas_tool.TOOL_DEFINITION)
+    # Canvas (skipped in light mode)
+    if not light:
+        registry.register(canvas_tool.TOOL_DEFINITION)
 
-    # Multi-channel stubs (Discord, Slack, WhatsApp — schema-compatible, disabled by default)
-    registry.register(channel_stubs.DISCORD_TOOL)
-    registry.register(channel_stubs.SLACK_TOOL)
-    registry.register(channel_stubs.WHATSAPP_TOOL)
+    # Multi-channel stubs (skipped in light mode)
+    if not light:
+        registry.register(channel_stubs.DISCORD_TOOL)
+        registry.register(channel_stubs.SLACK_TOOL)
+        registry.register(channel_stubs.WHATSAPP_TOOL)
 
     # Sessions / sub-agents / orchestration
     registry.register(sessions_tool.SESSIONS_SPAWN_TOOL)
@@ -168,7 +174,21 @@ def _wire_channel(telegram, registry, approval, cron_mgr, build_system_prompt):
 
 
 def main() -> None:
-    logger.info("Starting LobsterClaw...")
+    import argparse
+    parser = argparse.ArgumentParser(description="LobsterClaw AI Assistant")
+    parser.add_argument(
+        "--light-context", action="store_true",
+        help="Light-bootstrap mode: skip browser, canvas, memory index, sub-agents. "
+             "Faster cold-start for scheduled/cron runs.",
+    )
+    args, _ = parser.parse_known_args()
+
+    cfg = get_config()
+    # CLI flag overrides env var
+    if args.light_context:
+        object.__setattr__(cfg, "light_context", True)
+
+    logger.info("Starting LobsterClaw%s...", " [LIGHT MODE]" if cfg.light_context else "")
 
     cfg = get_config()
     logger.info("LLM provider: %s / model: %s", cfg.llm_provider, cfg.llm_model)
@@ -193,12 +213,13 @@ def main() -> None:
     set_session_store(session_store)
     logger.info("Session store: %s", cfg.sessions_db)
 
-    # Sub-agent manager
+    # Sub-agent manager (skipped in light mode)
     subagent_mgr = SubagentManager()
-    set_subagent_manager(subagent_mgr)
+    if not cfg.light_context:
+        set_subagent_manager(subagent_mgr)
 
     approval = ApprovalGate()
-    registry = build_registry()
+    registry = build_registry(light=cfg.light_context)
     registry.set_approval_gate(approval)
 
     history = HistoryManager()
@@ -246,6 +267,28 @@ def main() -> None:
             build_prompt=build_system_prompt,
         )
         channels.append(ch)
+
+    # ----------------------------------------------------------------
+    # Build Discord channel (if enabled)
+    # ----------------------------------------------------------------
+    discord_channel = None
+    if cfg.discord_enabled:
+        try:
+            from channels.discord import DiscordChannel
+            from tools.discord_tool import set_discord_channel, DISCORD_TOOL
+            discord_channel = DiscordChannel(
+                agent=agent,
+                history=history,
+                approval=approval,
+                build_prompt=build_system_prompt,
+            )
+            set_discord_channel(discord_channel)
+            # Replace stub tool with live implementation
+            registry.register(DISCORD_TOOL)
+            logger.info("Discord channel enabled")
+        except Exception as exc:
+            logger.error("Discord channel failed to initialise: %s", exc)
+            discord_channel = None
 
     # Use the primary (first) channel for all tool wiring
     primary = channels[0]
@@ -306,10 +349,18 @@ def main() -> None:
     # Load plugins
     # ----------------------------------------------------------------
 
-    from tools.plugin_loader import register_plugins
+    from tools.plugin_loader import register_plugins, start_hot_reload
+    from pathlib import Path as _Path
     plugin_tools = register_plugins(registry)
     if plugin_tools:
         logger.info("Loaded plugin tools: %s", ", ".join(plugin_tools))
+
+    # Plugin hot-reload (watchdog) — watches workspace/plugins/ for changes
+    if getattr(cfg, "plugin_hot_reload", True) and not cfg.light_context:
+        _plugins_dir = _Path(__file__).parent / "workspace" / "plugins"
+        _hr_started = start_hot_reload(registry, watch_dir=_plugins_dir)
+        if not _hr_started:
+            logger.info("Plugin hot-reload: install watchdog>=3.0.0 to enable")
 
     # ----------------------------------------------------------------
     # Load hooks (workspace/hooks/*/handler.py)
@@ -369,6 +420,8 @@ def main() -> None:
             channels,
             start_canvas_host=use_canvas_host,
             start_gateway=use_gateway,
+            start_discord=bool(discord_channel),
+            discord_ch=discord_channel,
             on_ready=start_schedulers,
         ))
 
@@ -378,6 +431,8 @@ async def _run_async_main(
     *,
     start_canvas_host: bool = False,
     start_gateway: bool = False,
+    start_discord: bool = False,
+    discord_ch=None,
     on_ready: callable = None,
 ) -> None:
     """
@@ -428,6 +483,12 @@ async def _run_async_main(
         t = asyncio.create_task(ch.run_async(), name=f"telegram-{getattr(ch, 'label', 'main')}")
         tasks.append(t)
 
+    # Discord channel
+    if start_discord and discord_ch:
+        t = asyncio.create_task(discord_ch.run_async(), name="discord")
+        tasks.append(t)
+        logger.info("Discord channel task started")
+
     logger.info("All tasks started (%d). Waiting for shutdown signal...", len(tasks))
     await stop_event.wait()
 
@@ -435,6 +496,8 @@ async def _run_async_main(
     logger.info("Shutting down...")
 
     stop_tasks = [asyncio.create_task(ch.stop_async()) for ch in channels]
+    if start_discord and discord_ch:
+        stop_tasks.append(asyncio.create_task(discord_ch.stop_async()))
     await asyncio.gather(*stop_tasks, return_exceptions=True)
 
     for t in tasks:

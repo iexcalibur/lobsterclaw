@@ -175,6 +175,13 @@ class Config:
 
     # Additional channels (stub-compatible; disabled by default)
     discord_enabled: bool = field(default_factory=lambda: _env_bool("DISCORD_ENABLED", False))
+    discord_bot_token: str = field(default_factory=lambda: _env("DISCORD_BOT_TOKEN", ""))
+    discord_guild_id: int = field(default_factory=lambda: _env_int("DISCORD_GUILD_ID", 0))
+    discord_channel_id: int = field(default_factory=lambda: _env_int("DISCORD_CHANNEL_ID", 0))
+    discord_owner_id: int = field(default_factory=lambda: _env_int("DISCORD_OWNER_ID", 0))
+    discord_dm_policy: str = field(default_factory=lambda: _env("DISCORD_DM_POLICY", "owner"))
+    discord_mention_required: bool = field(default_factory=lambda: _env_bool("DISCORD_MENTION_REQUIRED", True))
+    discord_streaming: bool = field(default_factory=lambda: _env_bool("DISCORD_STREAMING", True))
     slack_enabled: bool = field(default_factory=lambda: _env_bool("SLACK_ENABLED", False))
     whatsapp_enabled: bool = field(default_factory=lambda: _env_bool("WHATSAPP_ENABLED", False))
     # Canvas
@@ -256,6 +263,13 @@ class Config:
     gateway_cors_origins: list[str] = field(
         default_factory=lambda: _env_list("GATEWAY_CORS_ORIGINS", "")
     )
+    # Light-bootstrap mode — skip heavy subsystems for low-overhead scheduled runs.
+    # Enable with:  python main.py --light-context
+    # Or set env:   LIGHT_CONTEXT=true
+    light_context: bool = field(default_factory=lambda: _env_bool("LIGHT_CONTEXT", False))
+    # Plugin hot-reload — watch workspace/plugins/ and reload on file change.
+    # Requires watchdog>=3.0.0
+    plugin_hot_reload: bool = field(default_factory=lambda: _env_bool("PLUGIN_HOT_RELOAD", True))
 
     # Agent identity
     # Human-readable agent identifier shown in the ## Runtime prompt line.
