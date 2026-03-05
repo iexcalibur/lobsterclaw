@@ -397,7 +397,7 @@ class TelegramChannel:
             f"- role: {role}",
             f"- user_id: {user.id}",
             f"- username: @{user.username}" if user.username else "- username: (none)",
-            f"- display_name: {display_name}  ← this IS the user's name; use it directly to answer 'what is my name?' questions",
+            f"- display_name: {display_name}  ← Telegram profile name (fallback if USER.md has no name)",
         ]
         if chat:
             lines.append(f"- chat_id: {chat.id}")
@@ -410,8 +410,8 @@ class TelegramChannel:
             if msg.message_thread_id:
                 lines.append(f"- message_thread_id: {msg.message_thread_id}")
         lines.append(
-            "Use display_name as the user's name. "
-            "Do NOT say you don't know the user's name — it is always available above. "
+            "Prefer USER.md for the user's name (Name, What to call them). "
+            "Use display_name only if USER.md has no name set. "
             "Do not dump raw metadata unless asked."
         )
         return "\n".join(lines)

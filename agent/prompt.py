@@ -278,7 +278,7 @@ def build_system_prompt(
             "then use memory_get to pull only the needed lines. "
             "If low confidence after search, say you checked. "
             "Exception: do NOT search memory for the user's name or identity — "
-            "that is always available in the sender metadata above (display_name).",
+            "that is in USER.md (Name, What to call them) or sender metadata (display_name) as fallback.",
         ]
         if memory_citations == "off":
             memory_lines.append(
