@@ -28,6 +28,7 @@ from agent.sessions import (
     get_session_store,
 )
 from config import get_config
+from agent import hooks as _hooks
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,15 @@ class SubagentManager:
         run._thinking = thinking
         self._registry[run_id] = run
 
+        # Fire session:spawn hook
+        await _hooks.fire("session:spawn", {
+            "session_id": session.id,
+            "parent_session_id": parent_session_id,
+            "label": child_label,
+            "task": task[:200] if task else "",
+            "depth": child_depth,
+        })
+
         # Launch in background
         task_coro = self._run_subagent(run, session, child_model)
         run.task_handle = asyncio.create_task(task_coro, name=f"subagent-{run_id}")
@@ -220,6 +230,11 @@ class SubagentManager:
             run.status = "completed"
             run.result = result
             await store.update_session_status(session.id, "completed")
+            await _hooks.fire("session:end", {
+                "session_id": session.id,
+                "status": "completed",
+                "label": run.label,
+            })
             await store.append_message(session.id, "user", run.task)
             await store.append_message(session.id, "assistant", result)
 
@@ -243,6 +258,12 @@ class SubagentManager:
             run.status = "error"
             run.result = str(e)
             await store.update_session_status(session.id, "error", error=str(e))
+            await _hooks.fire("session:end", {
+                "session_id": session.id,
+                "status": "error",
+                "label": run.label,
+                "error": str(e),
+            })
             if self._send_fn:
                 label_str = f" *{run.label}*" if run.label else ""
                 await self._send_fn(f"❌ Sub-agent{label_str} failed: {e}")

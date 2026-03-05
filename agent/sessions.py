@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import time as _time
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,9 @@ class SessionStore:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = str(db_path)
         self._lock = asyncio.Lock()
+        # JSONL transcript directory — mirrors OpenClaw per-session .jsonl files
+        self._transcript_dir: Path = db_path.parent / "transcripts"
+        self._transcript_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -227,15 +231,34 @@ class SessionStore:
     async def append_message(self, session_id: str, role: str, content: str) -> None:
         async with self._lock:
             conn = self._connect()
+            now = _now()
             conn.execute(
                 "INSERT INTO session_messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                (session_id, role, content, _now()),
+                (session_id, role, content, now),
             )
             conn.execute(
-                "UPDATE sessions SET updated_at=? WHERE id=?", (_now(), session_id)
+                "UPDATE sessions SET updated_at=? WHERE id=?", (now, session_id)
             )
             conn.commit()
             conn.close()
+
+        # Write to per-session JSONL transcript (mirrors OpenClaw .jsonl per session)
+        self._append_jsonl(session_id, role, content)
+
+    def _append_jsonl(self, session_id: str, role: str, content: str) -> None:
+        """Append one message to ~/.lobsterclaw/transcripts/<session_id>.jsonl"""
+        try:
+            path = self._transcript_dir / f"{session_id}.jsonl"
+            entry = json.dumps({
+                "ts": _time.time(),
+                "session_id": session_id,
+                "role": role,
+                "content": content[:4096],  # cap very long tool results
+            }, ensure_ascii=False)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(entry + "\n")
+        except Exception as exc:
+            logger.debug("JSONL transcript write failed for session %s: %s", session_id, exc)
 
     async def get_messages(self, session_id: str, limit: int = 100) -> list[dict]:
         conn = self._connect()

@@ -37,6 +37,7 @@ from agent.compaction import (
 )
 from agent.loop_detection import LoopDetectionState
 from config import get_config
+from agent import hooks as _hooks
 
 if TYPE_CHECKING:
     from tools.registry import ToolRegistry
@@ -494,6 +495,17 @@ class AgentLoop:
             # Reset per-run token counters so we only persist this run's usage
             self._token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
+            # Fire command:new hook — user message entering the agent loop
+            if messages:
+                _last_user = next(
+                    (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
+                    "",
+                )
+                await _hooks.fire("command:new", {
+                    "session_id": session_id or "main",
+                    "message": _last_user if isinstance(_last_user, str) else "",
+                })
+
             effective_model = model_override or self.cfg.llm_model
 
             # Resolve model aliases (e.g., "sonnet" → "claude-sonnet-4-5")
@@ -566,6 +578,13 @@ class AgentLoop:
                     )
                 except Exception:
                     pass  # SessionStore may not be initialized in tests
+
+            # Fire turn:end hook — agent finished a full response turn
+            await _hooks.fire("turn:end", {
+                "session_id": session_id or "main",
+                "content": result,
+                "role": "assistant",
+            })
 
             return result
 
@@ -743,11 +762,22 @@ class AgentLoop:
                     args_with_ctx = dict(block.input)
                     if session_id:
                         args_with_ctx.setdefault("_session_id", session_id)
+                    _t_start = __import__("time").monotonic()
                     try:
                         result = await self.registry.execute(block.name, args_with_ctx)
+                        _tool_success = True
                     except Exception as e:
                         logger.exception("Unhandled tool error: %s", block.name)
                         result = f"Tool error: {_sanitize_error(e)}"
+                        _tool_success = False
+
+                    # Fire tool:result hook
+                    await _hooks.fire("tool:result", {
+                        "session_id": session_id or "main",
+                        "tool_name": block.name,
+                        "success": _tool_success,
+                        "duration_ms": round((__import__("time").monotonic() - _t_start) * 1000),
+                    })
 
                     if check.action == "warn":
                         result = f"⚠️ {check.message}\n\n{result}"
@@ -1011,11 +1041,20 @@ class AgentLoop:
                         args_with_ctx = dict(args)
                         if session_id:
                             args_with_ctx.setdefault("_session_id", session_id)
+                        _t_start = __import__("time").monotonic()
                         try:
                             result = await self.registry.execute(tc["name"], args_with_ctx)
+                            _tool_success = True
                         except Exception as e:
                             logger.exception("Unhandled tool error: %s", tc["name"])
                             result = f"Tool error: {_sanitize_error(e)}"
+                            _tool_success = False
+                        await _hooks.fire("tool:result", {
+                            "session_id": session_id or "main",
+                            "tool_name": tc["name"],
+                            "success": _tool_success,
+                            "duration_ms": round((__import__("time").monotonic() - _t_start) * 1000),
+                        })
 
                         if check.action == "warn":
                             result = f"⚠️ {check.message}\n\n{result}"
@@ -1104,11 +1143,20 @@ class AgentLoop:
                         args_with_ctx = dict(args)
                         if session_id:
                             args_with_ctx.setdefault("_session_id", session_id)
+                        _t_start = __import__("time").monotonic()
                         try:
                             result = await self.registry.execute(tool_call.function.name, args_with_ctx)
+                            _tool_success = True
                         except Exception as e:
                             logger.exception("Unhandled tool error: %s", tool_call.function.name)
                             result = f"Tool error: {_sanitize_error(e)}"
+                            _tool_success = False
+                        await _hooks.fire("tool:result", {
+                            "session_id": session_id or "main",
+                            "tool_name": tool_call.function.name,
+                            "success": _tool_success,
+                            "duration_ms": round((__import__("time").monotonic() - _t_start) * 1000),
+                        })
 
                         if check.action == "warn":
                             result = f"⚠️ {check.message}\n\n{result}"

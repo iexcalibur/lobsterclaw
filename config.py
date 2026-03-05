@@ -248,6 +248,14 @@ class Config:
     gateway_enabled: bool = field(default_factory=lambda: _env_bool("GATEWAY_ENABLED", True))
     gateway_port: int = field(default_factory=lambda: _env_int("GATEWAY_PORT", 4400))
     gateway_bind: str = field(default_factory=lambda: _env("GATEWAY_BIND", "127.0.0.1"))
+    # Gateway security — set GATEWAY_API_KEY in .env to enable auth on all endpoints.
+    # Generate a strong key: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+    gateway_api_key: str = field(default_factory=lambda: _env("GATEWAY_API_KEY", ""))
+    # Comma-separated CORS origins. Leave empty to default to localhost:3001 only.
+    # Example: "http://localhost:3001,https://your-domain.com"
+    gateway_cors_origins: list[str] = field(
+        default_factory=lambda: _env_list("GATEWAY_CORS_ORIGINS", "")
+    )
 
     # Agent identity
     # Human-readable agent identifier shown in the ## Runtime prompt line.

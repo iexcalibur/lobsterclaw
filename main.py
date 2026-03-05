@@ -312,6 +312,16 @@ def main() -> None:
         logger.info("Loaded plugin tools: %s", ", ".join(plugin_tools))
 
     # ----------------------------------------------------------------
+    # Load hooks (workspace/hooks/*/handler.py)
+    # ----------------------------------------------------------------
+    from agent.hooks import init_hooks
+    from pathlib import Path as _Path
+    _workspace = _Path(__file__).parent / "workspace"
+    hook_registry = init_hooks(_workspace)
+    if hook_registry.loaded:
+        logger.info("Loaded hooks: %s", ", ".join(hook_registry.loaded))
+
+    # ----------------------------------------------------------------
     # Start Telegram bot(s)
     # ----------------------------------------------------------------
 
