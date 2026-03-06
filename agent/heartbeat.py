@@ -95,7 +95,9 @@ class HeartbeatRunner:
                 "[Heartbeat] Please check your HEARTBEAT.md tasks and act on any that are due.",
                 system,
             )
-            if reply and reply.strip():
+            no_reply = getattr(self.cfg, "silent_reply_token", "NO_REPLY")
+            hb_ok = getattr(self.cfg, "heartbeat_ok_token", "HEARTBEAT_OK")
+            if reply and reply.strip() and reply.strip() not in (no_reply, hb_ok):
                 await self._send_fn(f"🔄 *Heartbeat*\n\n{reply}")
         except Exception as e:
             logger.error("Heartbeat agent run failed: %s", e)

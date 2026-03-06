@@ -329,6 +329,11 @@ def main() -> None:
         send_fn=primary.send_message,
     )
 
+    # Nightly memory consolidation — distils daily log → MEMORY.md each night
+    from agent.nightly_memory import get_nightly_memory_runner
+    nightly_memory = get_nightly_memory_runner()
+    nightly_memory.configure(agent_fn=agent_for_bg)
+
     # ----------------------------------------------------------------
     # Configure Gateway API (Mission Control dashboard)
     # ----------------------------------------------------------------
@@ -396,12 +401,22 @@ def main() -> None:
             if cfg.heartbeat_enabled:
                 heartbeat.start(cron_mgr.scheduler)
                 logger.info("Heartbeat runner attached (schedule: %s)", cfg.heartbeat_schedule)
+            nightly_memory.start(cron_mgr.scheduler)
+            logger.info("Nightly memory runner attached")
         elif cfg.heartbeat_enabled:
             from apscheduler.schedulers.asyncio import AsyncIOScheduler
             hb_scheduler = AsyncIOScheduler()
             hb_scheduler.start()
             heartbeat.start(hb_scheduler)
+            nightly_memory.start(hb_scheduler)
             logger.info("Heartbeat-only scheduler started")
+        else:
+            # No cron, no heartbeat — still need a scheduler for nightly memory
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            nm_scheduler = AsyncIOScheduler()
+            nm_scheduler.start()
+            nightly_memory.start(nm_scheduler)
+            logger.info("Nightly memory scheduler started")
 
     if len(channels) == 1 and not use_canvas_host and not use_gateway:
         # Simple single-account blocking path (no extra servers)

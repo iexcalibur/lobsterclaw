@@ -123,7 +123,7 @@ def build_system_prompt(
         include_heartbeat: include HEARTBEAT.md in context (heartbeat runs only)
         prompt_mode:       "full" (default) | "minimal" (sub-agents) | "none"
         runtime_info:      dict with channel/capabilities overrides for ## Runtime
-        extra_system_prompt: injected as ## Subagent Context (minimal) or ## Group Chat Context (full)
+        extra_system_prompt: injected as ## Subagent Context (minimal) or ## Sender Context (full)
     """
     from agent.workspace import load_workspace_context
     from agent.skills import format_skills_for_prompt
@@ -511,7 +511,7 @@ def build_system_prompt(
     # Extra system prompt (sub-agent context or group chat context)
     # ----------------------------------------------------------------
     if extra_system_prompt and extra_system_prompt.strip():
-        header = "## Subagent Context" if is_minimal else "## Group Chat Context"
+        header = "## Subagent Context" if is_minimal else "## Sender Context"
         lines += [header, extra_system_prompt.strip(), ""]
 
     # ----------------------------------------------------------------

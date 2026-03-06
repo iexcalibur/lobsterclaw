@@ -203,6 +203,16 @@ class Config:
     heartbeat_schedule: str = field(
         default_factory=lambda: _env("HEARTBEAT_SCHEDULE", "0 * * * *")
     )
+
+    # Nightly memory summarization — distils today's daily log into MEMORY.md
+    # Runs as a cron job at the configured schedule. Disable by setting to "".
+    nightly_memory_enabled: bool = field(
+        default_factory=lambda: _env_bool("NIGHTLY_MEMORY_ENABLED", True)
+    )
+    nightly_memory_schedule: str = field(
+        default_factory=lambda: _env("NIGHTLY_MEMORY_SCHEDULE", "30 23 * * *")
+    )
+
     # Active hours: heartbeat/cron wakes only fire in this local hour range (0-23, inclusive)
     heartbeat_active_hours_start: int = field(
         default_factory=lambda: _env_int("HEARTBEAT_ACTIVE_HOURS_START", 0)

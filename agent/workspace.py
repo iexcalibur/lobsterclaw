@@ -4,14 +4,15 @@ Workspace MD file loader — mirrors OpenClaw's bootstrap context system.
 Files loaded from the workspace/ directory and injected into the system prompt.
 
 Load order (first wins for SOUL.md persona):
-  AGENTS.md    — top-level agent instructions (loaded first if present; same role as OpenClaw's AGENTS.md)
-  BOOTSTRAP.md — onboarding/bootstrap guidance (loaded before SOUL)
-  SOUL.md      — agent personality and core principles
-  USER.md      — facts about the human
-  MEMORY.md    — persistent key facts
-  IDENTITY.md  — agent name/role override
-  TOOLS.md     — tool usage guidelines
-  HEARTBEAT.md — periodic task list (loaded only during heartbeat runs)
+  AGENTS.md          — top-level agent instructions (loaded first if present; same role as OpenClaw's AGENTS.md)
+  BOOTSTRAP.md       — onboarding/bootstrap guidance (loaded before SOUL)
+  SOUL.md            — agent personality and core principles
+  USER.md            — facts about the human
+  MEMORY.md          — persistent key facts
+  IDENTITY.md        — agent name/role override
+  TOOLS.md           — tool usage guidelines
+  HEARTBEAT.md       — periodic task list (loaded only during heartbeat runs)
+  memory/YYYY-MM-DD  — today + yesterday daily logs (loaded after static files, mirrors OpenClaw)
 
 Each file is optional. Missing files are silently skipped.
 Front-matter (YAML between --- delimiters) is stripped before injection.
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -54,9 +56,22 @@ BOOTSTRAP_TRUNCATION_MARKER = "\n\n[... middle truncated ({removed} chars) — h
 # Files loaded for sub-agent and cron sessions (minimal set)
 MINIMAL_SESSION_FILES = ["AGENTS.md", "TOOLS.md", "SOUL.md", "IDENTITY.md", "USER.md"]
 
+# Per-file char budget for daily logs (smaller than static files — they can grow large)
+DAILY_LOG_PER_FILE_CHAR_BUDGET = 8_000
+
 # File content cache: path → {"content": str, "identity": str}
 # Identity = f"{size}:{mtime_ns}" — cheap inode-free freshness check
 _file_cache: dict[str, dict] = {}
+
+
+def _daily_log_filenames() -> list[str]:
+    """Return [today, yesterday] daily log filenames: ["memory/2026-03-06.md", "memory/2026-03-05.md"]."""
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    return [
+        f"memory/{today.isoformat()}.md",
+        f"memory/{yesterday.isoformat()}.md",
+    ]
 
 
 def _file_identity(path: Path) -> str:
@@ -181,6 +196,24 @@ def load_workspace_context(
 
         sections.append(f"## [{filename}]\n\n{content}")
         total_chars += len(content)
+
+    # ── Daily logs: today + yesterday (mirrors OpenClaw session-start load) ──────
+    # Loaded AFTER static files so they appear at the bottom of the context block,
+    # and only for main sessions (not subagent/cron — they get MINIMAL_SESSION_FILES).
+    if session_type not in ("subagent", "cron"):
+        for daily_name in _daily_log_filenames():
+            daily_path = directory / daily_name
+            if not daily_path.exists():
+                continue
+            daily_content = _read_workspace_file(daily_path)
+            if not daily_content or _is_effectively_empty(daily_content):
+                continue
+            daily_content = _truncate_content(daily_content, DAILY_LOG_PER_FILE_CHAR_BUDGET)
+            if total_chars + len(daily_content) > BOOTSTRAP_TOTAL_CHAR_BUDGET:
+                logger.debug("Total budget full, skipping daily log %s", daily_name)
+                break
+            sections.append(f"## [{daily_name}]\n\n{daily_content}")
+            total_chars += len(daily_content)
 
     if not sections:
         return ""
