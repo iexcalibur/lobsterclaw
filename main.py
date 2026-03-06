@@ -364,10 +364,21 @@ def main() -> None:
     use_gateway = cfg.gateway_enabled
     if use_gateway:
         from gateway.server import configure as configure_gateway
+
+        async def _gateway_chat_fn(message: str) -> str:
+            """Gateway chat agent — stateful, multi-turn with full conversation history."""
+            history.add("gateway", "user", message)
+            msgs = history.get_for_llm("gateway")
+            system = build_system_prompt(cfg, registry.get_names())
+            response = await agent.run(msgs, system, session_id="gateway")
+            if response:
+                history.add("gateway", "assistant", response)
+            return response
+
         configure_gateway(
             registry=registry,
             cron_mgr=cron_mgr,
-            agent_fn=lambda msg: agent_for_bg(msg),
+            agent_fn=_gateway_chat_fn,
             send_fn=primary.send_message,
             history_mgr=history,
         )

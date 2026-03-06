@@ -11,7 +11,6 @@ import {
   Clock,
   Wrench,
   Settings,
-  Activity,
   Mail,
   Newspaper,
 } from "lucide-react";
@@ -39,11 +38,13 @@ export default function Sidebar({ connected }: SidebarProps) {
     <aside className="fixed inset-y-0 left-0 z-30 flex w-56 flex-col border-r border-zinc-800 bg-zinc-950">
       {/* Logo */}
       <div className="flex items-center gap-2.5 px-5 py-5">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-600">
-          <Activity className="h-4 w-4 text-white" />
+        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-orange-500 text-sm">
+          <span role="img" aria-label="LobsterClaw">
+            🦞
+          </span>
         </div>
         <div>
-          <p className="text-sm font-semibold text-white">Pygate</p>
+          <p className="text-sm font-semibold text-white">LobsterClaw</p>
           <p className="text-[10px] text-zinc-500">Mission Control</p>
         </div>
       </div>

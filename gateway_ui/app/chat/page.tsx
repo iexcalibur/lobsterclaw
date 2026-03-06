@@ -24,8 +24,9 @@ export default function ChatPage() {
   useEffect(() => {
     (async () => {
       try {
+        // Load gateway chat history (HistoryManager "gateway" user — multi-turn aware)
         const res = await api<{ messages: Message[] }>(
-          "/api/gateway/history/main?limit=30"
+          "/api/gateway/chat/history?limit=30"
         );
         const filtered = (res.messages || []).filter(
           (m) => m.role === "user" || m.role === "assistant"
@@ -124,12 +125,16 @@ export default function ChatPage() {
         "/api/gateway/chat",
         { message: text }
       );
-      if (res.response) {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: res.response, type: "chat" },
-        ]);
-      }
+      // Always add the response — never silently drop empty strings
+      const reply = res.response ?? "";
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: reply || "_(no response)_",
+          type: "chat",
+        },
+      ]);
     } catch (e: any) {
       setMessages((prev) => [
         ...prev,

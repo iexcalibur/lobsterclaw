@@ -14,7 +14,7 @@ GATEWAY_KEY := $(shell grep '^GATEWAY_API_KEY=' .env 2>/dev/null | cut -d= -f2- 
 
 help:
 	@echo ""
-	@echo "  Pygate — Mission Control"
+	@echo "  LobsterClaw — Mission Control"
 	@echo "  ========================"
 	@echo ""
 	@echo "  Setup:"
@@ -71,7 +71,7 @@ gateway-ui-build: install-ui
 # ---------------------------------------------------------------
 
 run: check-env
-	@echo "[Pygate] Starting bot + Gateway API..."
+	@echo "[LobsterClaw] Starting bot + Gateway API..."
 	@GATEWAY_ENABLED=true $(PY) main.py
 
 run-debug: check-env
@@ -79,7 +79,7 @@ run-debug: check-env
 
 # Start everything: bot + gateway API + gateway UI (in parallel)
 all: check-env install-ui
-	@echo "[Pygate] Starting all services..."
+	@echo "[LobsterClaw] Starting all services..."
 	@echo "  → Bot + Gateway API (Python)"
 	@echo "  → Gateway UI (Next.js on :3001)"
 	@echo ""

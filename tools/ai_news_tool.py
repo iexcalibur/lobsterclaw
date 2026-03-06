@@ -32,6 +32,9 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 import httpx
 
@@ -431,7 +434,7 @@ async def _fetch_gemini_trending(api_key: str) -> list[dict]:
         chunks = grounding.get("groundingChunks", [])
         for chunk in chunks:
             web = chunk.get("web", {})
-            title = web.get("title", "").strip()
+            title = _strip_md(web.get("title", "").strip())
             url = web.get("uri", "").strip()
             if title and url and url.startswith("http"):
                 # Auto-assign category based on title keywords
@@ -520,12 +523,12 @@ Return ONLY a valid JSON array, no other text:
             idx = int(idea.get("index", 1)) - 1
             art = articles[idx] if 0 <= idx < len(articles) else {}
             result.append({
-                "title": idea.get("title", art.get("title", "")),
+                "title": _strip_md(idea.get("title", art.get("title", ""))),
                 "url": art.get("url", ""),
                 "category": art.get("category", ""),
                 "source": art.get("source", ""),
-                "angle": idea.get("angle", ""),
-                "why": idea.get("why", ""),
+                "angle": _strip_md(idea.get("angle", "")),
+                "why": _strip_md(idea.get("why", "")),
             })
         return result
 
@@ -562,8 +565,8 @@ def _in_active_hours(start: int = 10, end: int = 22) -> bool:
 
 # ── Core refresh ──────────────────────────────────────────────────────────────
 
-async def _do_refresh(db: AiNewsDB, retention_days: int = 3) -> dict[str, int]:
-    """One full refresh cycle: fetch news → score content ideas."""
+async def _do_refresh_news(db: AiNewsDB, retention_days: int = 3) -> dict[str, int]:
+    """Fetch AI news only — no content idea scoring. Called by watcher loop and manual refresh."""
     from config import get_config
     cfg = get_config()
     perplexity_key: str = getattr(cfg, "perplexity_api_key", "")
@@ -609,16 +612,23 @@ async def _do_refresh(db: AiNewsDB, retention_days: int = 3) -> dict[str, int]:
         total_new += inserted
         logger.debug("Gemini trending: %d results, %d new", len(trending), inserted)
 
-    # ── 3. Score content ideas ────────────────────────────────────────────
-    recent = db.get_articles(limit=25)
-    if recent:
-        ideas = await _score_content_ideas(recent, gemini_key)
-        if ideas:
-            db.store_content_ideas(ideas, retention_days)
-            logger.info("Content ideas scored: %d ideas stored", len(ideas))
-
     logger.info("AI news refresh done: +%d new articles, -%d expired", total_new, purged)
     return {"new": total_new, "purged": purged}
+
+
+async def _do_score_ideas(db: AiNewsDB, retention_days: int = 3) -> int:
+    """Score content ideas from recent articles. Called only at 6 PM IST daily."""
+    from config import get_config
+    gemini_key: str = getattr(get_config(), "gemini_api_key", "")
+    recent = db.get_articles(limit=25)
+    if not recent:
+        return 0
+    ideas = await _score_content_ideas(recent, gemini_key)
+    if ideas:
+        count = db.store_content_ideas(ideas, retention_days)
+        logger.info("Content ideas scored at 6 PM IST: %d ideas stored", count)
+        return count
+    return 0
 
 
 def _parse_fallback(text: str, category: str | None) -> list[dict]:
@@ -653,6 +663,7 @@ def _parse_fallback(text: str, category: str | None) -> list[dict]:
 # ── Public refresh (gateway endpoint) ────────────────────────────────────────
 
 async def refresh_news() -> dict[str, Any]:
+    """Refresh AI news only — does NOT regenerate content ideas (those update at 6 PM IST)."""
     global _refresh_lock
     if _refresh_lock is None:
         _refresh_lock = asyncio.Lock()
@@ -661,7 +672,7 @@ async def refresh_news() -> dict[str, Any]:
     if _refresh_lock.locked():
         return {"new": 0, "purged": 0, "status": "already_running"}
     async with _refresh_lock:
-        return await _do_refresh(get_db(), retention_days=getattr(cfg, "ai_news_retention_days", 3))
+        return await _do_refresh_news(get_db(), retention_days=getattr(cfg, "ai_news_retention_days", 3))
 
 
 def trigger_early_refresh() -> None:
@@ -697,7 +708,7 @@ async def ai_news_watcher_loop(cfg: Any) -> None:
         if _in_active_hours(active_start, active_end):
             try:
                 async with _refresh_lock:
-                    await _do_refresh(db, retention_days=retention_days)
+                    await _do_refresh_news(db, retention_days=retention_days)
             except Exception as e:
                 logger.warning("AI news watcher error: %s", e)
         else:
@@ -715,29 +726,34 @@ async def ai_news_watcher_loop(cfg: Any) -> None:
 
 async def content_brief_loop(send_fn: Any, cfg: Any) -> None:
     """
-    Daily Telegram notification at brief_hour (default 6am):
-    sends top 3 content ideas scored during last news cycle.
+    Daily at 6 PM IST:
+    1. Score fresh content ideas from recent articles
+    2. Send Telegram brief with top 3 ideas
     """
-    brief_hour: int = getattr(cfg, "ai_news_brief_hour", 6)
+    retention_days: int = getattr(cfg, "ai_news_retention_days", 3)
     db = get_db()
-    logger.info("Content brief loop started — fires daily at %02d:00", brief_hour)
+    logger.info("Content brief loop started — fires daily at 18:00 IST (6 PM)")
 
     while True:
-        # Calculate seconds until next brief_hour
-        now = datetime.now()
-        next_run = now.replace(hour=brief_hour, minute=0, second=0, microsecond=0)
+        # Calculate seconds until next 6 PM IST
+        now = datetime.now(_IST)
+        next_run = now.replace(hour=18, minute=0, second=0, microsecond=0)
         if next_run <= now:
             next_run += timedelta(days=1)
         wait_secs = (next_run - now).total_seconds()
-        logger.debug("Content brief: next run in %.0f seconds (%s)", wait_secs, next_run.strftime("%H:%M %d/%m"))
+        logger.debug("Content brief: next run in %.0f seconds (%s IST)", wait_secs, next_run.strftime("%H:%M %d/%m"))
         await asyncio.sleep(wait_secs)
 
         try:
+            # Score fresh content ideas at 6 PM
+            await _do_score_ideas(db, retention_days)
+
+            # Send Telegram brief
             ideas = db.get_content_ideas(limit=3)
             if ideas:
-                msg = _format_content_brief(ideas, brief_hour)
+                msg = _format_content_brief(ideas, 18)
                 await send_fn(msg)
-                logger.info("Content brief sent (%d ideas)", len(ideas))
+                logger.info("Content brief sent at 6 PM IST (%d ideas)", len(ideas))
             else:
                 logger.debug("Content brief: no ideas to send")
         except Exception as e:

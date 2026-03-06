@@ -464,6 +464,26 @@ def create_app() -> FastAPI:
             },
         }
 
+    @app.get("/api/gateway/chat/history", dependencies=[Auth])
+    async def get_chat_history(limit: int = 30):
+        """Return gateway chat conversation history from HistoryManager."""
+        if not _history_mgr:
+            return {"messages": []}
+        msgs = _history_mgr.get_for_llm("gateway")
+        formatted = []
+        for m in msgs[-limit:]:
+            content = m.get("content", "")
+            if isinstance(content, list):
+                # Extract plain text from structured content blocks
+                texts = [
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                content = "\n".join(t for t in texts if t)
+            if m.get("role") in ("user", "assistant") and content:
+                formatted.append({"role": m["role"], "content": content})
+        return {"messages": formatted}
+
     @app.post("/api/gateway/chat", dependencies=[Auth])
     async def send_chat(body: dict):
         message = body.get("message", "").strip()
@@ -475,7 +495,8 @@ def create_app() -> FastAPI:
         try:
             response = await _agent_fn(message)
             await event_bus.publish("chat.agent_response", {"content": response})
-            return {"ok": True, "response": response}
+            # Always return a non-null response so the UI never silently drops it
+            return {"ok": True, "response": response or ""}
         except Exception as e:
             logger.error("Gateway chat error: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -728,11 +749,19 @@ def create_app() -> FastAPI:
     # ── AI News ───────────────────────────────────────────────────────────────
 
     @app.get("/api/gateway/ai-news", dependencies=[Auth])
-    async def get_ai_news(category: str | None = None, limit: int = 100):
-        """Return cached AI news articles."""
+    async def get_ai_news(category: str | None = None):
+        """Return cached AI news articles — capped at 10 Products + 5 Research (15 total)."""
         from tools.ai_news_tool import get_db
         db = get_db()
-        articles = db.get_articles(category=category, limit=min(limit, 200))
+        if category == "Products":
+            articles = db.get_articles(category="Products", limit=10)
+        elif category == "Research":
+            articles = db.get_articles(category="Research", limit=5)
+        else:
+            # Return at most 10 Products + 5 Research
+            products = db.get_articles(category="Products", limit=10)
+            research = db.get_articles(category="Research", limit=5)
+            articles = sorted(products + research, key=lambda a: a["found_at"], reverse=True)
         stats = db.stats()
         return {
             "articles": articles,

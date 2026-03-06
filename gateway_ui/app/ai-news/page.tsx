@@ -59,6 +59,7 @@ interface IdeasResponse {
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const CATEGORIES = ["All", "Products", "Research"] as const;
+const CATEGORY_CAPS = { Products: 10, Research: 5 } as const;
 
 const CATEGORY_STYLES = {
   Products: {
@@ -196,7 +197,7 @@ export default function AiNewsPage() {
   const fetchAll = useCallback(async () => {
     try {
       const [newsRes, ideasRes] = await Promise.all([
-        api<NewsResponse>("/api/gateway/ai-news?limit=200"),
+        api<NewsResponse>("/api/gateway/ai-news"),
         api<IdeasResponse>("/api/gateway/ai-news/content-ideas"),
       ]);
       setArticles(newsRes.articles);
@@ -256,7 +257,7 @@ export default function AiNewsPage() {
             <h1 className="text-2xl font-semibold">AI News</h1>
           </div>
           <p className="text-sm text-zinc-500 mt-1">
-            {stats.total} articles · refreshes every 4h · 10am–10pm only
+            {stats.total} articles (max 10 Products + 5 Research) · news refreshes every 4h · 10am–10pm
             {lastUpdated && (
               <span className="ml-1 text-zinc-700">
                 · synced {lastUpdated.toLocaleTimeString()} · {countdown}s
@@ -267,9 +268,10 @@ export default function AiNewsPage() {
 
         <div className="flex items-center gap-2">
           <button onClick={handleRefresh} disabled={refreshing}
+            title="Fetches latest AI news only — content ideas auto-refresh at 6pm IST"
             className="flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-300 hover:border-zinc-600 hover:text-white transition-colors disabled:opacity-50">
             <RefreshCw className={clsx("h-3.5 w-3.5", refreshing && "animate-spin")} />
-            {refreshing ? "Refreshing…" : "Refresh now"}
+            {refreshing ? "Fetching news…" : "Refresh news"}
           </button>
           <button onClick={handleClear}
             className="flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-600 hover:border-red-900/50 hover:text-red-400 transition-colors">
@@ -288,14 +290,14 @@ export default function AiNewsPage() {
             </div>
             <h2 className="text-sm font-semibold text-amber-200">Content Ideas</h2>
             <span className="text-[10px] text-amber-700 ml-auto">
-              AI-scored · 6am Telegram brief
+              AI-scored · auto-refreshes daily at 6pm IST
             </span>
           </div>
 
           {ideas.length === 0 ? (
             <p className="text-xs text-zinc-600 text-center py-4">
-              Content ideas are scored after each news refresh cycle.
-              {stats.total === 0 ? " Fetch news first." : " Check back shortly."}
+              Content ideas regenerate automatically at 6pm IST daily.
+              {stats.total === 0 ? " Fetch news first using the Refresh button." : " Check back at 6pm IST."}
             </p>
           ) : (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -310,7 +312,9 @@ export default function AiNewsPage() {
       {/* ── Category Filter ── */}
       <div className="flex flex-wrap gap-2">
         {CATEGORIES.map((cat) => {
-          const count = cat === "All" ? stats.total : (stats.by_category[cat] ?? 0);
+          const rawCount = cat === "All" ? stats.total : (stats.by_category[cat] ?? 0);
+          const cap = cat !== "All" ? (CATEGORY_CAPS[cat as keyof typeof CATEGORY_CAPS] ?? rawCount) : null;
+          const count = cap !== null ? Math.min(rawCount, cap) : Math.min(rawCount, 15);
           const catStyles = cat !== "All" ? CATEGORY_STYLES[cat as keyof typeof CATEGORY_STYLES] : null;
           return (
             <button key={cat} onClick={() => setActiveCategory(cat)}
@@ -343,11 +347,11 @@ export default function AiNewsPage() {
           <Newspaper className="h-8 w-8 mx-auto mb-3 text-zinc-700" />
           <p className="text-sm">No {activeCategory !== "All" ? activeCategory : ""} articles yet</p>
           <p className="text-xs text-zinc-700 mt-1">
-            Watcher runs 10am–10pm every 4 hours · or click Refresh now
+            News auto-refreshes every 4h (10am–10pm) · content ideas regenerate at 6pm IST
           </p>
           <button onClick={handleRefresh} disabled={refreshing}
             className="mt-4 rounded-lg border border-zinc-700 bg-zinc-800 px-4 py-2 text-xs text-zinc-300 hover:border-zinc-600 disabled:opacity-50">
-            {refreshing ? "Fetching…" : "Fetch news now"}
+            {refreshing ? "Fetching news…" : "Fetch news now"}
           </button>
         </div>
       ) : (

@@ -110,7 +110,7 @@ export default function DashboardPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold">Mission Control</h1>
+          <h1 className="text-2xl font-semibold">LobsterClaw Mission Control</h1>
           <p className="text-sm text-zinc-500 mt-1">
             {status.provider}/{status.model} &middot; Agent {status.agent_id}
           </p>
