@@ -12,6 +12,7 @@ import {
   Wrench,
   Settings,
   Activity,
+  Mail,
 } from "lucide-react";
 
 const NAV_ITEMS = [
@@ -21,6 +22,7 @@ const NAV_ITEMS = [
   { href: "/skills", label: "Skills", icon: Zap },
   { href: "/cron", label: "Cron Jobs", icon: Clock },
   { href: "/tools", label: "Tools", icon: Wrench },
+  { href: "/google-accounts", label: "Google Accounts", icon: Mail },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

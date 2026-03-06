@@ -133,7 +133,7 @@ class Config:
             (
                 "web_fetch,web_search,cron,read,write,edit,glob,list_dir,"
                 "memory_search,memory_get,memory_write,memory_list,memory_delete,"
-                "message,tts,pdf,image,"
+                "message,tts,pdf,image,gmail_search,gmail_send,"
                 "sessions_spawn,sessions_list,sessions_history,sessions_send,"
                 "session_status,subagents,agents_list"
             ),
@@ -172,6 +172,34 @@ class Config:
     # Browser
     browser_enabled: bool = field(default_factory=lambda: _env_bool("BROWSER_ENABLED", False))
     browser_headless: bool = field(default_factory=lambda: _env_bool("BROWSER_HEADLESS", True))
+
+    # Google Workspace
+    # Phase 1: account registry only (no token runtime flow yet)
+    google_workspace_accounts_file: str = field(
+        default_factory=lambda: _env(
+            "GOOGLE_WORKSPACE_ACCOUNTS_FILE",
+            "~/.lobsterclaw/google_workspace/accounts.json",
+        )
+    )
+    google_workspace_cli_enabled: bool = field(
+        default_factory=lambda: _env_bool("GOOGLE_WORKSPACE_CLI_ENABLED", False)
+    )
+    google_workspace_cli: str = field(
+        default_factory=lambda: _env("GOOGLE_WORKSPACE_CLI", "")
+    )
+    # Phase 2: OAuth — from Google Cloud Console OAuth 2.0 credentials
+    google_oauth_client_id: str = field(
+        default_factory=lambda: _env("GOOGLE_OAUTH_CLIENT_ID", "")
+    )
+    google_oauth_client_secret: str = field(
+        default_factory=lambda: _env("GOOGLE_OAUTH_CLIENT_SECRET", "")
+    )
+    google_oauth_redirect_uri: str = field(
+        default_factory=lambda: _env(
+            "GOOGLE_OAUTH_REDIRECT_URI",
+            "http://localhost:4400/api/gateway/google-oauth/callback",
+        )
+    )
 
     # Additional channels (stub-compatible; disabled by default)
     discord_enabled: bool = field(default_factory=lambda: _env_bool("DISCORD_ENABLED", False))

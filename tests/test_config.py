@@ -48,8 +48,8 @@ def test_cron_disabled():
     assert cfg.cron_enabled is False
 
 
-def test_exec_disabled_default():
-    cfg = _make_config()
+def test_exec_disabled_when_set():
+    cfg = _make_config(EXEC_ENABLED="false")
     assert cfg.exec_enabled is False
 
 
@@ -96,3 +96,10 @@ def test_subagents_config():
     cfg = _make_config(SUBAGENTS_MAX_DEPTH="5", SUBAGENTS_MAX_CHILDREN="10")
     assert cfg.subagents_max_depth == 5
     assert cfg.subagents_max_children == 10
+
+
+def test_google_workspace_defaults():
+    cfg = _make_config()
+    assert cfg.google_workspace_accounts_file.endswith("google_workspace/accounts.json")
+    assert cfg.google_workspace_cli_enabled is False
+    assert cfg.google_workspace_cli == ""

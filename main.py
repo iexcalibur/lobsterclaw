@@ -64,6 +64,7 @@ def build_registry(light: bool = False):
         nodes_tool,
         canvas_tool,
         channel_stubs,
+        gmail_tool,
     )
 
     registry = ToolRegistry()
@@ -106,6 +107,11 @@ def build_registry(light: bool = False):
     registry.register(message_tool.TOOL_DEFINITION)
     registry.register(cron_tool.TOOL_DEFINITION)
     registry.register(gateway_tool.TOOL_DEFINITION)
+
+    # Gmail (Phase 2 — requires OAuth-connected Google Workspace accounts)
+    if not light:
+        registry.register(gmail_tool.GMAIL_SEARCH_TOOL)
+        registry.register(gmail_tool.GMAIL_SEND_TOOL)
 
     # Nodes (remote device management)
     registry.register(nodes_tool.TOOL_DEFINITION)

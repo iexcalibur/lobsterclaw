@@ -22,9 +22,20 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import APIKeyHeader
 
+from agent.google_workspace_accounts import (
+    add_account,
+    list_accounts,
+    remove_account,
+)
+from agent.google_workspace_oauth import (
+    GMAIL_SCOPES,
+    clear_oauth_tokens,
+    has_oauth_tokens,
+    store_oauth_tokens,
+)
 from config import get_config
 from gateway.events import event_bus
 
@@ -516,6 +527,183 @@ def create_app() -> FastAPI:
                         "preview": (content[:500] + "...") if len(content) > 500 else content,
                     })
         return {"files": files}
+
+    # OAuth state store: nonce -> (account_id, expires_at) — in-memory, single process
+    _oauth_state_store: dict[str, tuple[str, float]] = {}
+
+    def _oauth_cleanup_expired():
+        now = time.time()
+        expired = [k for k, v in _oauth_state_store.items() if v[1] < now]
+        for k in expired:
+            del _oauth_state_store[k]
+
+    @app.get("/api/gateway/google-accounts", dependencies=[Auth])
+    async def list_google_workspace_accounts():
+        try:
+            accounts = list_accounts(redact=True)
+            for acct in accounts:
+                acct["oauth_connected"] = has_oauth_tokens(acct.get("id", ""))
+            return {"accounts": accounts, "total": len(accounts)}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/gateway/google-accounts", dependencies=[Auth])
+    async def add_google_workspace_account(body: dict):
+        label = str(body.get("label", "")).strip()
+        email = str(body.get("email", "")).strip()
+        source = str(body.get("source", "manual")).strip() or "manual"
+        status = str(body.get("status", "active")).strip() or "active"
+
+        if not label or not email:
+            raise HTTPException(status_code=400, detail="Both 'label' and 'email' are required")
+
+        try:
+            account = add_account(label=label, email=email, source=source, status=status)
+            return {"ok": True, "account": account, "message": "Account added"}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete("/api/gateway/google-accounts/{email_or_label}", dependencies=[Auth])
+    async def remove_google_workspace_account(email_or_label: str):
+        try:
+            removed = remove_account(email_or_label)
+            if removed is None:
+                raise HTTPException(status_code=404, detail="Account not found")
+            aid = removed.get("id", "")
+            if aid:
+                clear_oauth_tokens(aid)
+            return {"ok": True, "account": removed, "message": "Account removed"}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ── Google OAuth (Phase 2) ────────────────────────────────────────────────
+
+    @app.get("/api/gateway/google-oauth/start", dependencies=[Auth])
+    async def google_oauth_start(account_id: str):
+        """Return authorization URL for OAuth. UI redirects user to Google."""
+        cfg = get_config()
+        cid = getattr(cfg, "google_oauth_client_id", "").strip()
+        csec = getattr(cfg, "google_oauth_client_secret", "").strip()
+        redirect_uri = getattr(cfg, "google_oauth_redirect_uri", "").strip()
+        if not cid or not csec or not redirect_uri:
+            raise HTTPException(
+                status_code=503,
+                detail="Google OAuth not configured. Set GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET in .env",
+            )
+        if not account_id or not account_id.strip():
+            raise HTTPException(status_code=400, detail="account_id is required")
+
+        # Build state: nonce -> we lookup account_id on callback
+        nonce = secrets.token_hex(16)
+        _oauth_cleanup_expired()
+        _oauth_state_store[nonce] = (account_id.strip(), time.time() + 600)  # 10 min
+
+        def _build_url():
+            from google_auth_oauthlib.flow import Flow
+
+            client_config = {
+                "web": {
+                    "client_id": cid,
+                    "client_secret": csec,
+                    "redirect_uris": [redirect_uri],
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            }
+            flow = Flow.from_client_config(
+                client_config,
+                scopes=GMAIL_SCOPES,
+                redirect_uri=redirect_uri,
+            )
+            auth_url, _ = flow.authorization_url(
+                access_type="offline",
+                prompt="consent",
+                state=nonce,
+            )
+            return auth_url
+
+        try:
+            url = await asyncio.to_thread(_build_url)
+            return {"authorization_url": url}
+        except Exception as e:
+            logger.exception("Google OAuth start failed: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/gateway/google-oauth/callback")
+    async def google_oauth_callback(code: str | None = None, state: str | None = None, error: str | None = None):
+        """OAuth callback — no auth (Google redirects user here)."""
+        ui_base = _gateway_ui_base()
+        if error:
+            return RedirectResponse(url=f"{ui_base}/google-accounts?oauth_error={error}")
+        if not code or not state:
+            return RedirectResponse(url=f"{ui_base}/google-accounts?oauth_error=missing_params")
+
+        _oauth_cleanup_expired()
+        entry = _oauth_state_store.pop(state, None)
+        if not entry:
+            return RedirectResponse(url=f"{ui_base}/google-accounts?oauth_error=invalid_state")
+        account_id, _ = entry
+
+        cfg = get_config()
+        cid = getattr(cfg, "google_oauth_client_id", "").strip()
+        csec = getattr(cfg, "google_oauth_client_secret", "").strip()
+        redirect_uri = getattr(cfg, "google_oauth_redirect_uri", "").strip()
+        if not cid or not csec:
+            return RedirectResponse(url=f"{ui_base}/google-accounts?oauth_error=config")
+
+        def _exchange():
+            from google_auth_oauthlib.flow import Flow
+
+            client_config = {
+                "web": {
+                    "client_id": cid,
+                    "client_secret": csec,
+                    "redirect_uris": [redirect_uri],
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            }
+            flow = Flow.from_client_config(
+                client_config,
+                scopes=GMAIL_SCOPES,
+                redirect_uri=redirect_uri,
+                state=state,
+            )
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            return creds.refresh_token, creds.token, creds.expiry
+
+        try:
+            refresh_token, access_token, expiry = await asyncio.to_thread(_exchange)
+            store_oauth_tokens(account_id, refresh_token or "", access_token, expiry)
+            return RedirectResponse(url=f"{ui_base}/google-accounts?oauth_connected=1")
+        except Exception as e:
+            logger.exception("Google OAuth callback failed: %s", e)
+            return RedirectResponse(url=f"{ui_base}/google-accounts?oauth_error=exchange")
+
+    def _gateway_ui_base() -> str:
+        """Base URL for redirecting back to the Gateway UI."""
+        origins = getattr(get_config(), "gateway_cors_origins", []) or []
+        if origins:
+            first = str(origins[0] if isinstance(origins, list) else origins).strip()
+            if first:
+                return first.rstrip("/")
+        return "http://localhost:3001"
+
+    @app.post("/api/gateway/google-oauth/disconnect", dependencies=[Auth])
+    async def google_oauth_disconnect(body: dict):
+        """Clear OAuth tokens for an account."""
+        account_id = str(body.get("account_id", "")).strip()
+        if not account_id:
+            raise HTTPException(status_code=400, detail="account_id is required")
+        clear_oauth_tokens(account_id)
+        return {"ok": True, "message": "OAuth disconnected"}
 
     # ── WebSocket — auth via ?api_key= query param ────────────────────────────
     @app.websocket("/ws/gateway")
