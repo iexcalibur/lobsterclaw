@@ -747,6 +747,23 @@ class TelegramChannel:
                     await update.message.reply_text("Your request is still pending approval.")
             return
 
+        # Text-based approval: owner can type "✅ <id>" or "❌ <id>" as fallback
+        # when inline button callbacks have expired on Telegram's side.
+        msg_text = (update.message.text or "").strip() if update.message else ""
+        if self._is_owner(update) and msg_text:
+            first, _, rest = msg_text.partition(" ")
+            request_id = rest.strip()
+            if first in ("✅", "approve") and request_id:
+                resolved = self.approval.resolve(request_id, True)
+                reply = "✅ Approved." if resolved else "Request not found (already resolved or expired)."
+                await update.message.reply_text(reply)
+                return
+            if first in ("❌", "deny") and request_id:
+                resolved = self.approval.resolve(request_id, False)
+                reply = "❌ Denied." if resolved else "Request not found (already resolved or expired)."
+                await update.message.reply_text(reply)
+                return
+
         if not self._should_respond_in_group(update):
             return
 
@@ -1352,7 +1369,12 @@ class TelegramChannel:
         query = update.callback_query
         if not query:
             return
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            # Callback queries expire on Telegram's side after ~10s — silently ignore
+            # so approval resolution and other logic still execute normally.
+            pass
 
         data = query.data or ""
 
