@@ -187,9 +187,10 @@ class MemoryIndex:
         if self._memory_md.exists():
             files.append(("MEMORY", self._memory_md))
         if self._memory_dir.exists():
-            for md in sorted(self._memory_dir.glob("*.md")):
+            for md in sorted(self._memory_dir.rglob("*.md")):
                 if md.name != "README.md":
-                    files.append((md.stem, md))
+                    rel_key = str(md.relative_to(self._memory_dir).with_suffix("").as_posix())
+                    files.append((rel_key, md))
         return files
 
     def _refresh_index(self) -> None:

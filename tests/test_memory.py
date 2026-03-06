@@ -41,6 +41,7 @@ async def test_memory_search_fts(tmp_workspace):
         idx = MemoryIndex(
             memory_dir=tmp_workspace / "memory",
             memory_md=tmp_workspace / "MEMORY.md",
+            index_db_path=tmp_workspace / ".memory_index.db",
         )
         results = idx.search("Python coffee", limit=3)
         keys = [r.key for r in results]
@@ -53,6 +54,7 @@ async def test_memory_search_no_results(tmp_workspace):
     idx = MemoryIndex(
         memory_dir=tmp_workspace / "memory",
         memory_md=tmp_workspace / "MEMORY.md",
+        index_db_path=tmp_workspace / ".memory_index.db",
     )
     results = idx.search("xyznomatch12345", limit=3)
     assert results == []
@@ -64,6 +66,7 @@ async def test_memory_index_loads_subdir(tmp_workspace):
     idx = MemoryIndex(
         memory_dir=tmp_workspace / "memory",
         memory_md=tmp_workspace / "MEMORY.md",
+        index_db_path=tmp_workspace / ".memory_index.db",
     )
     results = idx.search("LobsterClaw chatbot", limit=3)
     keys = [r.key for r in results]
@@ -77,6 +80,7 @@ async def test_memory_search_fts_sanitizes_special_chars(tmp_workspace):
     idx = MemoryIndex(
         memory_dir=tmp_workspace / "memory",
         memory_md=tmp_workspace / "MEMORY.md",
+        index_db_path=tmp_workspace / ".memory_index.db",
     )
     # Query with chars that break FTS5 syntax
     results = idx.search("Python (coffee) & more!", limit=5)
@@ -103,6 +107,41 @@ async def test_memory_write_creates_file(tmp_path):
             result = await _memory_write("test_key", "Test content here")
             assert "saved" in result.lower() or "memory" in result.lower()
             assert (tmp_path / "memory" / "test_key.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_memory_write_appends_to_daily_key(tmp_path):
+    env = {
+        "TELEGRAM_BOT_TOKEN": "tok",
+        "TELEGRAM_OWNER_ID": "1",
+        "ANTHROPIC_API_KEY": "sk",
+        "MEMORY_ENABLED": "true",
+        "MEMORY_DIR": str(tmp_path / "memory"),
+    }
+    with patch.dict(os.environ, env, clear=True):
+        import config as cfg_mod
+        cfg_mod._config = None
+
+        memory_dir = tmp_path / "memory"
+        memory_dir.mkdir(exist_ok=True)
+
+        with patch("tools.memory_tool._get_memory_dir", return_value=memory_dir):
+            from tools.memory_tool import _memory_write, _memory_get
+
+            await _memory_write("2026-03-06", "First durable note.")
+            await _memory_write("2026-03-06", "Second durable note.")
+            await _memory_write("memory/2026-03-06", "Third durable note.")
+
+            daily_path = memory_dir / "2026-03-06.md"
+            assert daily_path.exists()
+            content = daily_path.read_text(encoding="utf-8")
+            assert "First durable note." in content
+            assert "Second durable note." in content
+            assert "Third durable note." in content
+
+            fetched = await _memory_get("memory/2026-03-06")
+            assert "First durable note." in fetched
+            assert "Third durable note." in fetched
 
 
 @pytest.mark.asyncio

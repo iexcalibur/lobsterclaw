@@ -4,7 +4,7 @@ Nightly memory summarization — mirrors OpenClaw's memory metabolism pattern.
 Runs on a cron schedule (default: 23:30 every night).
 
 What it does:
-  1. Reads today's daily log: workspace/memory/YYYY-MM-DD.md
+  1. Reads today's daily log from the configured memory directory: YYYY-MM-DD.md
   2. Reads current MEMORY.md (for dedup context)
   3. Asks the agent to distil new durable facts into MEMORY.md
   4. Suppresses user-visible output (NO_REPLY)
@@ -28,8 +28,9 @@ from typing import Awaitable, Callable
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from agent.workspace import DEFAULT_WORKSPACE_DIR, _is_effectively_empty
+from agent.workspace import _is_effectively_empty
 from config import get_config
+from tools.memory_tool import _get_memory_dir, _get_memory_md_path
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +108,9 @@ class NightlyMemoryRunner:
         """Run the nightly consolidation turn."""
         logger.info("Nightly memory consolidation firing")
 
-        workspace = DEFAULT_WORKSPACE_DIR
         today_str = date.today().isoformat()
-        daily_path = workspace / "memory" / f"{today_str}.md"
-        memory_path = workspace / "MEMORY.md"
+        daily_path = _get_memory_dir() / f"{today_str}.md"
+        memory_path = _get_memory_md_path()
 
         # ── 1. Read today's daily log ──────────────────────────────────────────
         daily_log = _safe_read(daily_path)

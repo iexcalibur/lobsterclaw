@@ -108,12 +108,19 @@ MEMORY_WRITE_TOOL = ToolDefinition(
     description=(
         "Save or update a memory entry as a markdown file. "
         "Key becomes the filename (e.g. 'preferences' → memory/preferences.md). "
+        "Use 'memory/YYYY-MM-DD' for the daily log. "
         "Set append=true to add to an existing entry instead of replacing it."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "key": {"type": "string", "description": "Short unique name (use underscores/hyphens, no spaces)"},
+            "key": {
+                "type": "string",
+                "description": (
+                    "Key or path without extension (e.g. 'preferences', 'memory/2026-03-06', "
+                    "'notes/project')."
+                ),
+            },
             "content": {"type": "string", "description": "Markdown content to remember"},
             "append": {"type": "boolean", "description": "Append to existing file (default false)", "default": False},
         },
@@ -173,6 +180,45 @@ def _get_memory_md_path() -> Path:
             return candidate
     # Default: workspace/MEMORY.md relative to project root
     return Path(__file__).parent.parent / "workspace" / "MEMORY.md"
+
+
+def _normalize_key(raw_key: str) -> str:
+    """Normalize a user-provided memory key into a stable internal form."""
+    if not raw_key:
+        return ""
+
+    key = raw_key.strip().replace("\\", "/").strip().strip("/")
+    if key.lower().startswith("memory/"):
+        key = key[len("memory/") :]
+    if key.lower().endswith(".md"):
+        key = key[:-3]
+    return key.strip()
+
+
+def _memory_path_from_key(raw_key: str) -> tuple[str, Path]:
+    """Resolve a key/path into a concrete file path under the memory directory."""
+    key = _normalize_key(raw_key)
+    if not key:
+        raise ValueError("Invalid key")
+
+    parts = key.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("Invalid key")
+
+    memory_dir = _get_memory_dir()
+    rel_path = Path(*parts)
+    if rel_path.suffix != ".md":
+        rel_path = rel_path.with_suffix(".md")
+    return key, memory_dir / rel_path
+
+
+def _is_daily_log_key(key: str) -> bool:
+    """Return True when the key looks like YYYY-MM-DD."""
+    try:
+        datetime.strptime(key, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
 
 
 # ------------------------------------------------------------------
@@ -248,7 +294,14 @@ async def _memory_get(
     if effective_key.upper() == "MEMORY":
         file_path = _get_memory_md_path()
     else:
-        file_path = _get_memory_dir() / f"{effective_key}.md"
+        try:
+            normalized_key, memory_file = _memory_path_from_key(effective_key)
+        except ValueError:
+            return "Invalid key"
+
+        workspace_root = Path(__file__).parent.parent / "workspace"
+        workspace_key_path = workspace_root / f"{normalized_key}.md"
+        file_path = workspace_key_path if workspace_key_path.exists() else memory_file
 
     if not file_path.exists():
         available = _list_keys()
@@ -272,36 +325,47 @@ async def _memory_write(key: str, content: str, append: bool = False) -> str:
     if not cfg.memory_enabled:
         return "Memory is disabled (MEMORY_ENABLED=false)"
 
-    safe_key = key.replace("/", "_").replace("\\", "_").strip(". ")
-    if not safe_key:
+    try:
+        normalized_key, memory_path = _memory_path_from_key(key)
+    except ValueError:
         return "Invalid key"
+
+    if _is_daily_log_key(normalized_key) and memory_path.exists():
+        append = True
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # Check workspace root first — update existing files like IDENTITY.md,
     # USER.md, SOUL.md in-place instead of creating duplicates in memory/.
     workspace_root = Path(__file__).parent.parent / "workspace"
-    workspace_file = workspace_root / f"{safe_key}.md"
-    memory_path = _get_memory_dir() / f"{safe_key}.md"
+    workspace_file = workspace_root / f"{normalized_key}.md"
+    if "/" in normalized_key:
+        workspace_file = None
 
-    path = workspace_file if workspace_file.exists() else memory_path
+    path = workspace_file if workspace_file is not None and workspace_file.exists() else memory_path
+    memory_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        if (append or workspace_file.exists()) and path.exists():
+        if (append or (workspace_file is not None and workspace_file.exists())) and path.exists():
             existing = path.read_text(encoding="utf-8")
             if append:
                 updated = f"{existing.rstrip()}\n\n_Updated {now}_\n\n{content}"
             else:
-                updated = f"# {safe_key}\n\n_Last updated: {now}_\n\n{content}"
+                updated = f"# {normalized_key}\n\n_Last updated: {now}_\n\n{content}"
             path.write_text(updated, encoding="utf-8")
-            loc = "workspace" if path == workspace_file else "workspace/memory"
-            return f"Memory '{safe_key}' updated → {loc}/{safe_key}.md"
+            if path == workspace_file:
+                loc = f"workspace/{path.name}"
+            else:
+                rel = path.relative_to(_get_memory_dir())
+                loc = f"memory/{rel.as_posix()}"
+            return f"Memory '{normalized_key}' updated → {loc}"
         else:
-            header = f"# {safe_key}\n\n_Last updated: {now}_\n\n"
+            header = f"# {normalized_key}\n\n_Last updated: {now}_\n\n"
             path.write_text(header + content, encoding="utf-8")
-            return f"Memory '{safe_key}' saved → workspace/memory/{safe_key}.md"
+            rel = path.relative_to(_get_memory_dir())
+            return f"Memory '{normalized_key}' saved → memory/{rel.as_posix()}"
     except Exception as e:
-        return f"Error saving memory '{safe_key}': {e}"
+        return f"Error saving memory '{normalized_key}': {e}"
 
 
 async def _memory_list() -> str:
@@ -317,7 +381,10 @@ async def _memory_delete(key: str) -> str:
     if not cfg.memory_enabled:
         return "Memory is disabled (MEMORY_ENABLED=false)"
 
-    path = _get_memory_dir() / f"{key}.md"
+    try:
+        _, path = _memory_path_from_key(key)
+    except ValueError:
+        return "Invalid key"
     if not path.exists():
         return f"No memory file found for key '{key}'"
     try:
@@ -329,7 +396,11 @@ async def _memory_delete(key: str) -> str:
 
 def _list_keys() -> str:
     memory_dir = _get_memory_dir()
-    keys = [f.stem for f in sorted(memory_dir.glob("*.md")) if f.name != "README.md"]
+    keys = [
+        str(path.relative_to(memory_dir).with_suffix("").as_posix())
+        for path in sorted(memory_dir.rglob("*.md"))
+        if path.name != "README.md"
+    ]
     if _get_memory_md_path().exists():
         keys = ["MEMORY"] + keys
     return ", ".join(keys) if keys else "(none yet)"
