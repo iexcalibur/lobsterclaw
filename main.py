@@ -126,6 +126,7 @@ def build_registry(light: bool = False):
         registry.register(calendar_tool.CALENDAR_RSVP_TOOL)
         # AI News Research Agent
         registry.register(ai_news_tool.AI_NEWS_LIST_TOOL)
+        registry.register(ai_news_tool.AI_NEWS_CONTENT_IDEAS_TOOL)
         registry.register(ai_news_tool.AI_NEWS_REFRESH_TOOL)
         registry.register(ai_news_tool.AI_NEWS_CLEAR_TOOL)
 
@@ -543,14 +544,25 @@ async def _run_async_main(
         ))
         logger.info("Gmail watcher and calendar reminder tasks started")
 
-    # AI News Research Agent (background loop)
+    # AI News Research Agent (background loops)
     if not _cfg.light_context and getattr(_cfg, "ai_news_enabled", True):
-        from tools.ai_news_tool import ai_news_watcher_loop
+        from tools.ai_news_tool import ai_news_watcher_loop, content_brief_loop
         tasks.append(asyncio.create_task(
             ai_news_watcher_loop(cfg=_cfg),
             name="ai-news-watcher",
         ))
-        logger.info("AI news watcher started (interval=%dm)", getattr(_cfg, "ai_news_poll_interval_minutes", 60))
+        if primary_send_fn is not None:
+            tasks.append(asyncio.create_task(
+                content_brief_loop(send_fn=primary_send_fn, cfg=_cfg),
+                name="ai-news-brief",
+            ))
+        logger.info(
+            "AI news watcher started (interval=%dm, active=%02d:00-%02d:00, brief=%02d:00)",
+            getattr(_cfg, "ai_news_poll_interval_minutes", 240),
+            getattr(_cfg, "ai_news_active_hours_start", 10),
+            getattr(_cfg, "ai_news_active_hours_end", 22),
+            getattr(_cfg, "ai_news_brief_hour", 6),
+        )
 
     logger.info("All tasks started (%d). Waiting for shutdown signal...", len(tasks))
     await stop_event.wait()

@@ -218,11 +218,23 @@ class Config:
     ai_news_enabled: bool = field(
         default_factory=lambda: _env_bool("AI_NEWS_ENABLED", True)
     )
+    # How often to refresh (minutes). Default 240 = every 4 hours
     ai_news_poll_interval_minutes: int = field(
-        default_factory=lambda: _env_int("AI_NEWS_POLL_INTERVAL_MINUTES", 60)
+        default_factory=lambda: _env_int("AI_NEWS_POLL_INTERVAL_MINUTES", 240)
     )
     ai_news_retention_days: int = field(
         default_factory=lambda: _env_int("AI_NEWS_RETENTION_DAYS", 3)
+    )
+    # Active window: only fetch news between these hours (24h, local time)
+    ai_news_active_hours_start: int = field(
+        default_factory=lambda: _env_int("AI_NEWS_ACTIVE_HOURS_START", 10)
+    )
+    ai_news_active_hours_end: int = field(
+        default_factory=lambda: _env_int("AI_NEWS_ACTIVE_HOURS_END", 22)
+    )
+    # Hour of day to send daily content brief via Telegram (24h local time)
+    ai_news_brief_hour: int = field(
+        default_factory=lambda: _env_int("AI_NEWS_BRIEF_HOUR", 6)
     )
 
     # Additional channels (stub-compatible; disabled by default)

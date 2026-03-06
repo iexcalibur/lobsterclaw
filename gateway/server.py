@@ -750,10 +750,18 @@ def create_app() -> FastAPI:
 
     @app.delete("/api/gateway/ai-news", dependencies=[Auth])
     async def clear_ai_news():
-        """Clear all cached AI news articles."""
+        """Clear all cached AI news articles and content ideas."""
         from tools.ai_news_tool import get_db
         count = get_db().clear_all()
         return {"ok": True, "cleared": count}
+
+    @app.get("/api/gateway/ai-news/content-ideas", dependencies=[Auth])
+    async def get_content_ideas():
+        """Return AI-scored content ideas for short-form video creation."""
+        from tools.ai_news_tool import get_db
+        db = get_db()
+        ideas = db.get_content_ideas(limit=10)
+        return {"ideas": ideas, "total": len(ideas)}
 
     # ── WebSocket — auth via ?api_key= query param ────────────────────────────
     @app.websocket("/ws/gateway")
