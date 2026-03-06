@@ -11,6 +11,8 @@ SECURITY FIXES (v2):
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import secrets
@@ -601,8 +603,18 @@ def create_app() -> FastAPI:
 
         # Build state: nonce -> we lookup account_id on callback
         nonce = secrets.token_hex(16)
+        # PKCE: generate code_verifier here so we can pass it during token exchange.
+        # google_auth_oauthlib auto-adds code_challenge to the auth URL, so Google
+        # requires the matching code_verifier at fetch_token time. Since the Flow
+        # object is recreated in the callback, we must persist the verifier ourselves.
+        code_verifier = secrets.token_urlsafe(64)
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+
         _oauth_cleanup_expired()
-        _oauth_state_store[nonce] = (account_id.strip(), time.time() + 600)  # 10 min
+        # Store (account_id, expires_at, code_verifier) — 10 min window
+        _oauth_state_store[nonce] = (account_id.strip(), time.time() + 600, code_verifier)
 
         def _build_url():
             from google_auth_oauthlib.flow import Flow
@@ -625,6 +637,8 @@ def create_app() -> FastAPI:
                 access_type="offline",
                 prompt="consent",
                 state=nonce,
+                code_challenge=code_challenge,
+                code_challenge_method="S256",
             )
             return auth_url
 
@@ -648,7 +662,7 @@ def create_app() -> FastAPI:
         entry = _oauth_state_store.pop(state, None)
         if not entry:
             return RedirectResponse(url=f"{ui_base}/google-accounts?oauth_error=invalid_state")
-        account_id, _ = entry
+        account_id, _, code_verifier = entry
 
         cfg = get_config()
         cid = getattr(cfg, "google_oauth_client_id", "").strip()
@@ -658,6 +672,12 @@ def create_app() -> FastAPI:
             return RedirectResponse(url=f"{ui_base}/google-accounts?oauth_error=config")
 
         def _exchange():
+            import os as _os
+            # Google appends `openid` to returned scopes even when not requested.
+            # oauthlib raises a Warning-as-exception on any scope mismatch;
+            # this env var suppresses that check.
+            _os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+
             from google_auth_oauthlib.flow import Flow
 
             client_config = {
@@ -675,7 +695,7 @@ def create_app() -> FastAPI:
                 redirect_uri=redirect_uri,
                 state=state,
             )
-            flow.fetch_token(code=code)
+            flow.fetch_token(code=code, code_verifier=code_verifier)
             creds = flow.credentials
             return creds.refresh_token, creds.token, creds.expiry
 
