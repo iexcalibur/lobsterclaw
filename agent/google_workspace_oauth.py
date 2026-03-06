@@ -16,14 +16,21 @@ from config import get_config
 
 logger = logging.getLogger(__name__)
 
-# Gmail API scopes
-GMAIL_SCOPES = [
+# Full Google Workspace scopes — Gmail + Calendar.
+# NOTE: adding Calendar scopes requires users to re-connect their Google account
+# in the Gateway UI so Google can issue a new consent with the expanded permissions.
+WORKSPACE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
 ]
+
+# Backward-compat alias used by gateway/server.py OAuth flow
+GMAIL_SCOPES = WORKSPACE_SCOPES
 
 
 def _tokens_path(accounts_file: str | None = None) -> Path:
@@ -118,7 +125,7 @@ def get_credentials_for_account_id(account_id: str, accounts_file: str | None = 
         token_uri="https://oauth2.googleapis.com/token",
         client_id=cfg.google_oauth_client_id,
         client_secret=cfg.google_oauth_client_secret,
-        scopes=GMAIL_SCOPES,
+        scopes=WORKSPACE_SCOPES,
     )
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())

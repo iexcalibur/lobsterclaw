@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import re
+import httpx
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 import anthropic
@@ -449,11 +450,14 @@ class AgentLoop:
         # Build auth profile lists for rotation (comma-separated keys)
         self._anthropic_keys = [k.strip() for k in (self.cfg.anthropic_api_key or "").split(",") if k.strip()]
         self._openai_keys = [k.strip() for k in (self.cfg.openai_api_key or "").split(",") if k.strip()]
+        self._gemini_keys = [k.strip() for k in (self.cfg.gemini_api_key or "").split(",") if k.strip()]
         self._current_anthropic_idx = 0
         self._current_openai_idx = 0
+        self._current_gemini_idx = 0
         self._key_cooldowns: dict[str, float] = {}
 
-        if self.cfg.llm_provider == "anthropic":
+        provider = self.cfg.llm_provider
+        if provider == "anthropic":
             self._anthropic = anthropic.AsyncAnthropic(
                 api_key=self._anthropic_keys[0] if self._anthropic_keys else "",
             )
@@ -489,6 +493,14 @@ class AgentLoop:
         new_key = self._openai_keys[self._current_openai_idx]
         self._openai = openai.AsyncOpenAI(api_key=new_key)
         logger.info("Rotated to OpenAI key profile #%d", self._current_openai_idx)
+        return new_key
+
+    def _rotate_gemini_key(self) -> str | None:
+        if len(self._gemini_keys) <= 1:
+            return None
+        self._current_gemini_idx = (self._current_gemini_idx + 1) % len(self._gemini_keys)
+        new_key = self._gemini_keys[self._current_gemini_idx]
+        logger.info("Rotated to Gemini key profile #%d", self._current_gemini_idx)
         return new_key
 
     async def run(
@@ -534,11 +546,14 @@ class AgentLoop:
 
             # Resolve model aliases (e.g., "sonnet" → "claude-sonnet-4-5")
             effective_model = self.cfg.resolve_model(effective_model)
+            provider = self.cfg.llm_provider
 
             api_key = (
                 self.cfg.anthropic_api_key
-                if self.cfg.llm_provider == "anthropic"
+                if provider == "anthropic"
                 else self.cfg.openai_api_key
+                if provider == "openai"
+                else self.cfg.gemini_api_key
             )
 
             # Transcript repair: strip orphaned tool_use/tool_result blocks before sending.
@@ -572,7 +587,7 @@ class AgentLoop:
                 )
                 self._memory_flush_done = False  # reset for the next compaction cycle
 
-            if self.cfg.llm_provider == "anthropic":
+            if provider == "anthropic":
                 result = await self._run_anthropic(
                     messages, system_prompt,
                     session_id=session_id,
@@ -581,13 +596,27 @@ class AgentLoop:
                     stream_callback=stream_callback,
                     on_tool_start=on_tool_start,
                 )
-            else:
+            elif provider == "openai":
                 result = await self._run_openai(
                     messages, system_prompt,
                     session_id=session_id,
                     model=effective_model,
                     stream_callback=stream_callback,
                     on_tool_start=on_tool_start,
+                )
+            elif provider == "gemini":
+                result = await self._run_gemini(
+                    messages,
+                    system_prompt,
+                    session_id=session_id,
+                    model=effective_model,
+                    stream_callback=stream_callback,
+                    on_tool_start=on_tool_start,
+                )
+            else:
+                result = (
+                    f"Unsupported LLM_PROVIDER='{provider}'. "
+                    "Use anthropic, openai, or gemini."
                 )
 
             # Persist token usage to SessionStore if available
@@ -611,6 +640,201 @@ class AgentLoop:
             })
 
             return result
+
+    # ------------------------------------------------------------------
+    # Gemini (Flash text-first path)
+    # ------------------------------------------------------------------
+
+    async def _run_gemini(
+        self,
+        messages: list[dict],
+        system_prompt: str,
+        session_id: str | None = None,
+        model: str | None = None,
+        stream_callback: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_start: Callable[[], Awaitable[None]] | None = None,
+    ) -> str:
+        effective_model = model or self.cfg.llm_model
+        api_key = self._gemini_keys[self._current_gemini_idx] if self._gemini_keys else self.cfg.gemini_api_key
+        if not api_key:
+            return "Error: GEMINI_API_KEY is required when LLM_PROVIDER=gemini"
+
+        _ = session_id
+        _ = on_tool_start
+
+        working = list(messages)
+        overflow_attempts = 0
+
+        for _iteration in range(self.cfg.max_tool_iterations):
+            if needs_compaction(working, effective_model, self.cfg.llm_max_tokens):
+                working = await compact_messages(
+                    messages=working,
+                    model=effective_model,
+                    api_key=api_key,
+                    provider="gemini",
+                )
+
+            try:
+                candidate = await self._call_gemini_chat(
+                    system_prompt=system_prompt,
+                    model=effective_model,
+                    messages=working,
+                    api_key=api_key,
+                    max_tokens=self.cfg.llm_max_tokens,
+                )
+            except Exception as e:
+                err_str = str(e).lower()
+                logger.warning("Gemini request failed: %s", err_str)
+                if "context" in err_str or "token" in err_str or "too long" in err_str:
+                    logger.warning(
+                        "Context overflow detected, attempting compaction (attempt %d/3)",
+                        overflow_attempts + 1,
+                    )
+                    overflow_attempts += 1
+                    if overflow_attempts <= 3:
+                        try:
+                            working = await compact_messages(
+                                messages=working,
+                                model=effective_model,
+                                api_key=api_key,
+                                provider="gemini",
+                            )
+                            continue
+                        except Exception:
+                            pass
+                    return "Context overflow: could not reduce context after 3 compaction attempts."
+                if "429" in err_str or "too many requests" in err_str:
+                    rotated = self._rotate_gemini_key()
+                    if rotated:
+                        api_key = rotated
+                        continue
+                logger.error("Gemini API fatal error: %s", e)
+                return f"Sorry, I couldn't reach the AI service: {_sanitize_error(e)}"
+
+            text, tool_calls, input_tokens, output_tokens = self._parse_gemini_candidate(candidate)
+            self._record_usage(input_tokens, output_tokens)
+
+            if tool_calls:
+                return (
+                    "Tool calling is not available on the current Gemini runtime path. "
+                    "Please re-run this request with provider openai or anthropic."
+                )
+
+            if not text:
+                return "(empty response from model)"
+
+            if stream_callback is not None and getattr(self.cfg, "llm_streaming", True):
+                await stream_callback(text)
+
+            show_thinking = getattr(self.cfg, "llm_show_thinking", False)
+            return _extract_reasoning_split(text, show_thinking)
+
+        logger.warning("Max tool iterations (%d) reached", self.cfg.max_tool_iterations)
+        return "I couldn't complete this Gemini turn in time. Try shortening context or retrying."
+
+    def _coerce_gemini_parts(self, value: object) -> list[dict]:
+        if isinstance(value, str):
+            return [{"text": value}]
+        if value is None:
+            return []
+        if isinstance(value, list):
+            parts: list[dict] = []
+            for item in value:
+                if not isinstance(item, dict):
+                    parts.append({"text": str(item)})
+                    continue
+                if item.get("type") == "text":
+                    text = item.get("text")
+                    if text:
+                        parts.append({"text": str(text)})
+                elif item.get("type") == "tool_result":
+                    content = item.get("content")
+                    if content is not None:
+                        parts.append({"text": str(content)})
+                elif item.get("type") == "tool_use":
+                    # Tool calls are handled separately in strict Gemini mode.
+                    continue
+                else:
+                    t = item.get("text") or item.get("content") or item.get("input")
+                    if t is not None:
+                        parts.append({"text": str(t)})
+            return parts
+        return [{"text": str(value)}]
+
+    def _to_gemini_contents(self, messages: list[dict]) -> list[dict]:
+        contents: list[dict] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            if role not in ("user", "assistant"):
+                continue
+
+            parts = self._coerce_gemini_parts(msg.get("content"))
+            if not parts:
+                continue
+            gemini_role = "model" if role == "assistant" else "user"
+            contents.append({"role": gemini_role, "parts": parts})
+        return contents
+
+    async def _call_gemini_chat(
+        self,
+        system_prompt: str,
+        model: str,
+        messages: list[dict],
+        api_key: str,
+        max_tokens: int = 1024,
+    ) -> dict:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+        payload: dict = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": self._to_gemini_contents(messages),
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+            },
+        }
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                url,
+                params={"key": api_key},
+                json=payload,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    def _parse_gemini_candidate(self, response: dict) -> tuple[str, list[dict], int, int]:
+        candidates = response.get("candidates", [])
+        if not candidates:
+            return "", [], 0, 0
+
+        first = candidates[0]
+        usage = response.get("usageMetadata", {})
+        usage_prompt = int(usage.get("promptTokenCount", 0) or 0)
+        usage_output = int(usage.get("candidatesTokenCount", 0) or 0)
+        content = first.get("content", {}) or {}
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if "text" in part:
+                text = part.get("text")
+                if text:
+                    text_parts.append(str(text))
+            if "functionCall" in part:
+                fn = part.get("functionCall") or {}
+                name = str(fn.get("name", ""))
+                args = fn.get("args", {}) if isinstance(fn.get("args"), dict) else {}
+                tool_calls.append({
+                    "name": name,
+                    "arguments": json.dumps(args),
+                    "id": str(fn.get("id", "")) if fn.get("id") else "gemini",
+                })
+
+        return "\n".join(p for p in text_parts if p).strip(), tool_calls, usage_prompt, usage_output
 
     # ------------------------------------------------------------------
     # Anthropic
@@ -867,6 +1091,10 @@ class AgentLoop:
                         logger.debug("Memory flush tool: %s", block.name)
                     except Exception as e:
                         logger.debug("Memory flush tool error (%s): %s", block.name, e)
+        elif self.cfg.llm_provider == "gemini":
+            # Gemini path currently runs without tool-calling support in flush mode.
+            # Keep this as a best-effort no-op so nightly compaction paths keep working.
+            logger.info("Skipping tool-based memory flush for Gemini (tool calling not wired for this run path).")
         else:
             memory_tools = [
                 t for t in self.registry.get_openai_tools()

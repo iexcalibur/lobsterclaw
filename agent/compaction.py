@@ -11,6 +11,7 @@ The compaction LLM call uses the same provider as the main agent.
 
 from __future__ import annotations
 
+import httpx
 import logging
 from typing import TYPE_CHECKING
 
@@ -45,6 +46,9 @@ _CONTEXT_WINDOWS: dict[str, int] = {
     "claude-opus-4": 200_000,
     "claude-sonnet-4": 200_000,
     "claude-haiku": 200_000,
+    "gemini-2.5": 1_000_000,
+    "gemini-2.0": 1_000_000,
+    "gemini-1.5": 1_000_000,
     "gpt-4o": 128_000,
     "gpt-4-turbo": 128_000,
     "gpt-4": 8_192,
@@ -357,6 +361,35 @@ async def _call_llm_for_summary(
             if hasattr(block, "text"):
                 return block.text
         return ""
+    if provider == "gemini":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+            },
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                url,
+                params={"key": api_key},
+                json=payload,
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return ""
+        content = candidates[0].get("content", {}) or {}
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+        text_parts: list[str] = []
+        for part in parts:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if text:
+                    text_parts.append(str(text))
+        return "\n".join(text_parts).strip()
     else:
         import openai
         client = openai.AsyncOpenAI(api_key=api_key)

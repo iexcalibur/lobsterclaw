@@ -13,6 +13,7 @@ import {
   Settings,
   Activity,
   Mail,
+  Newspaper,
 } from "lucide-react";
 
 const NAV_ITEMS = [
@@ -22,6 +23,7 @@ const NAV_ITEMS = [
   { href: "/skills", label: "Skills", icon: Zap },
   { href: "/cron", label: "Cron Jobs", icon: Clock },
   { href: "/tools", label: "Tools", icon: Wrench },
+  { href: "/ai-news", label: "AI News", icon: Newspaper },
   { href: "/google-accounts", label: "Google Accounts", icon: Mail },
   { href: "/settings", label: "Settings", icon: Settings },
 ];

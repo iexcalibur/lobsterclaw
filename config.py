@@ -134,6 +134,8 @@ class Config:
                 "web_fetch,web_search,cron,read,write,edit,glob,list_dir,"
                 "memory_search,memory_get,memory_write,memory_list,memory_delete,"
                 "message,tts,pdf,image,gmail_search,gmail_send,"
+                "gmail_read,gmail_reply,gmail_archive,gmail_label,gmail_mark_read,gmail_vip,"
+                "calendar_list,calendar_create,calendar_rsvp,"
                 "sessions_spawn,sessions_list,sessions_history,sessions_send,"
                 "session_status,subagents,agents_list"
             ),
@@ -199,6 +201,28 @@ class Config:
             "GOOGLE_OAUTH_REDIRECT_URI",
             "http://localhost:4400/api/gateway/google-oauth/callback",
         )
+    )
+    # Gmail VIP watcher
+    gmail_vip_senders: list[str] = field(
+        default_factory=lambda: _env_list("GMAIL_VIP_SENDERS", "")
+    )
+    gmail_watch_interval_minutes: int = field(
+        default_factory=lambda: _env_int("GMAIL_WATCH_INTERVAL_MINUTES", 30)
+    )
+    # Calendar meeting reminder
+    calendar_reminder_minutes: int = field(
+        default_factory=lambda: _env_int("CALENDAR_REMINDER_MINUTES", 10)
+    )
+
+    # AI News Research Agent
+    ai_news_enabled: bool = field(
+        default_factory=lambda: _env_bool("AI_NEWS_ENABLED", True)
+    )
+    ai_news_poll_interval_minutes: int = field(
+        default_factory=lambda: _env_int("AI_NEWS_POLL_INTERVAL_MINUTES", 60)
+    )
+    ai_news_retention_days: int = field(
+        default_factory=lambda: _env_int("AI_NEWS_RETENTION_DAYS", 3)
     )
 
     # Additional channels (stub-compatible; disabled by default)
@@ -456,6 +480,7 @@ class Config:
         errors = []
         # In multi-account mode, individual accounts may override the global token
         accounts = self.telegram_accounts
+        self.llm_provider = self.llm_provider.strip().lower()
         if not accounts and not self.telegram_bot_token:
             errors.append("TELEGRAM_BOT_TOKEN is required (or set TELEGRAM_ACCOUNTS)")
         if not accounts and not self.telegram_owner_id:
@@ -464,6 +489,10 @@ class Config:
             errors.append("ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic")
         if self.llm_provider == "openai" and not self.openai_api_key:
             errors.append("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+        if self.llm_provider == "gemini" and not self.gemini_api_key:
+            errors.append("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
+        if self.llm_provider not in {"anthropic", "openai", "gemini"}:
+            errors.append("LLM_PROVIDER must be one of: anthropic, openai, gemini")
         if errors:
             raise ValueError("Config errors:\n" + "\n".join(f"  - {e}" for e in errors))
         return self

@@ -65,6 +65,8 @@ def build_registry(light: bool = False):
         canvas_tool,
         channel_stubs,
         gmail_tool,
+        calendar_tool,
+        ai_news_tool,
     )
 
     registry = ToolRegistry()
@@ -112,6 +114,20 @@ def build_registry(light: bool = False):
     if not light:
         registry.register(gmail_tool.GMAIL_SEARCH_TOOL)
         registry.register(gmail_tool.GMAIL_SEND_TOOL)
+        registry.register(gmail_tool.GMAIL_READ_TOOL)
+        registry.register(gmail_tool.GMAIL_REPLY_TOOL)
+        registry.register(gmail_tool.GMAIL_ARCHIVE_TOOL)
+        registry.register(gmail_tool.GMAIL_LABEL_TOOL)
+        registry.register(gmail_tool.GMAIL_MARK_READ_TOOL)
+        registry.register(gmail_tool.GMAIL_VIP_TOOL)
+        # Calendar (Phase 2 — same OAuth connection, Calendar scopes required)
+        registry.register(calendar_tool.CALENDAR_LIST_TOOL)
+        registry.register(calendar_tool.CALENDAR_CREATE_TOOL)
+        registry.register(calendar_tool.CALENDAR_RSVP_TOOL)
+        # AI News Research Agent
+        registry.register(ai_news_tool.AI_NEWS_LIST_TOOL)
+        registry.register(ai_news_tool.AI_NEWS_REFRESH_TOOL)
+        registry.register(ai_news_tool.AI_NEWS_CLEAR_TOOL)
 
     # Nodes (remote device management)
     registry.register(nodes_tool.TOOL_DEFINITION)
@@ -444,6 +460,7 @@ def main() -> None:
             start_discord=bool(discord_channel),
             discord_ch=discord_channel,
             on_ready=start_schedulers,
+            primary_send_fn=primary.send_message,
         ))
 
 
@@ -455,6 +472,7 @@ async def _run_async_main(
     start_discord: bool = False,
     discord_ch=None,
     on_ready: callable = None,
+    primary_send_fn=None,
 ) -> None:
     """
     Async entry point for:
@@ -509,6 +527,30 @@ async def _run_async_main(
         t = asyncio.create_task(discord_ch.run_async(), name="discord")
         tasks.append(t)
         logger.info("Discord channel task started")
+
+    # Gmail VIP watcher + Calendar reminder (background loops)
+    _cfg = get_config()
+    if not _cfg.light_context and primary_send_fn is not None:
+        from tools.gmail_tool import gmail_watcher_loop
+        from tools.calendar_tool import calendar_reminder_loop
+        tasks.append(asyncio.create_task(
+            gmail_watcher_loop(send_fn=primary_send_fn, cfg=_cfg),
+            name="gmail-watcher",
+        ))
+        tasks.append(asyncio.create_task(
+            calendar_reminder_loop(send_fn=primary_send_fn, cfg=_cfg),
+            name="calendar-reminder",
+        ))
+        logger.info("Gmail watcher and calendar reminder tasks started")
+
+    # AI News Research Agent (background loop)
+    if not _cfg.light_context and getattr(_cfg, "ai_news_enabled", True):
+        from tools.ai_news_tool import ai_news_watcher_loop
+        tasks.append(asyncio.create_task(
+            ai_news_watcher_loop(cfg=_cfg),
+            name="ai-news-watcher",
+        ))
+        logger.info("AI news watcher started (interval=%dm)", getattr(_cfg, "ai_news_poll_interval_minutes", 60))
 
     logger.info("All tasks started (%d). Waiting for shutdown signal...", len(tasks))
     await stop_event.wait()

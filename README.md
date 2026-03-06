@@ -243,9 +243,12 @@ All config via `.env`. Full reference in `.env.example`.
 
 ```bash
 # Minimum to get running
+LLM_PROVIDER=anthropic              # or openai/gemini
 ANTHROPIC_API_KEY=sk-ant-...
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_OWNER_ID=12345678
+OPENAI_API_KEY=sk-...
+GEMINI_API_KEY=YOUR_GEMINI_API_KEY
 
 # Recommended to also set
 GATEWAY_API_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
@@ -256,7 +259,7 @@ Key settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_PROVIDER` | `anthropic` | `anthropic` or `openai` |
+| `LLM_PROVIDER` | `anthropic` | `anthropic`, `openai`, or `gemini` |
 | `LLM_MODEL` | `claude-opus-4-5` | Model name |
 | `DISCORD_ENABLED` | `false` | Enable Discord channel |
 | `PLUGIN_HOT_RELOAD` | `true` | Live plugin reload via watchdog |

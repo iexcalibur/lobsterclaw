@@ -725,6 +725,36 @@ def create_app() -> FastAPI:
         clear_oauth_tokens(account_id)
         return {"ok": True, "message": "OAuth disconnected"}
 
+    # ── AI News ───────────────────────────────────────────────────────────────
+
+    @app.get("/api/gateway/ai-news", dependencies=[Auth])
+    async def get_ai_news(category: str | None = None, limit: int = 100):
+        """Return cached AI news articles."""
+        from tools.ai_news_tool import get_db
+        db = get_db()
+        articles = db.get_articles(category=category, limit=min(limit, 200))
+        stats = db.stats()
+        return {
+            "articles": articles,
+            "total": len(articles),
+            "stats": stats,
+        }
+
+    @app.post("/api/gateway/ai-news/refresh", dependencies=[Auth])
+    async def trigger_ai_news_refresh():
+        """Trigger an immediate AI news refresh cycle."""
+        from tools.ai_news_tool import refresh_news, trigger_early_refresh
+        trigger_early_refresh()
+        result = await refresh_news()
+        return {"ok": True, **result}
+
+    @app.delete("/api/gateway/ai-news", dependencies=[Auth])
+    async def clear_ai_news():
+        """Clear all cached AI news articles."""
+        from tools.ai_news_tool import get_db
+        count = get_db().clear_all()
+        return {"ok": True, "cleared": count}
+
     # ── WebSocket — auth via ?api_key= query param ────────────────────────────
     @app.websocket("/ws/gateway")
     async def ws_events(websocket: WebSocket):

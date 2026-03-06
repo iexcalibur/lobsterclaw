@@ -29,6 +29,12 @@ def test_resolve_context_window_gpt4():
     assert size > 0
 
 
+def test_resolve_context_window_gemini():
+    from agent.compaction import resolve_context_window
+    size = resolve_context_window("gemini-2.5-flash-lite")
+    assert size >= 500_000
+
+
 def test_resolve_context_window_unknown():
     from agent.compaction import resolve_context_window
     size = resolve_context_window("unknown-model-xyz")
