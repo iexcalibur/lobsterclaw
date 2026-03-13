@@ -67,6 +67,7 @@ def build_registry(light: bool = False):
         gmail_tool,
         calendar_tool,
         ai_news_tool,
+        trending_topic_tool,
     )
 
     registry = ToolRegistry()
@@ -129,6 +130,10 @@ def build_registry(light: bool = False):
         registry.register(ai_news_tool.AI_NEWS_CONTENT_IDEAS_TOOL)
         registry.register(ai_news_tool.AI_NEWS_REFRESH_TOOL)
         registry.register(ai_news_tool.AI_NEWS_CLEAR_TOOL)
+        # Trending Topic Engine
+        registry.register(trending_topic_tool.TRENDING_LIST_TOOL)
+        registry.register(trending_topic_tool.TRENDING_REFRESH_TOOL)
+        registry.register(trending_topic_tool.TRENDING_CLEAR_TOOL)
 
     # Nodes (remote device management)
     registry.register(nodes_tool.TOOL_DEFINITION)
@@ -574,6 +579,20 @@ async def _run_async_main(
             getattr(_cfg, "ai_news_active_hours_end", 22),
             getattr(_cfg, "ai_news_brief_hour", 6),
         )
+
+    # Trending Topic Engine (background loops)
+    if not _cfg.light_context:
+        from tools.trending_topic_tool import trending_watcher_loop, trending_daily_digest_loop
+        tasks.append(asyncio.create_task(
+            trending_watcher_loop(cfg=_cfg),
+            name="trending-watcher",
+        ))
+        if primary_send_fn is not None:
+            tasks.append(asyncio.create_task(
+                trending_daily_digest_loop(send_fn=primary_send_fn, cfg=_cfg),
+                name="trending-digest",
+            ))
+        logger.info("Trending topic watcher started")
 
     logger.info("All tasks started (%d). Waiting for shutdown signal...", len(tasks))
     await stop_event.wait()

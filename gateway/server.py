@@ -792,6 +792,72 @@ def create_app() -> FastAPI:
         ideas = db.get_content_ideas(limit=10)
         return {"ideas": ideas, "total": len(ideas)}
 
+    # ── Trending Topics ──────────────────────────────────────────────────────
+
+    @app.get("/api/gateway/trending", dependencies=[Auth])
+    async def get_trending(topic: str = "AI"):
+        """Return top 3 trending topic cards + signals for a topic."""
+        from tools.trending_topic_tool import get_trending_db, DEFAULT_TOPICS
+        db = get_trending_db()
+        cards = db.get_topic_cards(topic)
+        stats = db.stats(topic)
+        return {
+            "cards": cards,
+            "stats": stats,
+            "topic": topic,
+            "available_topics": list(DEFAULT_TOPICS.keys()),
+        }
+
+    @app.get("/api/gateway/trending/signals", dependencies=[Auth])
+    async def get_trending_signals(topic: str = "AI", tier: str | None = None, limit: int = 30):
+        """Return raw signals for a topic, optionally filtered by tier."""
+        from tools.trending_topic_tool import get_trending_db
+        db = get_trending_db()
+        signals = db.get_signals(topic, tier=tier, limit=min(limit, 100))
+        return {"signals": signals, "total": len(signals), "topic": topic}
+
+    @app.post("/api/gateway/trending/refresh", dependencies=[Auth])
+    async def trigger_trending_refresh(body: dict = {}):
+        """Trigger an immediate trending topic refresh."""
+        from tools.trending_topic_tool import refresh_trending
+        topic = body.get("topic", "AI")
+        result = await refresh_trending(topic)
+        return {"ok": True, **result}
+
+    @app.delete("/api/gateway/trending", dependencies=[Auth])
+    async def clear_trending(topic: str | None = None):
+        """Clear cached trending data."""
+        from tools.trending_topic_tool import get_trending_db
+        db = get_trending_db()
+        if topic:
+            count = db.clear_topic(topic)
+        else:
+            count = db.clear_all()
+        return {"ok": True, "cleared": count}
+
+    @app.get("/api/gateway/trending/settings", dependencies=[Auth])
+    async def get_trending_settings():
+        """Return trending settings (auto-refresh toggle, active topic)."""
+        from tools.trending_topic_tool import is_auto_refresh_enabled, get_active_topic, is_auto_top3_enabled, DEFAULT_TOPICS
+        return {
+            "auto_refresh_enabled": is_auto_refresh_enabled(),
+            "auto_top3_enabled": is_auto_top3_enabled(),
+            "active_topic": get_active_topic(),
+            "available_topics": list(DEFAULT_TOPICS.keys()),
+        }
+
+    @app.post("/api/gateway/trending/settings", dependencies=[Auth])
+    async def update_trending_settings(body: dict):
+        """Update trending settings."""
+        from tools.trending_topic_tool import set_auto_refresh_enabled, set_active_topic, set_auto_top3_enabled
+        if "auto_refresh_enabled" in body:
+            set_auto_refresh_enabled(bool(body["auto_refresh_enabled"]))
+        if "auto_top3_enabled" in body:
+            set_auto_top3_enabled(bool(body["auto_top3_enabled"]))
+        if "active_topic" in body:
+            set_active_topic(str(body["active_topic"]))
+        return {"ok": True}
+
     # ── WebSocket — auth via ?api_key= query param ────────────────────────────
     @app.websocket("/ws/gateway")
     async def ws_events(websocket: WebSocket):
